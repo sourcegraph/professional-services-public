@@ -1,0 +1,10 @@
+INSERT INTO PRODUCT (name, price) VALUES ('Laptop XPS 13', 999.99);
+INSERT INTO PRODUCT (name, price) VALUES ('Wireless Mouse', 29.99);
+INSERT INTO PRODUCT (name, price) VALUES ('Mechanical Keyboard', 159.99);
+INSERT INTO PRODUCT (name, price) VALUES ('27" Monitor', 299.99);
+INSERT INTO PRODUCT (name, price) VALUES ('USB-C Dock', 189.99);
+INSERT INTO PRODUCT (name, price) VALUES ('Wireless Headphones', 199.99);
+INSERT INTO PRODUCT (name, price) VALUES ('Webcam HD', 79.99);
+INSERT INTO PRODUCT (name, price) VALUES ('SSD 1TB', 119.99);
+INSERT INTO PRODUCT (name, price) VALUES ('Power Bank', 49.99);
+INSERT INTO PRODUCT (name, price) VALUES ('Gaming Mouse', 89.99);
