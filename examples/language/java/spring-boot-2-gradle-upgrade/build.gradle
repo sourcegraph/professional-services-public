@@ -1,3 +1,5 @@
+import org.gradle.api.JavaVersion
+
 plugins {
     id 'java'
     id 'org.springframework.boot' version '2.7.18'
@@ -8,7 +10,7 @@ group = 'com.sourcegraph.demo'
 version = '1.0-SNAPSHOT'
 
 java {
-    sourceCompatibility = '11'
+    sourceCompatibility = JavaVersion.VERSION_11
 }
 
 repositories {
