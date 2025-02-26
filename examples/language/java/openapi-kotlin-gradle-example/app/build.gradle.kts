@@ -18,23 +18,31 @@ dependencies {
     implementation("com.squareup.moshi:moshi:${property("moshi_version")}")
     implementation("com.squareup.moshi:moshi-kotlin:${property("moshi_version")}")
 
+    // Ktor dependencies
+    implementation("io.ktor:ktor-server-core:1.6.8")
+    implementation("io.ktor:ktor-server-netty:1.6.8")
+    implementation("io.ktor:ktor-jackson:1.6.8")
+
+    // Add Logback as the SLF4J implementation
+    implementation("ch.qos.logback:logback-classic:1.2.11")
+
     // Test dependencies
     testImplementation("io.kotlintest:kotlintest-runner-junit5:3.4.2")
     testImplementation("io.kotlintest:kotlintest-assertions:3.4.2")
-}
 
+
+}
 
 application {
-    mainClass = "com.github.trly.app.AppKt"
+    mainClass = "com.sourcegraph.demo.app.AppKt"
 }
-
 tasks.openApiGenerate {
     generatorName.set("kotlin")
     inputSpec.set("$projectDir/src/main/resources/openapi.json")
     outputDir.set("$projectDir")
-    packageName.set("com.github.trly.openapi.generated")
-    apiPackage.set("com.github.trly.openapi.generated.api")
-    modelPackage.set("com.github.trly.openapi.generated.model")
+    packageName.set("com.sourcegraph.demo.openapi.generated")
+    apiPackage.set("com.sourcegraph.demo.openapi.generated.api")
+    modelPackage.set("com.sourcegraph.demo.openapi.generated.model")
     configOptions.set(mapOf(
         "dateLibrary" to "java8",
         "enumPropertyNaming" to "UPPERCASE",
@@ -57,6 +65,6 @@ tasks.processResources {
 tasks.clean {
     delete(layout.projectDirectory.dir("docs"))
     delete(layout.projectDirectory.dir(".openapi-generator"))
-    delete(layout.projectDirectory.dir("src/main/kotlin/com/github/trly/openapi/generated"))
-    delete(layout.projectDirectory.dir("src/test/kotlin/com/github/trly/openapi/generated"))
+    delete(layout.projectDirectory.dir("src/main/kotlin/com/sourcegraph/demo/openapi/generated"))
+    delete(layout.projectDirectory.dir("src/test/kotlin/com/sourcegraph/demo/openapi/generated"))
 }
