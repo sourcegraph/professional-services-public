@@ -1,43 +1,29 @@
 package com.sourcegraph.demo.app
 
-import com.sourcegraph.demo.app.controller.PetController
-import io.ktor.features.*
 import com.github.trly.utils.Printer
-import io.ktor.application.*
-import io.ktor.http.*
-import io.ktor.jackson.*
-import io.ktor.routing.*
+import com.sourcegraph.demo.app.config.RoutingConfig.configureRouting
+import com.sourcegraph.demo.app.config.SerializationConfig.configureContentNegotiation
+import com.sourcegraph.demo.app.config.ServerConfig.configureServer
+import com.sourcegraph.demo.app.controller.PetController
+import com.sourcegraph.demo.app.service.PetService
 import io.ktor.server.engine.*
 import io.ktor.server.netty.*
-import com.fasterxml.jackson.databind.SerializationFeature
-import com.sourcegraph.demo.app.service.PetService
 
 fun main() {
     val printer = Printer("Starting Pet Store API Server...")
     printer.printMessage()
 
-    // Initialize the service
+    // Initialize services and controllers
     val petService = PetService()
     val petController = PetController(petService)
 
-    // Start Ktor server
+    // Start Ktor server with modular configuration
     embeddedServer(Netty, port = 8080) {
-        install(ContentNegotiation) {
-            jackson {
-                enable(SerializationFeature.INDENT_OUTPUT)
-            }
-        }
+        // Apply shared configurations
+        configureContentNegotiation()
+        configureServer()
 
-        install(CORS) {
-            method(HttpMethod.Options)
-            method(HttpMethod.Get)
-            header(HttpHeaders.AccessControlAllowOrigin)
-            header(HttpHeaders.ContentType)
-            anyHost()
-        }
-
-        routing {
-            petController.setupRoutes(this)
-        }
+        // Configure routing with our controller
+        configureRouting(petController)
     }.start(wait = true)
 }

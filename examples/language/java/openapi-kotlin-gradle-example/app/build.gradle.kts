@@ -1,6 +1,7 @@
 plugins {
     id("buildsrc.convention.kotlin-jvm")
     id("org.openapi.generator") version "7.10.0"
+    id("org.owasp.dependencycheck") version "12.1.0"
     application
 }
 
@@ -29,13 +30,28 @@ dependencies {
     // Test dependencies
     testImplementation("io.kotlintest:kotlintest-runner-junit5:3.4.2")
     testImplementation("io.kotlintest:kotlintest-assertions:3.4.2")
+    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.3.2")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.3.2")
+    // Additional test dependencies for unit tests
+    testImplementation("org.junit.jupiter:junit-jupiter-api:5.8.2")
+    testImplementation("org.junit.jupiter:junit-jupiter-engine:5.8.2")
 
+    // Ktor testing dependencies
+    testImplementation("io.ktor:ktor-server-test-host:1.6.8")
 
+    // Add MockK for Kotlin-native mocking
+    testImplementation("io.mockk:mockk:1.13.5")
 }
-
 application {
     mainClass = "com.sourcegraph.demo.app.AppKt"
 }
+
+// Configure testing
+tasks.withType<Test> {
+    useJUnitPlatform()
+}
+
+// OpenAPI generator configuration
 tasks.openApiGenerate {
     generatorName.set("kotlin")
     inputSpec.set("$projectDir/src/main/resources/openapi.json")
@@ -46,7 +62,6 @@ tasks.openApiGenerate {
     configOptions.set(mapOf(
         "dateLibrary" to "java8",
         "enumPropertyNaming" to "UPPERCASE",
-        "serializationLibrary" to "moshi",
         "serializationLibrary" to "moshi",
         "useCoroutines" to "true",
         "omitGradleWrapper" to "true"
