@@ -18,6 +18,7 @@ dependencies {
     // JSON serialization dependencies
     implementation("com.squareup.moshi:moshi:${property("moshi_version")}")
     implementation("com.squareup.moshi:moshi-kotlin:${property("moshi_version")}")
+    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.3.2")
 
     // Ktor dependencies
     implementation("io.ktor:ktor-server-core:1.6.8")
@@ -27,12 +28,7 @@ dependencies {
     // Add Logback as the SLF4J implementation
     implementation("ch.qos.logback:logback-classic:1.2.11")
 
-    // Test dependencies
-    testImplementation("io.kotlintest:kotlintest-runner-junit5:3.4.2")
-    testImplementation("io.kotlintest:kotlintest-assertions:3.4.2")
-    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.3.2")
-    testImplementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.3.2")
-    // Additional test dependencies for unit tests
+    // Test dependencies - choose one testing framework
     testImplementation("org.junit.jupiter:junit-jupiter-api:5.8.2")
     testImplementation("org.junit.jupiter:junit-jupiter-engine:5.8.2")
 
@@ -42,6 +38,7 @@ dependencies {
     // Add MockK for Kotlin-native mocking
     testImplementation("io.mockk:mockk:1.13.5")
 }
+
 application {
     mainClass = "com.sourcegraph.demo.app.AppKt"
 }
