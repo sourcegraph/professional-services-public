@@ -1,8 +1,15 @@
 plugins {
     id("buildsrc.convention.kotlin-jvm")
+    id("buildSrc.convention.sourcegraph")
     id("org.openapi.generator") version "7.10.0"
-    id("org.owasp.dependencycheck") version "12.1.0"
-    application
+    id("application")
+}
+
+semanticDB {
+    // Configure as needed for your project
+    useAnnotationProcessors = false
+    enableCrossRepoNavigation = true
+    enableScipIndexing = true
 }
 
 dependencies {
@@ -29,8 +36,8 @@ dependencies {
     implementation("ch.qos.logback:logback-classic:1.2.11")
 
     // Test dependencies - choose one testing framework
-    testImplementation("org.junit.jupiter:junit-jupiter-api:5.8.2")
-    testImplementation("org.junit.jupiter:junit-jupiter-engine:5.8.2")
+    testImplementation("io.kotlintest:kotlintest-runner-junit5:3.4.2")
+    testImplementation("io.kotlintest:kotlintest-assertions:3.4.2")
 
     // Ktor testing dependencies
     testImplementation("io.ktor:ktor-server-test-host:1.6.8")
