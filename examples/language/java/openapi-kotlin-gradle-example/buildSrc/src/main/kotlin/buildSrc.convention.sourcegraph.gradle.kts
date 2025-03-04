@@ -1,3 +1,4 @@
+import gradle.kotlin.dsl.accessors._285dcef16d8875fee0ec91e18e07daf9.runtimeClasspath
 import org.jetbrains.kotlin.gradle.tasks.KotlinCompile
 
 /**
@@ -11,8 +12,6 @@ import org.jetbrains.kotlin.gradle.tasks.KotlinCompile
  */
 abstract class SemanticDBExtension {
     var useAnnotationProcessors: Boolean = false
-
-    var useJavacClassesDirectoryAsTargetRoot: Boolean = false
 
     var enableCrossRepoNavigation: Boolean = true
 
@@ -28,7 +27,6 @@ val semanticDB = extensions.create<SemanticDBExtension>("semanticDB")
 afterEvaluate {
     val semanticDBVersion = "0.10.3"
     val semanticDbKotlinVersion = "0.4.0"
-    val scipJavaVersion = semanticDBVersion
 
     if (semanticDB.useAnnotationProcessors) {
         dependencies.add("annotationProcessor", "com.sourcegraph:semanticdb-javac:$semanticDBVersion")
@@ -39,16 +37,11 @@ afterEvaluate {
     logger.lifecycle("Added SemanticDB Javac dependency (version $semanticDBVersion) as ${if (semanticDB.useAnnotationProcessors) "annotationProcessor" else "compileOnly"}")
 
     if (semanticDB.enableScipIndexing) {
-        dependencies.add("implementation", "com.sourcegraph:scip-java_2.13:$scipJavaVersion")
-        logger.lifecycle("Added SCIP Java dependency (version $scipJavaVersion)")
+        dependencies.add("implementation", "com.sourcegraph:scip-java_2.13:$semanticDBVersion")
+        logger.lifecycle("Added SCIP Java dependency (version $semanticDBVersion)")
     }
 
-    val targetRootDir = if (semanticDB.useJavacClassesDirectoryAsTargetRoot) {
-        rootProject.layout.buildDirectory.dir("javac-classes-directory").get().asFile
-    } else {
-        rootProject.layout.buildDirectory.dir("semanticdb-targetroot").get().asFile
-    }
-
+    val semanticdbTargetRoot = rootProject.layout.buildDirectory.dir("semanticdb-targetroot").get().asFile
 
     /**
      * Configures JavaCompile tasks with SemanticDB compiler options for source code indexing.
@@ -61,17 +54,11 @@ afterEvaluate {
 
         options.compilerArgs.addAll(listOf(
             "-Xplugin:semanticdb",
-            "-sourceroot:$sourceRoot"
+            "-sourceroot:$sourceRoot",
+            "-targetroot:$semanticdbTargetRoot"
         ))
 
-
-        if (semanticDB.useJavacClassesDirectoryAsTargetRoot) {
-            options.compilerArgs.add("-targetroot:javac-classes-directory")
-        } else {
-            options.compilerArgs.add("-targetroot:$targetRootDir")
-        }
-
-        logger.lifecycle("Configured JavaCompile task '${this.name}' with SemanticDB compiler options")
+        logger.lifecycle("Configured JavaCompile task '${this.name}' with SemanticDB compiler options (targetroot: $semanticdbTargetRoot)")
     }
 
 
@@ -88,11 +75,12 @@ afterEvaluate {
         kotlinOptions.freeCompilerArgs += listOf(
             "-Xplugin=${semanticDBJar}",
             "-P", "plugin:semanticdb-kotlinc:sourceroot=${rootProject.projectDir}",
-            "-P", "plugin:semanticdb-kotlinc:targetroot=${project.layout.buildDirectory.dir("semanticdb-targetroot").get().asFile.absolutePath}"
+            "-P", "plugin:semanticdb-kotlinc:targetroot=$semanticdbTargetRoot"
         )
 
-        logger.lifecycle("Configured KotlinCompile task '${this.name}' with SemanticDB compiler options")
+        logger.lifecycle("Configured KotlinCompile task '${this.name}' with SemanticDB compiler options (targetroot: $semanticdbTargetRoot)")
     }
+
     /**
      * Configures cross-repository navigation support for SemanticDB indexing.
      * Creates a task to generate dependencies.txt file containing resolved compile classpath artifacts,
@@ -100,38 +88,44 @@ afterEvaluate {
      * The dependencies file is used by SemanticDB to enable precise code navigation across different repositories.
      */
     if (semanticDB.enableCrossRepoNavigation) {
-    tasks.register("generateDependenciesTxt") {
-        description = "Generates dependencies.txt file for SemanticDB cross-repository navigation"
-        group = "sourcegraph"
+        tasks.register("generateDependenciesTxt") {
+            description = "Generates dependencies.txt file for SemanticDB cross-repository navigation"
+            group = "sourcegraph"
 
-        // Use layout API for file references
-        val targetrootDir = layout.buildDirectory.dir("semanticdb-targetroot")
-        val dependenciesFile = targetrootDir.map { it.file("dependencies.txt") }
+            dependsOn("createSemanticDBDirectories")
 
-        // Declare inputs and outputs properly
-        inputs.files(configurations.named("compileClasspath"))
-        outputs.file(dependenciesFile)
+            // Use layout API for file references
+            val targetRootDir = layout.buildDirectory.dir("semanticdb-targetroot")
+            val dependenciesFile = targetRootDir.map { it.file("dependencies.txt") }
 
-        doLast {
-            // Create parent directories
-            dependenciesFile.get().asFile.parentFile.mkdirs()
+            // Declare inputs and outputs properly using providers
+            inputs.files(configurations.named("compileClasspath"))
+            outputs.file(dependenciesFile)
 
-            // Get resolved artifacts through Provider API instead of direct project access
-            val dependencies = configurations.named("compileClasspath").get()
-                .resolvedConfiguration.resolvedArtifacts
+            doLast {
+                // Get the file only in the execution phase
+                val outputFile = dependenciesFile.get().asFile
+                logger.lifecycle("Generating dependencies.txt at $outputFile")
 
-            // Write dependencies file
-            dependenciesFile.get().asFile.bufferedWriter().use { writer ->
-                dependencies.forEach { artifact ->
-                    val id = artifact.moduleVersion.id
-                    writer.write("${id.group}\t${id.name}\t${id.version}\t${artifact.file.absolutePath}")
-                    writer.newLine()
+                // Create parent directories
+                outputFile.parentFile.mkdirs()
+
+                // Get resolved artifacts through Provider API
+                val resolvedArtifacts = configurations.named("compileClasspath").get()
+                    .resolvedConfiguration.resolvedArtifacts
+
+                // Write dependencies file
+                outputFile.bufferedWriter().use { writer ->
+                    resolvedArtifacts.forEach { artifact ->
+                        val id = artifact.moduleVersion.id
+                        writer.write("${id.group}\t${id.name}\t${id.version}\t${artifact.file.absolutePath}")
+                        writer.newLine()
+                    }
                 }
-            }
 
-            logger.lifecycle("Generated dependencies.txt at ${dependenciesFile.get()}")
+                logger.lifecycle("Successfully generated dependencies.txt with ${resolvedArtifacts.size} entries")
+            }
         }
-    }
 
         /**
          * Configures Java compilation tasks to depend on dependencies.txt generation.
@@ -152,55 +146,76 @@ afterEvaluate {
         logger.lifecycle("Enabled cross-repository navigation support")
     }
 
-
     /**
-     * Configures SCIP indexing tasks when enabled.
+     * Configures SCIP indexing tasks for generating index files from SemanticDB.
      * Registers two tasks:
-     * - generateScipIndex: Converts SemanticDB files into SCIP index format for code intelligence
-     * - generateSourcegraphIndex: Runs the complete indexing pipeline including compilation and SCIP generation
+     * - generateScipIndex: Converts SemanticDB files to SCIP format
+     * - generateSourcegraphIndex: Runs the complete indexing pipeline including compilation
      *
-     * The SCIP index is used by Sourcegraph for precise code navigation and analysis.
-     * Depends on Java/Kotlin compilation tasks and optionally cross-repository navigation data.
+     * The tasks handle both Java and Kotlin compilation, and optionally include
+     * cross-repository navigation data when enabled.
      */
     if (semanticDB.enableScipIndexing) {
+        // Create a directory creation task that runs before everything else
+        tasks.register("createSemanticDBDirectories") {
+            description = "Creates directories needed for SemanticDB"
+            group = "sourcegraph"
+
+            val scipOutputDir = layout.buildDirectory.dir("scip").get().asFile
+
+            outputs.dir(semanticdbTargetRoot)
+            outputs.dir(scipOutputDir)
+
+            doLast {
+                semanticdbTargetRoot.mkdirs()
+                scipOutputDir.mkdirs()
+                logger.lifecycle("Created SemanticDB directories: $semanticdbTargetRoot and $scipOutputDir")
+            }
+        }
+
+        // Make all the relevant tasks depend on directory creation
+        tasks.withType<JavaCompile>().configureEach {
+            dependsOn("createSemanticDBDirectories")
+        }
+
+        tasks.withType<KotlinCompile>().configureEach {
+            dependsOn("createSemanticDBDirectories")
+        }
+
         tasks.register<JavaExec>("generateScipIndex") {
             description = "Generates SCIP index from SemanticDB files"
             group = "sourcegraph"
 
-            val targetrootDir = layout.buildDirectory.dir("semanticdb-targetroot")
-            val scipOutputDir = layout.buildDirectory.dir("scip")
-            val scipIndexFile = scipOutputDir.map { it.file("index.scip") }
+            // Explicitly declare ALL dependencies
+            dependsOn("createSemanticDBDirectories")
+            dependsOn("generateDependenciesTxt")
+            dependsOn(tasks.withType<JavaCompile>())
+            dependsOn(tasks.withType<KotlinCompile>())
 
-            classpath = configurations.named("runtimeClasspath").get()
+            val scipOutputDir = layout.buildDirectory.dir("scip").get().asFile
+            val scipIndexFile = file("${scipOutputDir.absolutePath}/index.scip")
+
+            classpath = configurations.runtimeClasspath.get()
             mainClass.set("com.sourcegraph.scip_java.ScipJava")
 
             args = listOf(
                 "index-semanticdb",
-                targetrootDir.get().asFile.absolutePath,
+                semanticdbTargetRoot.absolutePath,
                 "--output",
-                scipIndexFile.get().asFile.absolutePath
+                scipIndexFile.absolutePath
             )
 
             doFirst {
-                scipOutputDir.get().asFile.mkdirs()
+                scipOutputDir.mkdirs()
+                logger.lifecycle("Looking for SemanticDB files in: $semanticdbTargetRoot")
             }
 
-            mustRunAfter(tasks.withType<JavaCompile>())
-            mustRunAfter(tasks.withType<KotlinCompile>())
-
-            inputs.dir(targetrootDir)
+            // Properly declare inputs that come from other tasks
+            inputs.dir(semanticdbTargetRoot)
             outputs.file(scipIndexFile)
         }
-        /**
-         * Registers the main Sourcegraph indexing task that runs the complete pipeline.
-         * This task coordinates all necessary steps for code intelligence:
-         * - Java/Kotlin compilation
-         * - Cross-repository navigation data generation (if enabled)
-         * - SCIP index generation from SemanticDB files
-         *
-         * The task ensures proper sequencing of dependent tasks to produce a complete
-         * code intelligence index for Sourcegraph.
-         */
+
+
         tasks.register("generateSourcegraphIndex") {
             description = "Runs the full Sourcegraph indexing pipeline"
             group = "sourcegraph"
