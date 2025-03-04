@@ -3,8 +3,9 @@ package com.sourcegraph.gradle
 import org.gradle.api.DefaultTask
 import org.gradle.api.file.ConfigurableFileCollection
 import org.gradle.api.file.RegularFileProperty
+import org.gradle.api.provider.MapProperty
+import org.gradle.api.provider.Property
 import org.gradle.api.tasks.*
-import java.io.File
 
 abstract class DependenciesTask : DefaultTask() {
     @get:InputFiles
@@ -13,34 +14,55 @@ abstract class DependenciesTask : DefaultTask() {
     @get:OutputFile
     abstract val outputFile: RegularFileProperty
 
+    // Add properties to store project coordinates
+    @get:Input
+    abstract val projectGroup: Property<String>
+
+    // Store a map of project module paths to their names
+    @get:Input
+    abstract val projectModules: MapProperty<String, String>
+
     @TaskAction
     fun generateDependenciesTxt() {
         val file = outputFile.get().asFile
         file.parentFile.mkdirs()
 
+        val group = projectGroup.get()
+        val modules = projectModules.get()
+
         file.bufferedWriter().use { writer ->
-            // Get the files directly from the ConfigurableFileCollection property
-            // No access to project.configurations here
             classpath.files.forEach { depFile ->
-                // We don't have the full metadata, so we'll use the filename to extract
-                // some basic information or just use placeholder values
-                val fileName = depFile.name
-                val parts = fileName.split("-")
+                val absolutePath = depFile.absolutePath
 
-                // This is a simplistic approach - in real code you might want more robust extraction
-                if (parts.size >= 2) {
-                    val lastIndex = parts.lastIndex
-                    val name = parts.subList(0, lastIndex).joinToString("-")
-                    val version = parts[lastIndex].removeSuffix(".jar")
+                // Check if this is a project module JAR
+                val moduleEntry = modules.entries.find { (path, _) ->
+                    absolutePath.contains("$path/build/")
+                }
 
-                    writer.write("extracted\t$name\t$version\t${depFile.absolutePath}")
+                if (moduleEntry != null) {
+                    // This is a project module JAR
+                    val moduleName = moduleEntry.value
+                    // Use project's group and module name as artifact ID
+                    writer.write("$group\t$moduleName\t1.0\t$absolutePath")
                 } else {
-                    writer.write("unknown\tunknown\tunknown\t${depFile.absolutePath}")
+                    // External dependency - extract from filename
+                    val fileName = depFile.name
+                    val parts = fileName.split("-")
+
+                    if (parts.size >= 2) {
+                        val lastIndex = parts.lastIndex
+                        val name = parts.subList(0, lastIndex).joinToString("-")
+                        val version = parts[lastIndex].removeSuffix(".jar")
+
+                        writer.write("extracted\t$name\t$version\t$absolutePath")
+                    } else {
+                        writer.write("unknown\tunknown\tunknown\t$absolutePath")
+                    }
                 }
                 writer.newLine()
             }
         }
 
-        logger.lifecycle("Generated dependencies.txt at ${file}")
+        logger.lifecycle("Generated dependencies.txt at $file")
     }
 }

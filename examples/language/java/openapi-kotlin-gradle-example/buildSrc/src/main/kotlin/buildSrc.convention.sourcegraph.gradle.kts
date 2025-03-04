@@ -77,6 +77,12 @@ afterEvaluate {
     }
 
     if (semanticDB.enableCrossRepoNavigation) {
+        // Gather project module information during configuration
+        val projectModulesMap = mutableMapOf<String, String>()
+        rootProject.subprojects.forEach { subproject ->
+            projectModulesMap[subproject.projectDir.absolutePath] = subproject.name
+        }
+
         val dependenciesTask = tasks.register<com.sourcegraph.gradle.DependenciesTask>("generateDependenciesTxt") {
             description = "Generates dependencies.txt file for cross-repository navigation"
             group = "sourcegraph"
@@ -85,6 +91,12 @@ afterEvaluate {
 
             // Feed the classpath during configuration
             classpath.from(configurations.named("compileClasspath"))
+
+            // Set project coordinates
+            projectGroup.set(project.group.toString())
+            projectModulesMap.forEach { (path, name) ->
+                projectModules.put(path, name)
+            }
 
             outputFile.set(layout.buildDirectory.file("semanticdb-targetroot/dependencies.txt"))
         }
