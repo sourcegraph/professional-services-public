@@ -83,7 +83,7 @@ afterEvaluate {
             projectModulesMap[subproject.projectDir.absolutePath] = subproject.name
         }
 
-        val dependenciesTask = tasks.register<com.sourcegraph.gradle.DependenciesTask>("generateDependenciesTxt") {
+        val dependenciesTask = tasks.register<DependenciesTask>("generateDependenciesTxt") {
             description = "Generates dependencies.txt file for cross-repository navigation"
             group = "sourcegraph"
 
