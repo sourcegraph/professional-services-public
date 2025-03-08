@@ -19,3 +19,11 @@ SRC_ACCESS_TOKEN=sgp_example
 SRC_RBAC_ROLE_NAME="Cody Users"
 LIST_OF_USERNAMES="user1,user2,user3"
 ```
+
+# References
+
+Your Sourcegraph instance also has a fully functional GraphQL API interface available at [https://sourcegraph.example.com/api/console](https://sourcegraph.example.com/api/console)
+
+See Sourcegraph's GraphQL schema [https://github.com/sourcegraph/artifacts/tree/main/gql](https://github.com/sourcegraph/artifacts/tree/main/gql)
+
+Sourcegraph's GraphQL API also supports introspection
