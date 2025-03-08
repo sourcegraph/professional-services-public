@@ -1,11 +1,13 @@
 """
-Sync RBAC role assignment by LDAP group membership
+EXAMPLE: Sync RBAC role assignment by LDAP group membership
 
 ex. Provide access to Cody via Sourcegraph RBAC roles by LDAP group membership
 
+NOTE: THIS IS NOT A SUPPORTED SOURCEGRAPH PRODUCT. This script was written for Sourcegraph Implementation Engineering deployments, and is not intended, designed, built, or supported for use in any other scenario. Feel free to open issues or PRs, but responses are best effort.
+
 Sourcegraph doesn't currently (v6.2) have a built-in way to assign RBAC roles to users based on LDAP group membership
 
-The current workaround is to write and run a script which:
+The current workaround is to write and run a script (like this one) which:
 
 - Queries your directory service to get a list of members of your group
     - Returns their email address which will matches on their Sourcegraph account (username or UPN may also work, depending on your SAML auth provider config)
@@ -33,13 +35,13 @@ The current workaround is to write and run a script which:
     - It could query your LDAP service every few minutes to check for new group members
     - If you have webhooks / a serverless environment, this sync script could be triggered by the webhook
 
-Alternative, write a Bash script to run the src cli: https://sourcegraph.com/docs/cli/references/api
+Alternatively, write a Bash script to run the GraphQL mutations via src cli: https://sourcegraph.com/docs/cli/references/api, but managing the user data attributes via Bash would probably be a struggle bus.
+
 """
 
 
 # Imports
 from datetime import datetime
-import glob
 from dotenv import dotenv_values # https://pypi.org/project/python-dotenv/
 from gql import Client, gql
 from gql.transport.requests import RequestsHTTPTransport
@@ -573,14 +575,17 @@ def main():
 
     # Query again to validate the list now matches, and print a success or failure
     newline()
-    log("Getting the ending list of all users and their roles from the Sourcegraph instance")
+    log("Getting the ending list of all users and their roles from the Sourcegraph instance for a visual check")
     global src_users_and_their_roles_at_end
     src_users_and_their_roles_at_end = get_all_src_users_and_their_roles()
 
     global src_users_with_rbac_role_at_end
     src_users_with_rbac_role_at_end = extract_src_users_with_rbac_role(src_users_and_their_roles_at_end)
 
-    # Compare the starting and ending lists to verify the sync worked
+    # TODO: Compare the starting and ending lists to verify the sync worked
+    # Alert the user if:
+        # src_users_and_their_roles_at_end does not 1:1 match the list of usernames which should be in the role
+        # Other diffs appear in the src_users_and_their_roles_at_start vs src_users_and_their_roles_at_end which are not anticipated
     # diff_src_user_and_roles(src_users_and_their_roles_at_start, src_users_and_their_roles_at_end)
 
     newline()
