@@ -1,11 +1,13 @@
 # LDAP to RBAC sync
 
+## Experimental - This is not a supported Sourcegraph product
+This was created for Sourcegraph Implementation Engineering deployments, and is not intended, designed, built, or supported for use in any other scenario. Feel free to open issues or PRs, but responses are best effort.
+
 Sourcegraph is building out an internal Role Based Access Control framework, however, we have not yet implemented a way to sync role assignments from external directory services, where Enterprise customers have workflows in place to manage user access and roles.
 
-This Python script is an example of how customers can use Sourcegraph's GraphQL API to sync role assignments from an
-external directory service.
+This Python script is an example of how customers can use Sourcegraph's GraphQL API to sync role assignments from an external directory service.
 
-# How to Use
+## How to Use
 
 Customers will need to:
 
@@ -20,7 +22,7 @@ SRC_RBAC_ROLE_NAME="Cody Users"
 LIST_OF_USERNAMES="user1,user2,user3"
 ```
 
-# References
+## References
 
 Your Sourcegraph instance also has a fully functional GraphQL API interface available at [https://sourcegraph.example.com/api/console](https://sourcegraph.example.com/api/console)
 
