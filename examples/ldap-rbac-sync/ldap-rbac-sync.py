@@ -355,9 +355,15 @@ def backup_src_users_and_their_roles_to_file(all_src_users_and_their_roles_gql_o
             os.makedirs(src_users_backup_file_path)
 
         # Back the users and roles JSON blob up to the file
-        with open(src_users_backup_file, 'w') as src_users_backup_file_outfile:
-            log(f"Writing backup of all users and their roles to file: {src_users_backup_file}")
-            json.dump(all_src_users_and_their_roles_gql_output, src_users_backup_file_outfile, indent=4)
+        with open(src_users_backup_file, 'a') as src_users_backup_file_outfile:
+            log(f"Appending backup of all users and their roles to file: {src_users_backup_file}")
+
+            # Add note in top level key of all_src_users_and_their_roles_gql_output with today's date and time
+            all_src_users_and_their_roles_gql_output['backup_info'] = {
+                'backup_time': datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f %z").strip()
+            }
+
+            json.dump(all_src_users_and_their_roles_gql_output, src_users_backup_file_outfile, indent=4, sort_keys=True)
 
     else:
         log("SRC_USERS_BACKUP_FILE is disabled, skipping backup of all users and their roles to file")
