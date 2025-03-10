@@ -338,16 +338,29 @@ def backup_src_users_and_their_roles_to_file(all_src_users_and_their_roles_gql_o
     newline()
     log("Function: backup_src_users_and_their_roles_to_file")
 
-    src_users_backup_file = env_vars_dict['SRC_USERS_BACKUP_FILE']['value']
-    src_users_backup_file_path = os.path.dirname(src_users_backup_file)
 
-    if src_users_backup_file_path and not os.path.exists(src_users_backup_file_path):
-        log(f"Path to SRC_USERS_BACKUP_FILE does not exist, creating directory: {src_users_backup_file_path}")
-        os.makedirs(src_users_backup_file_path)
+    # If env_vars_dict['SRC_USERS_BACKUP_FILE']['value'] is not an empty string
+    # then backup the list of users and their roles to a file
+    if env_vars_dict['SRC_USERS_BACKUP_FILE']['value']:
 
-    with open(src_users_backup_file, 'w') as src_users_backup_file_outfile:
-        log(f"Writing backup of all users and their roles to file: {src_users_backup_file}")
-        json.dump(all_src_users_and_their_roles_gql_output, src_users_backup_file_outfile, indent=4)
+        # Get the file name and path
+        src_users_backup_file = env_vars_dict['SRC_USERS_BACKUP_FILE']['value']
+
+        # Get the file path
+        src_users_backup_file_path = os.path.dirname(src_users_backup_file)
+
+        # If the path doesn't exist, then create it
+        if src_users_backup_file_path and not os.path.exists(src_users_backup_file_path):
+            log(f"Path to SRC_USERS_BACKUP_FILE does not exist, creating directory: {src_users_backup_file_path}")
+            os.makedirs(src_users_backup_file_path)
+
+        # Back the users and roles JSON blob up to the file
+        with open(src_users_backup_file, 'w') as src_users_backup_file_outfile:
+            log(f"Writing backup of all users and their roles to file: {src_users_backup_file}")
+            json.dump(all_src_users_and_their_roles_gql_output, src_users_backup_file_outfile, indent=4)
+
+    else:
+        log("SRC_USERS_BACKUP_FILE is disabled, skipping backup of all users and their roles to file")
 
 
 def extract_src_users_with_rbac_role(src_users_and_their_roles):
