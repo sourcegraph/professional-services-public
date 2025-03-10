@@ -37,6 +37,15 @@ The current workaround is to write and run a script (like this one) which:
 
 Alternatively, write a Bash script to run the GraphQL mutations via src cli: https://sourcegraph.com/docs/cli/references/api, but managing the user data attributes via Bash would probably be a struggle bus.
 
+TODO:
+
+- Implement LDAP query
+- Sort and dedupe users in the list of usernames from the directory service / env var
+- Warn the user if any usernames are not found on the Sourcegraph instance
+- Implement before and after comparison, to verify that:
+    - The needed changes were made
+    - No other changes were made
+
 """
 
 
@@ -49,32 +58,35 @@ import json
 import os
 
 
-# Global variables
+# Global variables and their default values
 env_vars_dict = {
     "SRC_ENDPOINT" : {
         "description": "The URL of your Sourcegraph instance, e.g. https://sourcegraph.example.com",
+        "validation_requirements": "Must begin with http:// or https://",
         "required": True,
         "value": None
     },
     "SRC_ACCESS_TOKEN" : {
-        "description": "Your Sourcegraph site-admin:sudo access token from https://sourcegraph.example.com/user/settings/tokens",
+        "description": "Access Sourcegraph access token from https://sourcegraph.example.com/user/settings/tokens",
+        "validation_requirements": "user:all token scope is sufficient, site-admin:sudo token scope is not required",
         "required": True,
         "value": None
     },
     "SRC_RBAC_ROLE_NAME" : {
-        "description": "The name of the RBAC role to sync with the LDAP group",
+        "description": "Display name of RBAC role in your Sourcegraph instance to sync users to",
+        "required": True,
+        "value": None
+    },
+    "LIST_OF_USERNAMES" : {
+        "description": "The list of usernames from the customer's directory service to sync with the RBAC role, separated by commas",
+        "validation_requirements": "Must match username of users on your Sourcegraph instance, otherwise all users will be removed from the RBAC role",
         "required": True,
         "value": None
     },
     "SRC_USERS_BACKUP_FILE" : {
-        "description": "Path to the backup file of all users and their roles from the Sourcegraph instance",
+        "description": "Path to the backup file of all users and their roles from the Sourcegraph instance, for safety, in case roles are inadvertently removed from users. Leave undeclared to use the default path, declare as an empty string to disable the backup, or provide a path to the backup destination",
         "required": False,
         "value": ".src_users_backup.json"
-    },
-    "LIST_OF_USERNAMES" : {
-        "description": "The list of usernames from the customer's directory service to sync with the RBAC role, separated by commas",
-        "required": False,
-        "value": None
     }
 }
 
@@ -192,7 +204,7 @@ def setup_graphql_client():
     log("Function: setup_graphql_client")
 
     # Set authentication header
-    headers={'Authorization': f'token-sudo token={env_vars_dict['SRC_ACCESS_TOKEN']['value']}'}
+    headers={'Authorization': f'token {env_vars_dict['SRC_ACCESS_TOKEN']['value']}'}
 
     # Configure the transport
     transport = RequestsHTTPTransport(
@@ -236,7 +248,7 @@ def test_connection_and_check_current_user_is_site_admin():
     if current_user_gql_output['currentUser']['siteAdmin']:
         log(f"Verifying Sourcegraph GraphQL API connection, authentication, and current user is Site Admin: \n{json.dumps(current_user_gql_output, indent=4)}")
     else:
-        raise ValueError("Current user is not Site Admin, please use a SRC_ACCESS_TOKEN from a Site Admin with sudo token scope")
+        raise ValueError("Current user is not Site Admin, please use a SRC_ACCESS_TOKEN from a Sourcegraph user account with Site Admin permissions")
 
 
 def get_rbac_role():
@@ -284,13 +296,11 @@ def get_rbac_role():
                 rbac_role = role
                 break
 
-        log(f"\"{rbac_role['name']}\" RBAC role found on Sourcegraph instance with role ID: {rbac_role['id']}")
+        # Print out the permissions of the role for visual verification
+        log(f"\"{rbac_role['name']}\" RBAC role found on Sourcegraph instance:\n{json.dumps(rbac_role, indent=4)}")
 
     else:
-        raise ValueError(f"SRC_RBAC_ROLE_NAME \"{env_vars_dict['SRC_RBAC_ROLE_NAME']['value']}\" not found in RBAC roles from Sourcegraph instance: {json.dumps(rbac_role_names, indent=4)}")
-
-    # Print out the permissions of the role for visual verification
-    log(f"\"{rbac_role['name']}\" RBAC role permissions: \n{json.dumps(rbac_role['permissions']['nodes'], indent=4)}")
+        raise ValueError(f"SRC_RBAC_ROLE_NAME \"{env_vars_dict['SRC_RBAC_ROLE_NAME']['value']}\" not found in RBAC roles from Sourcegraph instance:\n{json.dumps(rbac_role_names, indent=4)}")
 
 
 def get_all_src_users_and_their_roles():
