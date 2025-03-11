@@ -2,7 +2,7 @@
 
 ## Experimental
 
-This was created for Sourcegraph Implementation Engineering deployments, and is not intended, designed, built, or supported for use in any other scenario. Feel free to open issues or PRs, but responses are best effort.
+This was created for Sourcegraph Implementation Engineering deployments, and is not intended, designed, built, or supported for use in any other scenario. Please open PRs with improvements, or issues with feedback; responses are best effort.
 
 ## Purpose
 
