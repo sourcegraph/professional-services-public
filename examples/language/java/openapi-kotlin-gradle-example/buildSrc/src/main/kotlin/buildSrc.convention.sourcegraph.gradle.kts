@@ -15,7 +15,7 @@ val semanticDB = extensions.create<SemanticDBExtension>("semanticDB")
 
 // Configure everything after project evaluation when all configurations are available
 afterEvaluate {
-    val semanticDBVersion = "0.10.3"
+    val semanticDBVersion = "0.10.4"
     val semanticDbKotlinVersion = "0.4.0"
 
     // Add required dependencies based on configuration
