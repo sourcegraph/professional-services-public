@@ -4,6 +4,7 @@ plugins {
     application
     id("org.openapi.generator") version "7.10.0"
     id("org.springframework.boot") version "3.4.3"
+    id("com.github.node-gradle.node") version "3.5.1"
 }
 
 apply(plugin = "io.spring.dependency-management")
@@ -17,6 +18,7 @@ dependencies {
     // Spring Boot dependencies
     implementation(libs.spring.boot.starter.web)
     implementation(libs.spring.boot.starter.webflux)
+    implementation(libs.spring.boot.starter.security)
     testImplementation(libs.spring.boot.starter.test)
 
     // Jackson dependencies - required for OpenAPI client
@@ -44,6 +46,13 @@ java {
     toolchain {
         languageVersion = JavaLanguageVersion.of(17)
     }
+}
+
+node {
+    version.set("18.12.1")
+    download.set(true)
+    workDir.set(file("${project.buildDir}/nodejs"))
+    npmWorkDir.set(file("${project.buildDir}/npm"))
 }
 
 application {
@@ -104,6 +113,24 @@ tasks.named("compileOpenapiJava") {
 }
 
 // Make main Java compilation depend on the openapi compilation
-tasks.compileJava {
+tasks.named("compileJava") {
     dependsOn(tasks.named("compileOpenapiJava"))
 }
+
+
+tasks.named("processResources") {
+    dependsOn("buildReact")
+    doLast {
+        copy {
+            from("${project.projectDir}/src/main/webapp/frontend/build")
+            into("${project.buildDir}/resources/main/static")
+        }
+    }
+}
+
+tasks.register<com.github.gradle.node.npm.task.NpmTask>("buildReact") {
+    dependsOn(tasks.npmInstall)
+    workingDir.set(file("${project.projectDir}/src/main/webapp/frontend"))
+    args.set(listOf("run", "build"))
+}
+
