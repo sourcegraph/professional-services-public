@@ -1,23 +1,24 @@
-import logo from './logo.svg';
+import React from 'react';
 import './App.css';
+import PetList from './components/PetList';
 
 function App() {
   return (
     <div className="App">
       <header className="App-header">
-        <img src={logo} className="App-logo" alt="logo" />
-        <p>
-          Edit <code>src/App.js</code> and save to reload.
-        </p>
-        <a
-          className="App-link"
-          href="https://reactjs.org"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          Learn React
-        </a>
+        <div className="header-content">
+          <h1>Pet Store Application</h1>
+          <p className="header-subtitle">Manage your pet inventory with ease</p>
+        </div>
       </header>
+      <main className="App-main">
+        <div className="content-container">
+          <PetList />
+        </div>
+      </main>
+      <footer className="App-footer">
+        <p>Powered by Sourcegraph Technology</p>
+      </footer>
     </div>
   );
 }

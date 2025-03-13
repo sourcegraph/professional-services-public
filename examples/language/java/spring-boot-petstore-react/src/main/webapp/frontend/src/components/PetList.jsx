@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import axios from 'axios';
+import './PetList.css';
 
 function PetList() {
   const [pets, setPets] = useState([]);
@@ -7,7 +8,7 @@ function PetList() {
   const [error, setError] = useState(null);
 
   useEffect(() => {
-    axios.get('/api/v3/pet/findByStatus?status=available')
+    axios.get('/api/pets/random/10')
       .then(response => {
         setPets(response.data);
         setLoading(false);
@@ -18,8 +19,19 @@ function PetList() {
       });
   }, []);
 
-  if (loading) return <div>Loading pets...</div>;
-  if (error) return <div>Error loading pets: {error}</div>;
+  if (loading) return <div className="loading">Loading pets...</div>;
+  if (error) return <div className="error">Error loading pets: {error}</div>;
+
+  // Helper function to get status class
+  const getStatusClass = (status) => {
+    if (!status) return '';
+    switch(status.toLowerCase()) {
+      case 'available': return 'status-available';
+      case 'pending': return 'status-pending';
+      case 'sold': return 'status-sold';
+      default: return '';
+    }
+  };
 
   return (
     <div className="pet-list">
@@ -27,11 +39,23 @@ function PetList() {
       <div className="pet-grid">
         {pets.map(pet => (
           <div key={pet.id} className="pet-card">
-            <h3>{pet.name}</h3>
-            <p>Status: {pet.status}</p>
-            <p>Category: {pet.category?.name || 'Not categorized'}</p>
             {pet.photoUrls && pet.photoUrls.length > 0 && (
               <img src={pet.photoUrls[0]} alt={pet.name} />
+            )}
+            <h3>{pet.name}</h3>
+            <p>
+              <span className={`pet-status ${getStatusClass(pet.status)}`}>
+                {pet.status || 'Unknown'}
+              </span>
+            </p>
+            <p>Category: {pet.category?.name || 'Not categorized'}</p>
+
+            {pet.tags && pet.tags.length > 0 && (
+              <div className="pet-tags">
+                {pet.tags.map(tag => (
+                  <span key={tag.id} className="tag">{tag.name}</span>
+                ))}
+              </div>
             )}
           </div>
         ))}
