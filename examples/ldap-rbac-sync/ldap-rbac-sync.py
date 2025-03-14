@@ -46,17 +46,11 @@ TODO:
     - Marshall / match these user objects against the user objects from Sourcegraph
         - Such that if one LDAP user has 2 email addresses,
         - they cannot be matched to 2 different Sourcegraph users
-- "List of users with \"{rbac_role_name}\" RBAC role assigned on Sourcegraph instance
+- src_extract_users_with_rbac_role: List of users with \"{rbac_role_name}\" RBAC role assigned on Sourcegraph instance
     - Filter attributes to print to console
         - username
         - email
         - id
-- Implement syncing multiple LDAP groups to RBAC roles
-    - MAP_OF_LDAP_GROUPS_TO_RBAC_ROLES = {
-        "ldap_group_name_1": "rbac_role_name_1",
-        "ldap_group_name_2": "rbac_role_name_2",
-        ...
-    }
 - Implement standard logging library and log levels
 - Implement before and after comparison, to verify that:
     - The needed changes were made
@@ -65,6 +59,12 @@ TODO:
         - src_all_users_and_their_roles_at_end does not 1:1 match the list of usernames
         - Other diffs appear in the src_all_users_and_their_roles_at_start vs src_all_users_and_their_roles_at_end which are not anticipated
             - diff_src_user_and_roles(src_all_users_and_their_roles_at_start, src_all_users_and_their_roles_at_end)
+- Implement syncing multiple LDAP groups to RBAC roles
+    - MAP_OF_LDAP_GROUPS_TO_RBAC_ROLES = {
+        "ldap_group_name_1": "rbac_role_name_1",
+        "ldap_group_name_2": "rbac_role_name_2",
+        ...
+    }
 
 """
 
@@ -985,7 +985,7 @@ def main():
     log("------------------------------------------------------------")
     log("Finishing script")
     log(f"Count of users in the \"{rbac_role_name}\" RBAC role at the start: {len(src_users_with_rbac_role_at_start['users']['nodes'])}")
-    log(f"Count of unique user IDs to try and sync to the \"{rbac_role_name}\" RBAC role: {len(list_of_users_to_sync)}")
+    log(f"Count of unique user IDs to try to sync to the \"{rbac_role_name}\" RBAC role: {len(list_of_users_to_sync)}")
     log(f"Count of users removed from the \"{rbac_role_name}\" RBAC role: {count_of_users_removed_from_rbac_role}")
     log(f"Count of users added to the \"{rbac_role_name}\" RBAC role: {count_of_users_added_to_rbac_role}")
     log(f"Count of user IDs which matched user accounts already in the \"{rbac_role_name}\" RBAC role: {count_of_users_already_in_the_rbac_role}")
