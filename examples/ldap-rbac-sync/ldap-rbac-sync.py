@@ -75,7 +75,7 @@ from dotenv import dotenv_values # https://pypi.org/project/python-dotenv/
 from gql import Client, gql
 from gql.transport.requests import RequestsHTTPTransport
 import json
-import ldap
+import ldap # https://www.python-ldap.org/en/python-ldap-3.3.0/reference/index.html
 import os
 
 
