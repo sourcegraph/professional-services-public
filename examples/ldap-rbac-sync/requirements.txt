@@ -1,3 +1,4 @@
 gql
+python_ldap
 python-dotenv
 requests
