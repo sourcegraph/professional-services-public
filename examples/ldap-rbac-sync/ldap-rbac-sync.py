@@ -38,9 +38,19 @@ The current workaround is to write and run a script (like this one) which:
 Alternatively, write a Bash script to run the GraphQL mutations via src cli: https://sourcegraph.com/docs/cli/references/api, but managing the user data attributes via Bash would probably be a struggle bus.
 
 TODO:
-- Get access to an LDAP endpoint to query against
-- Implement LDAP query in get_list_of_users_from_directory() function
-- Output a summary and count of users added / removed
+- Match users more atomically
+    - If the LDAP attribute to match is mail
+    - Users can have multiple email addresses, but are still one identity
+    - For each LDAP user which is is a member of the group
+        - Add one object to a dict, including all of their email addresses
+    - Marshall / match these user objects against the user objects from Sourcegraph
+        - Such that if one LDAP user has 2 email addresses,
+        - they cannot be matched to 2 different Sourcegraph users
+- "List of users with \"{rbac_role_name}\" RBAC role assigned on Sourcegraph instance
+    - Filter attributes to print to console
+        - username
+        - email
+        - id
 - Implement syncing multiple LDAP groups to RBAC roles
     - MAP_OF_LDAP_GROUPS_TO_RBAC_ROLES = {
         "ldap_group_name_1": "rbac_role_name_1",
@@ -52,9 +62,9 @@ TODO:
     - The needed changes were made
     - No other changes were made
     - Alert the user if:
-        - src_users_and_their_roles_at_end does not 1:1 match the list of usernames
-        - Other diffs appear in the src_users_and_their_roles_at_start vs src_users_and_their_roles_at_end which are not anticipated
-            - diff_src_user_and_roles(src_users_and_their_roles_at_start, src_users_and_their_roles_at_end)
+        - src_all_users_and_their_roles_at_end does not 1:1 match the list of usernames
+        - Other diffs appear in the src_all_users_and_their_roles_at_start vs src_all_users_and_their_roles_at_end which are not anticipated
+            - diff_src_user_and_roles(src_all_users_and_their_roles_at_start, src_all_users_and_their_roles_at_end)
 
 """
 
@@ -65,44 +75,88 @@ from dotenv import dotenv_values # https://pypi.org/project/python-dotenv/
 from gql import Client, gql
 from gql.transport.requests import RequestsHTTPTransport
 import json
+import ldap
 import os
 
 
 ### Global variables and their default values
 env_vars_dict = {
+    "LDAP_BIND_DN" : {
+        "description": "LDAP service account to login (bind) to LDAP server",
+        "validation_requirements": "Valid LDAP account, in DN format, ex. cn=admin,dc=example,dc=org",
+        "required": False,
+        "value": None
+    },
+    "LDAP_BIND_PASSWORD" : {
+        "description": "LDAP service account password",
+        "validation_requirements": "",
+        "required": False,
+        "value": None
+    },
+    "LDAP_GROUP_DN" : {
+        "description": "LDAP group which contains users to sync with RBAC role",
+        "validation_requirements": "Valid LDAP group, in DN format, ex. cn=sourcegraph-cody-users,ou=groups,dc=example,dc=org",
+        "required": False,
+        "value": None
+    },
+    "LDAP_GROUP_MEMBER_ATTRIBUTE" : {
+        "description": "Attribute of the LDAP group which contains the list of members' DNs",
+        "validation_requirements": "Valid LDAP group attribute, ex. member",
+        "required": False,
+        "value": "member"
+    },
+    "LDAP_TRACE_LEVEL" : {
+        "description": "Set the LDAP trace level; 0 for no logging, 1 for only logging the method calls with arguments, 2 for also logging the complete results, and 9 for also logging the traceback of method calls",
+        "validation_requirements": "0, 1, 2, or 9",
+        "required": False,
+        "value": 0
+    },
+    "LDAP_URL" : {
+        "description": "URL to your LDAP directory service",
+        "validation_requirements": "Must include URL schema, host, and port, ex. ldap://localhost:1389",
+        "required": False,
+        "value": None
+    },
+    "LDAP_USER_ID_ATTRIBUTE" : {
+        "description": "Attribute of the LDAP user which contains the user's ID to be matched to a Sourcegraph username or verified email address",
+        "validation_requirements": "Valid LDAP user attribute, ex. mail",
+        "required": False,
+        "value": "mail"
+    },
     "LIST_OF_USERS" : {
-        "description": "The list of usernames and/or verified email addresses from the customer's directory service to sync with the RBAC role, separated by commas",
-        "validation_requirements": "Usernames or email addresses provided must match username or verified email address of users on your Sourcegraph instance, otherwise the RBAC role will be removed from all users",
-        "required": True,
+        "description": "In addition to, or instead of an LDAP query, provide a list of usernames and/or email addresses to sync with the RBAC role, separated by commas",
+        "validation_requirements": "Must match username or verified email address of users on your Sourcegraph instance",
+        "required": False,
         "value": None
     },
     "REMOVE_ALL_USERS_FROM_RBAC_ROLE" : {
-        "description": "Set to True if you're intentionally sending an empty list of users, and wish to remove all users from the RBAC role",
+        "description": "Safeguard against removing all users from the RBAC role, in case an empty list is provided. If intentionally removing all users from the RBAC role, then set to True",
         "validation_requirements": "True or False",
         "required": False,
         "value": False
     },
     "SRC_ACCESS_TOKEN" : {
-        "description": "Access Sourcegraph access token from https://sourcegraph.example.com/user/settings/tokens",
+        "description": "Sourcegraph access token from https://sourcegraph.example.com/user/settings/tokens",
         "validation_requirements": "user:all token scope is sufficient, site-admin:sudo token scope is not required",
         "required": True,
         "value": None
     },
     "SRC_ENDPOINT" : {
         "description": "The URL of your Sourcegraph instance, e.g. https://sourcegraph.example.com",
-        "validation_requirements": "Must begin with http:// or https://",
+        "validation_requirements": "Must begin with either http:// or https://",
         "required": True,
         "value": None
     },
     "SRC_RBAC_ROLE_NAME" : {
-        "description": "Display name of RBAC role in your Sourcegraph instance to sync users to",
+        "description": "Display name of RBAC role in your Sourcegraph instance to sync users to, ex. 'Cody Users'",
+        "validation_requirements": "Must match the name of an existing RBAC role in your Sourcegraph instance",
         "required": True,
         "value": None
     },
     "SRC_TLS_VERIFY" : {
         "description": "Control if / how to verify your Sourcegraph instance's TLS certificate",
         "validation_requirements": [
-            "True (default): Verify your Sourcegraph instance's TLS certificate with the running host OS' default settings",
+            "True: Verify your Sourcegraph instance's TLS certificate with the host OS' trust store",
             "False: Disable verification of your Sourcegraph instance's TLS certificate",
             "string: must be a path to a CA bundle to verify your Sourcegraph instance's TLS certificate against"
         ],
@@ -110,30 +164,31 @@ env_vars_dict = {
         "value": True
     },
     "SRC_USERS_BACKUP_FILE" : {
-        "description": "Path to the backup file of all users and their roles from the Sourcegraph instance, for safety, in case roles are inadvertently removed from users. Leave undeclared to use the default path, declare as an empty string to disable the backup, or provide a path to the backup destination",
+        "description": "Path to the backup file of all users and their roles from the Sourcegraph instance, for safety, in case roles are inadvertently removed from users. ",
+        "validation_requirements": [
+            "Leave undeclared to use the default path",
+            "Provide a path to the backup destination",
+            "Declare as an empty string to disable the backup",
+        ],
         "required": False,
         "value": ".src_users_backup.json"
     },
 }
 
-graphql_client : Client = None
-list_of_users = []
-rbac_role = {}
-src_users_and_their_roles_at_start = {}
-src_users_and_their_roles_at_end = {}
-
-# Use the same JSON dictionary schema as the GraphQL query output
-src_users_with_rbac_role_at_start = {
-    "users": {
-        "nodes": []
-    }
-}
-
-src_users_with_rbac_role_at_end = {
-    "users": {
-        "nodes": []
-    }
-}
+count_of_users_added_to_rbac_role = 0
+count_of_users_already_in_the_rbac_role = 0
+count_of_users_did_not_match_src_user_accounts = 0
+count_of_users_removed_from_rbac_role = 0
+ldap_client : ldap.ldapobject = None
+ldap_users_to_sync = []
+list_of_users_to_sync = []
+src_all_users_and_their_roles_at_end = {}
+src_all_users_and_their_roles_at_start = {}
+src_graphql_client : Client = None
+src_rbac_role = {}
+src_users_with_rbac_role_at_end = {"users": {"nodes": []}}
+src_users_with_rbac_role_at_start = {"users": {"nodes": []}}
+user_objects_to_sync = {"users": {"nodes": []}}
 
 
 ### Functions
@@ -183,8 +238,11 @@ def read_env_vars():
         # If the env var was found, print it out
         if env_var_found:
 
-            # Don't print the access token
-            if env_var == "SRC_ACCESS_TOKEN":
+            # Don't print credentials
+            if env_var in [
+                "SRC_ACCESS_TOKEN",
+                "LDAP_BIND_PASSWORD"
+            ]:
                 log(f"Found env: {env_var}=***********")
 
             else:
@@ -193,6 +251,21 @@ def read_env_vars():
     # If any required environment variables are missing, raise an error and exit
     if missing_required_env_var:
         raise ValueError("One or more required environment variables are missing, please configure them in the .env file, or export them into environment variables")
+
+    # # If a LDAP_SEARCH_ATTRIBUTES_LIST value is passed in, split it into an array of strings
+    # if env_vars_dict['LDAP_SEARCH_ATTRIBUTES_LIST']['value']:
+    #     env_vars_dict['LDAP_SEARCH_ATTRIBUTES_LIST']['value'] = env_vars_dict['LDAP_SEARCH_ATTRIBUTES_LIST']['value'].split(",")
+
+    # Validate LDAP_TRACE_LEVEL is either 0, 1, 2, or 9
+    if int(env_vars_dict['LDAP_TRACE_LEVEL']['value']) in (0, 1, 2, 9):
+        # If yes, convert to int
+        env_vars_dict['LDAP_TRACE_LEVEL']['value'] = int(env_vars_dict['LDAP_TRACE_LEVEL']['value'])
+    else:
+        raise ValueError("LDAP_TRACE_LEVEL must be one of: 0, 1, 2, or 9")
+
+    # if LDAP_URL in env vars
+    # verify it starts with ldap:// or ldaps://
+    # verify it ends with :port
 
     # Try casting REMOVE_ALL_USERS_FROM_RBAC_ROLE to a boolean
     remove_all_users_from_rbac_role = str(env_vars_dict['REMOVE_ALL_USERS_FROM_RBAC_ROLE']['value']).lower()
@@ -223,65 +296,13 @@ def read_env_vars():
     # and let the gql library provide the error
 
 
-def get_list_of_users_from_directory():
-    """
-    Get the list of usernames from the directory service
-    """
-
-    newline()
-    log("Function: get_list_of_users_from_directory")
-
-    # TODO: Implement this function
-    # Current workaround is to read the list of usernames / email addresses from the LIST_OF_USERS env var
-
-    # If we call this function after we get the list of all users from the Sourcegraph instance
-    # then we could try to dedupe the provided list of usernames and email addresses
-    # against the list of usernames and email addresses from the Sourcegraph instance
-    # in the cases where both a username and email address are
-        # provided in the list to be added
-        # or removed from the list
-    # in the same run of the script
-    # but are attached to the same Sourcegraph account
-    # But the only downside to duplicates
-    # is duplicated GraphQL mutations sent
-    # The end result is the same
-    # There's no change even if a username is removed from the list and an email address is added
-
-    global list_of_users # Global required when modifying global variable in function
-
-    if env_vars_dict['LIST_OF_USERS']['value']:
-
-        # Read the comma-delimited list of usernames / email addresses from the env var
-        list_of_users = sorted(                                             # Sort the list with sorted()
-            list(                                                           # Read into list() to sort
-                set(                                                        # Read into a set() to deduplicate strings
-                    env_vars_dict['LIST_OF_USERS']['value'].split(',')      # Split string to list, on commas
-                )
-            )
-        )
-
-        # Remove empty strings, ex. repeated or trailing commas
-        list_of_users[:] = [string for string in list_of_users if string.strip()]
-
-        log(f"List of usernames and/or email addresses provided in LIST_OF_USERS (sorted and deduplicated): {json.dumps(list_of_users, indent=4)}")
-
-    else:
-
-        if env_vars_dict['REMOVE_ALL_USERS_FROM_RBAC_ROLE']['value']:
-
-            log("WARNING: LIST_OF_USERS is empty, and REMOVE_ALL_USERS_FROM_RBAC_ROLE is True, this will remove all users from RBAC role")
-
-        else:
-            raise ValueError("LIST_OF_USERS is empty, and REMOVE_ALL_USERS_FROM_RBAC_ROLE is False, please provide a list of usernames or email addresses from the customer's directory service to sync with the RBAC role, or set REMOVE_ALL_USERS_FROM_RBAC_ROLE to True to remove all users from the RBAC role")
-
-
-def setup_graphql_client():
+def src_setup_graphql_client():
     """
     Create a GraphQL client with the given endpoint and authentication
     """
 
     newline()
-    log("Function: setup_graphql_client")
+    log("Function: src_setup_graphql_client")
 
     # Set authentication header
     headers={'Authorization': f'token {env_vars_dict['SRC_ACCESS_TOKEN']['value']}'}
@@ -296,20 +317,20 @@ def setup_graphql_client():
     )
 
     # Create the client
-    global graphql_client
-    graphql_client = Client(
+    global src_graphql_client
+    src_graphql_client = Client(
         transport=transport,
         fetch_schema_from_transport=True
     )
 
 
-def test_connection_and_check_current_user_is_site_admin():
+def src_test_graphql_connection_and_check_current_user_is_site_admin():
     """
     Check that the current user is a site admin, and the connection to the GraphQL API is working
     """
 
     newline()
-    log("Function: test_connection_and_check_current_user_is_site_admin")
+    log("Function: src_test_graphql_connection_and_check_current_user_is_site_admin")
 
     # Write the query
     current_user_gql_query = gql("""
@@ -322,7 +343,7 @@ def test_connection_and_check_current_user_is_site_admin():
     """)
 
     # Run the query, capture the output
-    current_user_gql_output = graphql_client.execute(current_user_gql_query)
+    current_user_gql_output = src_graphql_client.execute(current_user_gql_query)
     # Let the GraphQL client raise any network connectivity, TLS, etc. errors
 
     # If the current user is not a site admin, exit
@@ -332,14 +353,14 @@ def test_connection_and_check_current_user_is_site_admin():
         raise ValueError("Current user is not Site Admin, please use a SRC_ACCESS_TOKEN from a Sourcegraph user account with Site Admin permissions")
 
 
-def get_rbac_role():
+def src_get_rbac_role():
     """
     Get the RBAC role from the Sourcegraph instance by the name provided
     Sourcegraph requires that RBAC role names are unique, so it's safe to lookup the role by name
     """
 
     newline()
-    log("Function: get_rbac_role")
+    log("Function: src_get_rbac_role")
 
     # Write the query
     rbac_role_id_gql_query = gql("""
@@ -362,7 +383,7 @@ def get_rbac_role():
     """)
 
     # Run the query, capture the output
-    rbac_role_id_gql_output = graphql_client.execute(rbac_role_id_gql_query)
+    rbac_role_id_gql_output = src_graphql_client.execute(rbac_role_id_gql_query)
 
     # Get the Role names from the output
     rbac_role_names = [role['name'] for role in rbac_role_id_gql_output['roles']['nodes']]
@@ -373,24 +394,24 @@ def get_rbac_role():
         # Sourcegraph requires that RBAC role names are unique, so we can just grab the first one with a matching name
         for role in rbac_role_id_gql_output['roles']['nodes']:
             if role['name'] == env_vars_dict['SRC_RBAC_ROLE_NAME']['value']:
-                global rbac_role
-                rbac_role = role
+                global src_rbac_role
+                src_rbac_role = role
                 break
 
         # Print out the permissions of the role for visual verification
-        log(f"\"{rbac_role['name']}\" RBAC role found on Sourcegraph instance:\n{json.dumps(rbac_role, indent=4)}")
+        log(f"\"{src_rbac_role['name']}\" RBAC role found on Sourcegraph instance:\n{json.dumps(src_rbac_role, indent=4)}")
 
     else:
         raise ValueError(f"SRC_RBAC_ROLE_NAME \"{env_vars_dict['SRC_RBAC_ROLE_NAME']['value']}\" not found in RBAC roles from Sourcegraph instance:\n{json.dumps(rbac_role_names, indent=4)}")
 
 
-def get_all_src_users_and_their_roles():
+def src_get_all_users_and_their_roles():
     """
     Get the list of all users and their roles from the Sourcegraph instance
     """
 
     newline()
-    log("Function: get_all_src_users_and_their_roles")
+    log("Function: src_get_all_users_and_their_roles")
 
     # Write the query
     all_src_users_and_their_roles_gql_query = gql("""
@@ -415,7 +436,7 @@ def get_all_src_users_and_their_roles():
     """)
 
     # Run the query, capture the output
-    all_src_users_and_their_roles_gql_output = graphql_client.execute(all_src_users_and_their_roles_gql_query)
+    all_src_users_and_their_roles_gql_output = src_graphql_client.execute(all_src_users_and_their_roles_gql_query)
 
     if not all_src_users_and_their_roles_gql_output:
         raise ValueError("GraphQL query returned no users from Sourcegraph instance")
@@ -425,13 +446,13 @@ def get_all_src_users_and_their_roles():
     return all_src_users_and_their_roles_gql_output
 
 
-def backup_src_users_and_their_roles_to_file():
+def src_backup_all_users_and_their_roles_to_file():
     """
-    Back up src_users_and_their_roles_at_start to a file, in case something goes sideways and a restore is needed
+    Back up src_all_users_and_their_roles_at_start to a file, in case something goes sideways and a restore is needed
     """
 
     newline()
-    log("Function: backup_src_users_and_their_roles_to_file")
+    log("Function: src_backup_all_users_and_their_roles_to_file")
 
 
     # If env_vars_dict['SRC_USERS_BACKUP_FILE']['value'] is not an empty string
@@ -455,12 +476,12 @@ def backup_src_users_and_their_roles_to_file():
             log(f"Appending backup of all users and their roles to file: {src_users_backup_file}")
 
             # Add note in top level key of all_src_users_and_their_roles_gql_output with today's date and time
-            src_users_and_their_roles_at_start['backup_info'] = {
+            src_all_users_and_their_roles_at_start['backup_info'] = {
                 'backup_time': datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f %z").strip()
             }
 
             # Write to the file
-            json.dump(src_users_and_their_roles_at_start, src_users_backup_file_outfile, indent=4, sort_keys=True)
+            json.dump(src_all_users_and_their_roles_at_start, src_users_backup_file_outfile, indent=4, sort_keys=True)
 
             # Let json.dump() raise an exception if writing to disk fails, don't want to proceed without a backup
 
@@ -468,13 +489,13 @@ def backup_src_users_and_their_roles_to_file():
         log("SRC_USERS_BACKUP_FILE is disabled, skipping backup of all users and their roles to file")
 
 
-def extract_src_users_with_rbac_role(src_users_and_their_roles):
+def src_extract_users_with_rbac_role(src_users_and_their_roles):
     """
     Extract the subset of user objects from the Sourcegraph instance with this RBAC role assigned
     """
 
     newline()
-    log("Function: extract_src_users_with_rbac_role")
+    log("Function: src_extract_users_with_rbac_role")
 
     # Use the same JSON schema as the GraphQL response
     src_users_with_rbac_role = {
@@ -484,7 +505,7 @@ def extract_src_users_with_rbac_role(src_users_and_their_roles):
     }
 
     # Make variables easier to read
-    rbac_role_name = rbac_role['name']
+    rbac_role_name = src_rbac_role['name']
 
     # Get the users who have the RBAC role
     for user_object in src_users_and_their_roles['users']['nodes']:
@@ -501,24 +522,213 @@ def extract_src_users_with_rbac_role(src_users_and_their_roles):
     return src_users_with_rbac_role
 
 
-def remove_rbac_role_from_users_not_in_list():
+def ldap_setup_and_test_client():
+    """
+    Create an LDAP client with the given URL
+    """
+
+    newline()
+    log("Function: ldap_setup_and_test_client")
+
+    # Modifying the global variable
+    global ldap_client
+
+    # If LDAP_URL is not set, skip LDAP client setup
+    if not env_vars_dict['LDAP_URL']['value']:
+        log("LDAP_URL is not set, skipping LDAP client setup")
+        return
+
+    # Create the client
+    ldap_client = ldap.initialize(
+        uri=env_vars_dict['LDAP_URL']['value'],
+        trace_level=env_vars_dict['LDAP_TRACE_LEVEL']['value']
+    )
+
+    ldap_client.simple_bind_s(
+        who=env_vars_dict['LDAP_BIND_DN']['value'],
+        cred=env_vars_dict['LDAP_BIND_PASSWORD']['value']
+    )
+
+
+def ldap_get_user_ids():
+    """
+    Get the list of user IDs from the LDAP group's members
+    """
+
+    newline()
+    log("Function: ldap_get_user_ids")
+
+    # Modifying the global variable
+    global ldap_users_to_sync
+
+    # If LDAP client isn't initiated, skip trying to query it
+    if not ldap_client:
+        log("LDAP client not initialized, skipping LDAP query")
+        return
+
+    # Get the list of members from the LDAP group
+    ldap_group_members_list_of_tuples = ldap_client.search_s(
+        base=env_vars_dict['LDAP_GROUP_DN']['value'],
+        scope=ldap.SCOPE_BASE,
+        attrlist=[env_vars_dict['LDAP_GROUP_MEMBER_ATTRIBUTE']['value']]
+    )
+
+    # [
+    #     (
+    #         'cn=sourcegraph-cody-users,ou=groups,dc=example,dc=org',
+    #         {
+    #             'member': [
+    #                 b'cn=user1,ou=users,dc=example,dc=org',
+    #                 b'cn=user2,ou=users,dc=example,dc=org'
+    #             ]
+    #         }
+    #     )
+    # ]
+
+    # If the length of ldap_group_members_list_of_tuples is not equal to 1 then the provided group DN is not valid
+    if len(ldap_group_members_list_of_tuples) != 1:
+        raise ValueError(f"LDAP group search returned {len(ldap_group_members_list_of_tuples)} groups, expected 1")
+
+    # Get the list of members from the LDAP group, as a list of strings instead of byte_strings
+    ldap_group_members_dn_list = [
+        member.decode('utf-8')
+        for member in ldap_group_members_list_of_tuples[0][1][env_vars_dict['LDAP_GROUP_MEMBER_ATTRIBUTE']['value']]
+    ]
+
+    # Output the results
+    log(f"LDAP group members' DNs:\n{json.dumps(ldap_group_members_dn_list, indent=4)}")
+
+
+    # For each group member DN, query the LDAP server to get their LDAP_USER_ID_ATTRIBUTE
+    # and add it to the list of users to sync
+    for group_member_dn in ldap_group_members_dn_list:
+
+        # Query the LDAP server to get their LDAP_USER_ID_ATTRIBUTE
+        # and add it to the list of users to sync
+        ldap_user_object = ldap_client.search_s(
+            base=group_member_dn,
+            scope=ldap.SCOPE_BASE,
+            attrlist=[env_vars_dict['LDAP_USER_ID_ATTRIBUTE']['value']]
+        )
+
+        # [
+        #     (
+        #         'cn=user1,ou=users,dc=example,dc=org',
+        #         {
+        #             'mail':
+        #             [
+        #                 b'user1@example.com'
+        #             ]
+        #         }
+        #     )
+        # ]
+
+        ldap_user_id_list = [
+            id_attribute_instance.decode('utf-8')
+            for id_attribute_instance in ldap_user_object[0][1][env_vars_dict['LDAP_USER_ID_ATTRIBUTE']['value']]
+        ]
+
+        log(f"LDAP user IDs from DN \"{group_member_dn}\":\n{json.dumps(ldap_user_id_list, indent=4)}")
+
+        # It's fine if the user has multiple IDs, just add them all for now, and we'll deduplicate them at marshalling time
+        if ldap_user_id_list:
+            ldap_users_to_sync += ldap_user_id_list
+
+
+def combine_and_dedupe_list_of_users_to_sync():
+    """
+    Combine list of users from the env var and the LDAP query, dedupe and sort them
+    """
+
+    newline()
+    log("Function: combine_and_dedupe_list_of_users_to_sync")
+
+    # Global required when modifying global variable in function
+    global list_of_users_to_sync
+
+    if ldap_users_to_sync:
+
+        list_of_users_to_sync += ldap_users_to_sync
+
+    if env_vars_dict['LIST_OF_USERS']['value']:
+
+        # Read the comma-delimited list of usernames / email addresses from the env var
+        # Split string to list, on commas, and remove whitespace
+        list_of_users_to_sync += env_vars_dict['LIST_OF_USERS']['value'].split(',')
+
+    if list_of_users_to_sync:
+
+        list_of_users_to_sync = sorted(                                 # Sort the list
+            list(                                               # Read into list() to sort
+                set(                                            # Read into a set() to deduplicate strings
+                    [user.strip() for user in list_of_users_to_sync]    # Strip starting / trailing whitespace from each string
+                )
+            )
+        )
+
+        # Remove empty strings, ex. repeated or trailing commas
+        list_of_users_to_sync[:] = [string for string in list_of_users_to_sync if string.strip()]
+
+        log(f"List of usernames and/or email addresses to sync with RBAC role (sorted and deduplicated):\n{json.dumps(list_of_users_to_sync, indent=4)}")
+
+    else:
+
+        if env_vars_dict['REMOVE_ALL_USERS_FROM_RBAC_ROLE']['value']:
+
+            log("WARNING: List of users is empty, and REMOVE_ALL_USERS_FROM_RBAC_ROLE is True, this will remove all users from RBAC role")
+
+        else:
+            raise ValueError("List of users is empty, and REMOVE_ALL_USERS_FROM_RBAC_ROLE is False, please provide a list of usernames or email addresses from the customer's directory service to sync with the RBAC role, or set REMOVE_ALL_USERS_FROM_RBAC_ROLE to True to remove all users from the RBAC role")
+
+
+def marshall_list_of_users_to_sync_to_src_user_objects():
+    """
+    Match the list of usernames and email addresses to the list of user objects from the Sourcegraph instance
+    """
+
+    newline()
+    log("Function: marshall_list_of_users_to_sync_to_src_user_objects")
+
+    # Global required when modifying global variable in function
+    global user_objects_to_sync
+
+    # Dedupe the list of usernames and email addresses
+    # against the list of usernames and email addresses from the Sourcegraph instance
+    # in the cases where both a username and email address are
+        # provided in the list to be added
+        # or removed from the list
+    # in the same run of the script
+    # but are attached to the same Sourcegraph account
+    # But the only downside to duplicates
+    # is duplicated GraphQL mutations sent
+    # The end result is the same
+    # There's no change even if a username is removed from the list and an email address is added
+
+
+def src_remove_rbac_role_from_users_not_in_list():
     """
     Remove the RBAC role from users who are not in the list
     """
 
     newline()
-    log("Function: remove_rbac_role_from_users_not_in_list")
+    log("Function: src_remove_rbac_role_from_users_not_in_list")
+
+    # Global required when modifying global variable in function
+    global count_of_users_removed_from_rbac_role
 
     # log(f"DEBUG: src_users_with_rbac_role_at_start: {json.dumps(src_users_with_rbac_role_at_start, indent=4)}")
 
     # Make variables easier to read
     rbac_role_user_objects = src_users_with_rbac_role_at_start['users']['nodes']
-    rbac_role_name = rbac_role['name']
+    rbac_role_name = src_rbac_role['name']
 
     # If no users have this RBAC role, return early
-    if not rbac_role_user_objects:
+    if rbac_role_user_objects:
+        log(f"Count of users in the \"{rbac_role_name}\" RBAC role before removing users: {len(rbac_role_user_objects)}")
+    else:
         log(f"No users in the \"{rbac_role_name}\" RBAC role, skipping removal")
         return
+
 
     # Iterate through the list of users in the RBAC role
     for user_object in rbac_role_user_objects:
@@ -541,7 +751,7 @@ def remove_rbac_role_from_users_not_in_list():
         # log(f"DEBUG: Username_and_verified_emails:\n{json.dumps(username_and_verified_emails, indent=4)}")
 
         # If neither their username, nor any of their verified emails are in the list
-        if not any(username_or_email in list_of_users for username_or_email in username_and_verified_emails):
+        if not any(username_or_email in list_of_users_to_sync for username_or_email in username_and_verified_emails):
 
             log(f"User \"{username}\" started in the \"{rbac_role_name}\" RBAC role, but not in the LDAP group; removing \"{rbac_role_name}\" from their list of RBAC roles")
 
@@ -559,7 +769,8 @@ def remove_rbac_role_from_users_not_in_list():
             # log(f"User \"{username}\" sending changes now")
 
             # Set their roles
-            set_user_roles(user_object['id'], [user_role['id'] for user_role in user_roles])
+            src_set_user_roles(user_object['id'], [user_role['id'] for user_role in user_roles])
+            count_of_users_removed_from_rbac_role += 1
 
             # log(f"User \"{username}\" changes sent")
 
@@ -567,21 +778,28 @@ def remove_rbac_role_from_users_not_in_list():
             log(f"User \"{username}\" is in both the LDAP group and the \"{rbac_role_name}\" RBAC role, skipping removal")
 
 
-def add_rbac_role_to_users_in_ldap_group():
+def src_add_rbac_role_to_users_in_list():
     """
-    Add the RBAC role to users who are in the LDAP group
+    Add the RBAC role to users who are in the list
     """
 
     newline()
-    log("Function: add_rbac_role_to_users_in_ldap_group")
+    log("Function: src_add_rbac_role_to_users_in_list")
 
     # If no users were sent, skip adding them
-    if not list_of_users:
-        log("No users in LDAP group, skipping addition")
+    if list_of_users_to_sync:
+        log(f"Count of user IDs in the list to try and add: {len(list_of_users_to_sync)}")
+    else:
+        log("No users in the list to add, skipping addition")
         return
 
+    # Global required when modifying global variable in function
+    global count_of_users_added_to_rbac_role
+    global count_of_users_already_in_the_rbac_role
+    global count_of_users_did_not_match_src_user_accounts
+
     # Make variables easier to read
-    rbac_role_name = rbac_role['name']
+    rbac_role_name = src_rbac_role['name']
 
     # Get the list of usernames and emails already in the RBAC role
     rbac_role_user_objects  = [user_object for user_object in src_users_with_rbac_role_at_start['users']['nodes']]
@@ -595,7 +813,7 @@ def add_rbac_role_to_users_in_ldap_group():
     # log(f"rbac_role_usernames_and_emails: \n{json.dumps(rbac_role_usernames_and_emails, indent=4)}")
 
     # Iterate through the list of usernames in the LDAP group
-    for username_or_email in list_of_users:
+    for username_or_email in list_of_users_to_sync:
 
         # If they are not in the RBAC role
         if username_or_email not in rbac_role_usernames_and_emails:
@@ -604,7 +822,7 @@ def add_rbac_role_to_users_in_ldap_group():
             user_object = None
 
             # Find the user's object in the dict of all user objects
-            for src_user_object in src_users_and_their_roles_at_start['users']['nodes']:
+            for src_user_object in src_all_users_and_their_roles_at_start['users']['nodes']:
 
                 # Grab the first user object from the Sourcegraph instance which matches
                 # Either the username or any of the verified emails
@@ -627,33 +845,35 @@ def add_rbac_role_to_users_in_ldap_group():
                 #log(f"User \"{username_or_email}\" starting roles IDs:\n{json.dumps(user_role_ids_list, indent=4)}")
 
                 # Add the RBAC role ID to their list of role IDs
-                user_role_ids_list.append(rbac_role['id'])
+                user_role_ids_list.append(src_rbac_role['id'])
 
                 #log(f"User \"{username_or_email}\" ending roles IDs:\n{json.dumps(user_role_ids_list, indent=4)}")
 
                 #log(f"User \"{username_or_email}\" sending changes now")
 
                 # Set their roles
-                set_user_roles(user_object['id'], user_role_ids_list)
+                src_set_user_roles(user_object['id'], user_role_ids_list)
+                count_of_users_added_to_rbac_role += 1
 
                 #log(f"User \"{username_or_email}\" changes sent")
 
             else:
-
+                count_of_users_did_not_match_src_user_accounts += 1
                 log(f"WARNING: User \"{username_or_email}\" does not match an account on this Sourcegraph instance, skipping addition")
 
         else:
+            count_of_users_already_in_the_rbac_role += 1
             log(f"User \"{username_or_email}\" already in \"{rbac_role_name}\" RBAC role, skipping addition")
 
 
-def set_user_roles(user_id, role_ids):
+def src_set_user_roles(user_id, role_ids):
     """
     Set the RBAC roles of a user
     Must include all roles, the list of roles sent overwrite all of the user's roles
     """
 
     newline()
-    log("Function: set_user_roles")
+    log("Function: src_set_user_roles")
 
     # Write the mutation
     set_user_roles_gql_mutation = gql("""
@@ -671,7 +891,7 @@ def set_user_roles(user_id, role_ids):
     }
 
     # Run the mutation and capture the output
-    set_user_roles_gql_output = graphql_client.execute(
+    set_user_roles_gql_output = src_graphql_client.execute(
         set_user_roles_gql_mutation,
         variable_values=set_user_roles_gql_variables
     )
@@ -701,55 +921,76 @@ def main():
     log("Script started")
     log("------------------------------------------------------------")
 
+
+    ## Setup
+
     # Get configuration from environment variables
     read_env_vars()
 
-    # Get the list of usernames from the directory service
-    get_list_of_users_from_directory()
+    ## Sourcegraph
 
     # Create the client
-    setup_graphql_client()
+    src_setup_graphql_client()
 
     # Test the client, verify the current user is a site admin
-    test_connection_and_check_current_user_is_site_admin()
+    src_test_graphql_connection_and_check_current_user_is_site_admin()
 
     # Get the RBAC role ID and permissions
-    get_rbac_role()
+    src_get_rbac_role()
 
     # Get a list of all users and their roles from the Sourcegraph instance
     # Store them for later comparison
     newline()
     log("Getting the starting list of all users and their roles from the Sourcegraph instance")
-    global src_users_and_their_roles_at_start
-    src_users_and_their_roles_at_start = get_all_src_users_and_their_roles()
+    global src_all_users_and_their_roles_at_start
+    src_all_users_and_their_roles_at_start = src_get_all_users_and_their_roles()
 
-    # Backup src_users_and_their_roles_at_start to a file
-    backup_src_users_and_their_roles_to_file()
+    # Backup src_all_users_and_their_roles_at_start to a file
+    src_backup_all_users_and_their_roles_to_file()
 
     # Extract the list of usernames who already have the RBAC role
     # Store them for later comparison
     global src_users_with_rbac_role_at_start
-    src_users_with_rbac_role_at_start = extract_src_users_with_rbac_role(src_users_and_their_roles_at_start)
+    src_users_with_rbac_role_at_start = src_extract_users_with_rbac_role(src_all_users_and_their_roles_at_start)
+
+    ## LDAP
+
+    ldap_setup_and_test_client()
+    ldap_get_user_ids()
+
+    # Get the list of usernames from the directory service
+    combine_and_dedupe_list_of_users_to_sync()
+    # marshall_list_of_users_to_sync_to_src_user_objects()
 
     # Sync the list of users in the RBAC role with the list of users in the LDAP group
-    remove_rbac_role_from_users_not_in_list()
+    src_remove_rbac_role_from_users_not_in_list()
 
     # Sync the members of the LDAP group to the RBAC role
-    add_rbac_role_to_users_in_ldap_group()
+    src_add_rbac_role_to_users_in_list()
 
     # Query again to validate the list now matches, and print a success or failure
     # Store them for comparison
     newline()
     log("Getting the ending list of all users and their roles from the Sourcegraph instance for a visual check")
-    global src_users_and_their_roles_at_end
-    src_users_and_their_roles_at_end = get_all_src_users_and_their_roles()
+    global src_all_users_and_their_roles_at_end
+    src_all_users_and_their_roles_at_end = src_get_all_users_and_their_roles()
 
     global src_users_with_rbac_role_at_end
-    src_users_with_rbac_role_at_end = extract_src_users_with_rbac_role(src_users_and_their_roles_at_end)
+    src_users_with_rbac_role_at_end = src_extract_users_with_rbac_role(src_all_users_and_their_roles_at_end)
+
+    # Make variables easier to read
+    rbac_role_name = src_rbac_role['name']
 
     newline()
     log("------------------------------------------------------------")
     log("Finishing script")
+    log(f"Count of users in the \"{rbac_role_name}\" RBAC role at the start: {len(src_users_with_rbac_role_at_start['users']['nodes'])}")
+    log(f"Count of unique user IDs to try and sync to the \"{rbac_role_name}\" RBAC role: {len(list_of_users_to_sync)}")
+    log(f"Count of users removed from the \"{rbac_role_name}\" RBAC role: {count_of_users_removed_from_rbac_role}")
+    log(f"Count of users added to the \"{rbac_role_name}\" RBAC role: {count_of_users_added_to_rbac_role}")
+    log(f"Count of user IDs which matched user accounts already in the \"{rbac_role_name}\" RBAC role: {count_of_users_already_in_the_rbac_role}")
+    log(f"Count of user IDs which didn't match user accounts on the Sourcegraph instance: {count_of_users_did_not_match_src_user_accounts}")
+    log(f"Count of users in the \"{rbac_role_name}\" RBAC role at the end: {len(src_users_with_rbac_role_at_end['users']['nodes'])}")
     log("------------------------------------------------------------")
     newline()
 
