@@ -28,9 +28,6 @@ def parse_manifest(xml_file, default_fetch):
             for linkfile in project.findall("linkfile")
         ]
 
-        remote_url = f"{fetch}/{name}"
-        print(f"git clone {remote_url}")
-
         projects.append({
             "path": path,
             "name": name,
@@ -46,26 +43,49 @@ def build_tree(projects):
         parts = project["path"].split("/")
         current = tree
         for part in parts[:-1]:
+            if part in current and not isinstance(current[part], dict):
+                current[part] = {"__project__": current[part]}
             current = current.setdefault(part, {})
-        current[parts[-1]] = {
-            "name": project["name"],
-            "groups": project["groups"],
-            "remote_url": project["remote_url"],
-            "linkfiles": project["linkfiles"]
-        }
+        
+        if parts[-1] in current and isinstance(current[parts[-1]], dict):
+            current[parts[-1]]["__project__"] = {
+                "name": project["name"],
+                "groups": project["groups"],
+                "remote_url": project["remote_url"],
+                "linkfiles": project["linkfiles"]
+            }
+        else:
+            current[parts[-1]] = {
+                "name": project["name"],
+                "groups": project["groups"],
+                "remote_url": project["remote_url"],
+                "linkfiles": project["linkfiles"]
+            }
     return tree
 
 def generate_markdown(tree, indent=0):
     markdown = ""
     for key, value in sorted(tree.items()):
-        if isinstance(value, dict) and "name" in value:
-            markdown += " " * indent + f"- [{key}/]({value['remote_url']})\n"
-            for src, dest in value.get("linkfiles", []):
-                markdown += " " * (indent + 2) + f"- [{src}]({value['remote_url']}/{src}) → [{dest}]({value['remote_url']}/{dest})\n"
-        else:
-            markdown += " " * indent + f"- {key}/\n"
-            markdown += generate_markdown(value, indent + 2)
+        if key == "__project__":
+            continue
+            
+        if isinstance(value, dict):
+            if "name" in value and "__project__" not in value:
+                markdown += " " * indent + f"- [{key}/]({value['remote_url']})\n"
+                for src, dest in value.get("linkfiles", []):
+                    markdown += " " * (indent + 2) + f"- [{src}]({value['remote_url']}/{src}) → [{dest}]({value['remote_url']}/{dest})\n"
+            else:
+                project_info = value.get("__project__")
+                if project_info:
+                    markdown += " " * indent + f"- [{key}/]({project_info['remote_url']})\n"
+                    for src, dest in project_info.get("linkfiles", []):
+                        markdown += " " * (indent + 2) + f"- [{src}]({project_info['remote_url']}/{src}) → [{dest}]({project_info['remote_url']}/{dest})\n"
+                else:
+                    markdown += " " * indent + f"- {key}/\n"
+                
+                markdown += generate_markdown(value, indent + 2)
     return markdown
+
 
 def main():
     parser = argparse.ArgumentParser(description='Process an XML manifest file.')
@@ -78,10 +98,14 @@ def main():
     projects = parse_manifest(args.file_path, args.remote_fetch)
     tree = build_tree(projects)
 
+    # Generate output filename based on input filename
+    input_filename = os.path.basename(args.file_path)
+    output_filename = os.path.splitext(input_filename)[0] + ".md"
+
     # Generate markdown file from manifest structure
     markdown = generate_markdown(tree)
-    with open("project_structure.md", "w") as md_file:
-        md_file.write("# Project Structure\n\n")
+    with open(output_filename, "w") as md_file:
+        md_file.write(f"# {os.path.splitext(input_filename)[0]} project structure\n\n")
         md_file.write(markdown)
 
 if __name__ == "__main__":
