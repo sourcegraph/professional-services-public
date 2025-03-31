@@ -12,7 +12,9 @@ def parse_manifest(xml_file, default_fetch):
     remotes = {}
     for remote in root.findall("remote"):
         name = remote.get("name")
-        fetch = default_fetch if remote.get("fetch") == ".." else remote.get("fetch")
+        fetch_value = remote.get("fetch")
+        is_url = fetch_value and (fetch_value.startswith('http://') or fetch_value.startswith('https://'))
+        fetch = fetch_value if is_url else default_fetch
         remotes[name] = fetch
 
     projects = []
