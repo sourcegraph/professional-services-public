@@ -43,20 +43,29 @@ public class PetController {
                 .mapToObj(i -> generateRandomPet())
                 .collect(Collectors.toList());
     }
-
     private Pet generateRandomPet() {
+        // First generate the category so we can use it for photo URLs
+        Category category = generateRandomCategory();
+
         // Create pet with required fields
         Pet pet = new Pet()
                 .id(random.nextLong(10000))
                 .name(getRandomElement(petNames))
-                .photoUrls(generateRandomPhotoUrls());
+                .photoUrls(generatePhotoUrlsForCategory(category.getName()));
 
         // Add optional fields
-        pet.setCategory(generateRandomCategory());
+        pet.setCategory(category);
         pet.setTags(generateRandomTags());
         pet.setStatus(getRandomStatus());
 
         return pet;
+    }
+
+    private List<String> generatePhotoUrlsForCategory(String categoryName) {
+        int count = random.nextInt(3) + 1; // 1-3 photos
+        return IntStream.range(0, count)
+                .mapToObj(i -> "/images/" + categoryName + ".jpg")
+                .collect(Collectors.toList());
     }
 
     private Category generateRandomCategory() {
