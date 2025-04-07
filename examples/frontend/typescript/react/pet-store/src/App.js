@@ -7,8 +7,8 @@ function App() {
     <div className="App">
       <header className="App-header">
         <div className="header-content">
-          <h1>Pet Store Application</h1>
-          <p className="header-subtitle">Manage your pet inventory with ease</p>
+          <h1>Sorucegraph Pet Store</h1>
+          <p className="header-subtitle">AI Assisted Pet Store</p>
         </div>
       </header>
       <main className="App-main">
