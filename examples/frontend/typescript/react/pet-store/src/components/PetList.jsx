@@ -33,18 +33,10 @@ function PetList() {
     }
   };
 
-  // Custom style to override the grid layout for 5 cards per row
-  const gridStyle = {
-    display: 'grid',
-    gridTemplateColumns: 'repeat(5, 1fr)',
-    gridGap: '20px',
-    marginTop: '20px'
-  };
-
   return (
     <div className="pet-list">
       <h2>Available Pets</h2>
-      <div className="pet-grid" style={gridStyle}>
+      <div className="pet-grid">
         {pets.map(pet => (
           <div key={pet.id} className="pet-card">
             {pet.photoUrls && pet.photoUrls.length > 0 && (

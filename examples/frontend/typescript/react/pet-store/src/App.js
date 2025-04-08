@@ -1,5 +1,4 @@
 import React from 'react';
-import './App.css';
 import PetList from './components/PetList';
 
 function App() {
