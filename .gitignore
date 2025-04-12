@@ -3,3 +3,4 @@
 .idea
 .src_users_backup.json
 .vscode
+examples/repo-manifest-to-markdown/example-manifests/private-examples
