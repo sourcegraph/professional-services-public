@@ -39,6 +39,9 @@ public class PetController {
 
     @GetMapping("/random/{count}")
     public List<Pet> getRandomPets(@PathVariable int count) {
+        if (count > 20) {
+            throw new IllegalArgumentException("Cannot generate more than 20 pets at once");
+        }
         return IntStream.range(0, count)
                 .mapToObj(i -> generateRandomPet())
                 .collect(Collectors.toList());
