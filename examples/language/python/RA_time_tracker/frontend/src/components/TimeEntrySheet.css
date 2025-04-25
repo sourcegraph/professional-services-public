@@ -1,0 +1,99 @@
+.timesheet-container {
+  background-color: white;
+  border-radius: 8px;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+  padding: 20px;
+  margin-top: 20px;
+  overflow-x: auto;
+}
+
+.timesheet-header {
+  display: flex;
+  flex-direction: column;
+  margin-bottom: 20px;
+  position: relative;
+}
+
+.timesheet-header h2 {
+  margin: 0 0 10px 0;
+  color: #333;
+}
+
+.timesheet-header h3 {
+  margin: 0;
+  color: #666;
+}
+
+.close-button {
+  position: absolute;
+  top: 0;
+  right: 0;
+  background-color: #f44336;
+  color: white;
+  border: none;
+  padding: 5px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.timesheet-grid {
+  overflow-x: auto;
+}
+
+.timesheet-grid table {
+  width: 100%;
+  border-collapse: collapse;
+  min-width: 600px;
+}
+
+.timesheet-grid th,
+.timesheet-grid td {
+  border: 1px solid #ddd;
+  padding: 8px;
+  text-align: center;
+}
+
+.timesheet-grid thead th {
+  background-color: #f2f2f2;
+  color: #333;
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+
+.resource-col {
+  width: 150px;
+  text-align: left;
+}
+
+.category-col {
+  width: 200px;
+  text-align: left;
+}
+
+.week-col {
+  width: 120px;
+}
+
+.total-col {
+  width: 80px;
+  background-color: #e6f7ff;
+  font-weight: bold;
+}
+
+.timesheet-grid input {
+  width: 60px;
+  padding: 5px;
+  text-align: center;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+}
+
+.totals-row {
+  background-color: #f2f2f2;
+  font-weight: bold;
+}
+
+.totals-row td {
+  border-top: 2px solid #666;
+}
