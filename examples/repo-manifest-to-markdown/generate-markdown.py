@@ -166,7 +166,7 @@ def create_search_context(endpoint, headers, projects, context_name):
 
         for project in projects:
             project_by_name[project["name"]] = project
-            project_by_url[project["remote_url"]] = project
+            project_by_url[project["remote_url"].replace("http://", "").replace("https://", "")] = project
             
         for repo in repo_result["data"]["repositories"]["nodes"]:
             matched_project = None
