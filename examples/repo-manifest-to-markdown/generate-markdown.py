@@ -141,8 +141,8 @@ def generate_markdown(tree, indent=0):
     return markdown
 
 
-def create_search_context(endpoint, headers, projects, context_name="Repository Manifest Context"):
-    repo_names = [project["remote_url"] for project in projects]
+def create_search_context(endpoint, headers, projects, context_name):
+    repo_names = [project["remote_url"].replace("http://", "").replace("https://", "") for project in projects]
     
     repo_variables = {
         "names": repo_names,
