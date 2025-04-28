@@ -81,13 +81,19 @@ def parse_manifest(xml_file, default_fetch):
             for linkfile in project.findall("linkfile")
         ]
 
+        copyfiles = [
+            (copyfile.get("src"), copyfile.get("dest"))
+            for copyfile in project.findall("copyfile")
+        ]
+
         projects.append({
             "path": path,
             "name": name,
             "revision": revision,
             "groups": groups,
             "remote_url": f"{fetch}/{name}",
-            "linkfiles": linkfiles
+            "linkfiles": linkfiles,
+            "copyfiles": copyfiles
         })
     return projects
 
@@ -106,14 +112,16 @@ def build_tree(projects):
                 "name": project["name"],
                 "groups": project["groups"],
                 "remote_url": project["remote_url"],
-                "linkfiles": project["linkfiles"]
+                "linkfiles": project["linkfiles"],
+                "copyfiles": project["copyfiles"]
             }
         else:
             current[parts[-1]] = {
                 "name": project["name"],
                 "groups": project["groups"],
                 "remote_url": project["remote_url"],
-                "linkfiles": project["linkfiles"]
+                "linkfiles": project["linkfiles"],
+                "copyfiles": project["copyfiles"]
             }
     return tree
 
@@ -127,13 +135,17 @@ def generate_markdown(tree, indent=0):
             if "name" in value and "__project__" not in value:
                 markdown += " " * indent + f"- [{key}/]({value['remote_url']})\n"
                 for src, dest in value.get("linkfiles", []):
-                    markdown += " " * (indent + 2) + f"- [{src}]({value['remote_url']}/{src}) → [{dest}]({value['remote_url']}/{dest})\n"
+                    markdown += " " * (indent + 2) + f"- [↪ {src}]({value['remote_url']}/{src}) → [{dest}]({value['remote_url']}/{dest})\n"
+                for src, dest in value.get("copyfiles", []):
+                    markdown += " " * (indent + 2) + f"- [⎘ {src}]({value['remote_url']}/{src}) → [{dest}]({value['remote_url']}/{dest})\n"
             else:
                 project_info = value.get("__project__")
                 if project_info:
                     markdown += " " * indent + f"- [{key}/]({project_info['remote_url']})\n"
                     for src, dest in project_info.get("linkfiles", []):
-                        markdown += " " * (indent + 2) + f"- [{src}]({project_info['remote_url']}/{src}) → [{dest}]({project_info['remote_url']}/{dest})\n"
+                        markdown += " " * (indent + 2) + f"- [↪ {src}]({project_info['remote_url']}/{src}) → [{dest}]({project_info['remote_url']}/{dest})\n"
+                    for src, dest in project_info.get("copyfiles", []):
+                        markdown += " " * (indent + 2) + f"- [⎘ {src}]({project_info['remote_url']}/{src}) → [{dest}]({project_info['remote_url']}/{dest})\n"
                 else:
                     markdown += " " * indent + f"- {key}/\n"
                 
