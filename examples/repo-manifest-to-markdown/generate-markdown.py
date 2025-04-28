@@ -138,6 +138,10 @@ def generate_markdown(tree, indent=0):
                     markdown += " " * (indent + 2) + f"- [↪ {src}]({value['remote_url']}/{src}) → [{dest}]({value['remote_url']}/{dest})\n"
                 for src, dest in value.get("copyfiles", []):
                     markdown += " " * (indent + 2) + f"- [⎘ {src}]({value['remote_url']}/{src}) → [{dest}]({value['remote_url']}/{dest})\n"
+                child_keys = [k for k in value.keys() if k not in ["name", "groups", "remote_url", "linkfiles", "copyfiles"] and not k.startswith("__")]
+                if child_keys:
+                    child_dict = {k: value[k] for k in child_keys}
+                    markdown += generate_markdown(child_dict, indent + 2)
             else:
                 project_info = value.get("__project__")
                 if project_info:
@@ -146,10 +150,14 @@ def generate_markdown(tree, indent=0):
                         markdown += " " * (indent + 2) + f"- [↪ {src}]({project_info['remote_url']}/{src}) → [{dest}]({project_info['remote_url']}/{dest})\n"
                     for src, dest in project_info.get("copyfiles", []):
                         markdown += " " * (indent + 2) + f"- [⎘ {src}]({project_info['remote_url']}/{src}) → [{dest}]({project_info['remote_url']}/{dest})\n"
+                    child_dict = {k: v for k, v in value.items() if k != "__project__"}
+                    if child_dict:
+                        markdown += generate_markdown(child_dict, indent + 2)
                 else:
                     markdown += " " * indent + f"- {key}/\n"
-                
-                markdown += generate_markdown(value, indent + 2)
+                    markdown += generate_markdown(value, indent + 2)
+        else:
+            markdown += " " * indent + f"- {key} = {value}\n"
     return markdown
 
 
