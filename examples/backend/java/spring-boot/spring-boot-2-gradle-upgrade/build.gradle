@@ -2,7 +2,7 @@ import org.gradle.api.JavaVersion
 
 plugins {
     id 'java'
-    id 'org.springframework.boot' version '2.7.18'
+    id 'org.springframework.boot' version '3.2.4'\n    id 'io.spring.dependency-management' version '1.1.4'
     id 'io.spring.dependency-management' version '1.0.15.RELEASE'
 }
 
@@ -15,7 +15,7 @@ java {
 
 repositories {
     mavenCentral()
-}
+}\n\njava {\n    sourceCompatibility = JavaVersion.VERSION_17\n    targetCompatibility = JavaVersion.VERSION_17\n}
 
 dependencies {
     implementation 'org.springframework.boot:spring-boot-starter'

@@ -11,7 +11,7 @@ targetCompatibility = 17
 
 repositories {
     mavenCentral()
-}
+}\n\njava {\n    sourceCompatibility = JavaVersion.VERSION_17\n    targetCompatibility = JavaVersion.VERSION_17\n}
 
 dependencies {
     // Apache POI for Excel file handling
