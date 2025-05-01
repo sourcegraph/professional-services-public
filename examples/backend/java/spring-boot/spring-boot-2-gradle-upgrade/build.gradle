@@ -2,15 +2,16 @@ import org.gradle.api.JavaVersion
 
 plugins {
     id 'java'
-    id 'org.springframework.boot' version '2.7.18'
-    id 'io.spring.dependency-management' version '1.0.15.RELEASE'
+    id 'org.springframework.boot' version '3.2.12'
+    id 'io.spring.dependency-management' version '1.1.4'
+    id 'org.openrewrite.rewrite' version '6.10.0'
 }
 
 group = 'com.sourcegraph.demo'
 version = '1.0-SNAPSHOT'
 
 java {
-    sourceCompatibility = JavaVersion.VERSION_11
+    sourceCompatibility = JavaVersion.VERSION_17
 }
 
 repositories {
@@ -30,4 +31,14 @@ dependencies {
 }
 test {
     useJUnitPlatform()
+}
+
+rewrite {
+    activeRecipe("org.openrewrite.java.spring.boot3.SpringBoot3Migration")
+}
+
+dependencies {
+    rewrite(platform("org.openrewrite:rewrite-bom:5.40.3"))
+    rewrite("org.openrewrite:rewrite-java")
+    rewrite("org.openrewrite:rewrite-spring")
 }
