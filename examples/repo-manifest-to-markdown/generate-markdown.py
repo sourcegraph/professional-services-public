@@ -164,52 +164,71 @@ def generate_markdown(tree, indent=0):
 def create_search_context(endpoint, headers, projects, context_name):
     repo_names = [project["remote_url"].replace("http://", "").replace("https://", "") for project in projects]
     
-    repo_variables = {
-        "names": repo_names,
-        "first": len(repo_names),
-        "after": None
-    }
+    all_repos = []
+    after_cursor = None
+    page_size = 1000
     
-    repo_result = execute_graphql_operation(endpoint, headers, "RepositoriesByNames", repo_variables)
+    # Fetch repositories with pagination support
+    while True:
+        repo_variables = {
+            "names": repo_names,
+            "first": page_size,
+            "after": after_cursor
+        }
+        
+        repo_result = execute_graphql_operation(endpoint, headers, "RepositoriesByNames", repo_variables)
+        
+        if "errors" in repo_result:
+            return {"error": f"Failed to fetch repositories: {repo_result['errors']}"}
+        
+        if "data" not in repo_result or "repositories" not in repo_result["data"]:
+            return {"error": "Invalid response from GraphQL API"}
+            
+        nodes = repo_result["data"]["repositories"]["nodes"]
+        all_repos.extend(nodes)
+        
+        # Check if we need to fetch more pages
+        page_info = repo_result["data"]["repositories"]["pageInfo"]
+        if not page_info["hasNextPage"]:
+            break
+            
+        after_cursor = page_info["endCursor"]
     
-    if "errors" in repo_result:
-        return {"error": f"Failed to fetch repositories: {repo_result['errors']}"}
+    if not all_repos:
+        return {"error": "No repositories found. Check that repository URLs are correct and accessible in Sourcegraph."}
     
     repositories = []
-    if "data" in repo_result and "repositories" in repo_result["data"]:
-        if not repo_result["data"]["repositories"]["nodes"]:
-            return {"error": "No repositories found. Check that repository URLs are correct and accessible in Sourcegraph."}
+    
+    # Attempt to match projects by name or remote URL for flexibility      
+    project_by_name = {}
+    project_by_url = {}
 
-        # Attempt to match projects by name or remote URL for flexibility      
-        project_by_name = {}
-        project_by_url = {}
-
-        for project in projects:
-            project_by_name[project["name"]] = project
-            project_by_url[project["remote_url"].replace("http://", "").replace("https://", "")] = project
-            
-        for repo in repo_result["data"]["repositories"]["nodes"]:
-            matched_project = None
-            
-            if repo["name"] in project_by_name:
-                matched_project = project_by_name[repo["name"]]
-            elif repo["name"] in project_by_url:
-                matched_project = project_by_url[repo["name"]]
-            else:
-                clean_name = repo["name"].strip('/')
-                for url, project in project_by_url.items():
-                    if url.strip('/') == clean_name:
-                        matched_project = project
-                        break
-            
-            if matched_project:
-                repositories.append({
-                    "repositoryID": repo["id"],
-                    "revisions": [matched_project["revision"]]
-                })
+    for project in projects:
+        project_by_name[project["name"]] = project
+        project_by_url[project["remote_url"].replace("http://", "").replace("https://", "")] = project
         
-        if not repositories:
-            return {"error": "Could not match any repositories with project URLs. Check URL formatting."}
+    for repo in all_repos:
+        matched_project = None
+        
+        if repo["name"] in project_by_name:
+            matched_project = project_by_name[repo["name"]]
+        elif repo["name"] in project_by_url:
+            matched_project = project_by_url[repo["name"]]
+        else:
+            clean_name = repo["name"].strip('/')
+            for url, project in project_by_url.items():
+                if url.strip('/') == clean_name:
+                    matched_project = project
+                    break
+        
+        if matched_project:
+            repositories.append({
+                "repositoryID": repo["id"],
+                "revisions": [matched_project["revision"]]
+            })
+    
+    if not repositories:
+        return {"error": "Could not match any repositories with project URLs. Check URL formatting."}
     
     context_variables = {
         "input": {
