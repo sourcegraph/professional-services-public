@@ -3,6 +3,7 @@ import xml.etree.ElementTree as ET
 import requests
 from collections import defaultdict
 import os
+import re
 
 GRAPHQL_CONFIG = {
     "RepositoriesByNames": {
@@ -128,6 +129,24 @@ def parse_manifest(xml_file, default_fetch):
         })
     return projects
 
+def construct_repository_url(remote_url, revision):
+    is_github = "github.com" in remote_url.lower()
+
+    if not is_github:
+        return remote_url
+
+    # For GitHub repositories, construct URL based on revision pattern
+    if revision.startswith('refs/heads/'):
+        branch_name = revision.replace('refs/heads/', '')
+        return f"{remote_url}/tree/{branch_name}"
+    elif revision.startswith('refs/tags/'):
+        tag_name = revision.replace('refs/tags/', '')
+        return f"{remote_url}/releases/tag/{tag_name}"
+    elif re.match(r'^[0-9a-f]{40}$', revision):
+        return f"{remote_url}/commit/{revision}"
+    else:
+        return f"{remote_url}/tree/{revision}"
+
 def build_tree(projects):
     tree = {}
     for project in projects:
@@ -143,6 +162,7 @@ def build_tree(projects):
                 "name": project["name"],
                 "groups": project["groups"],
                 "remote_url": project["remote_url"],
+                "revision": project["revision"],
                 "linkfiles": project["linkfiles"],
                 "copyfiles": project["copyfiles"]
             }
@@ -151,6 +171,7 @@ def build_tree(projects):
                 "name": project["name"],
                 "groups": project["groups"],
                 "remote_url": project["remote_url"],
+                "revision": project["revision"],
                 "linkfiles": project["linkfiles"],
                 "copyfiles": project["copyfiles"]
             }
@@ -164,19 +185,21 @@ def generate_markdown(tree, indent=0):
 
         if isinstance(value, dict):
             if "name" in value and "__project__" not in value:
-                markdown += " " * indent + f"- [{key}/]({value['remote_url']})\n"
+                url = construct_repository_url(value['remote_url'], value['revision'])
+                markdown += " " * indent + f"- [{key}/]({url})\n"
                 for src, dest in value.get("linkfiles", []):
                     markdown += " " * (indent + 2) + f"- [↪ {src}]({value['remote_url']}/{src}) → [{dest}]({value['remote_url']}/{dest})\n"
                 for src, dest in value.get("copyfiles", []):
                     markdown += " " * (indent + 2) + f"- [⎘ {src}]({value['remote_url']}/{src}) → [{dest}]({value['remote_url']}/{dest})\n"
-                child_keys = [k for k in value.keys() if k not in ["name", "groups", "remote_url", "linkfiles", "copyfiles"] and not k.startswith("__")]
+                child_keys = [k for k in value.keys() if k not in ["name", "groups", "remote_url", "revision", "linkfiles", "copyfiles"] and not k.startswith("__")]
                 if child_keys:
                     child_dict = {k: value[k] for k in child_keys}
                     markdown += generate_markdown(child_dict, indent + 2)
             else:
                 project_info = value.get("__project__")
                 if project_info:
-                    markdown += " " * indent + f"- [{key}/]({project_info['remote_url']})\n"
+                    url = construct_repository_url(project_info['remote_url'], project_info['revision'])
+                    markdown += " " * indent + f"- [{key}/]({url})\n"
                     for src, dest in project_info.get("linkfiles", []):
                         markdown += " " * (indent + 2) + f"- [↪ {src}]({project_info['remote_url']}/{src}) → [{dest}]({project_info['remote_url']}/{dest})\n"
                     for src, dest in project_info.get("copyfiles", []):
@@ -340,11 +363,10 @@ Environment variables:
     projects = parse_manifest(args.file_path, args.remote_fetch)
     tree = build_tree(projects)
 
-    # Track search context creation status
+    # Create search context
     context_created = False
     context_url = ""
 
-    # Create search context
     if args.create_context:
         endpoint = os.environ.get('SRC_ENDPOINT')
         token = os.environ.get('SRC_ACCESS_TOKEN')
