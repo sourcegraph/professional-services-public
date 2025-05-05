@@ -9,11 +9,13 @@ This script parses a **repo manifest XML file**, extracts project details, organ
    - Extracts remote fetch URLs and default revision information.
 2. **Builds a hierarchical tree**:
    - Organizes projects into a nested dictionary based on their paths.
+   - Properly handles nested project structures with child elements.
 3. **Generates a Markdown file**:
    - Outputs a structured view of projects with clickable links.
-4. **Optional: Creates a Sourcegraph Search Context**:
+   - For github.com repositories, links point to specific branches, tags, or commits.
+4. **Optional: Creates or Updates a Sourcegraph Search Context**:
    - Queries Sourcegraph API for the internal repository IDs of the projects in the manifest.
-   - Creates a [Search Context](https://sourcegraph.com/docs/code-search/working/search_contexts) containing all repositories with their specified revisions.
+   - Creates a new [Search Context](https://sourcegraph.com/docs/code-search/working/search_contexts) or updates an existing one with the same name.
    - Adds a link to the Search Context in the generated markdown file.
 
 ## Usage
