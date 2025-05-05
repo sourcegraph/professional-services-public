@@ -33,6 +33,37 @@ GRAPHQL_CONFIG = {
         """,
         "variables": ["input", "repositories"],
         "success_key": "createSearchContext"
+    },
+    "UpdateSearchContext": {
+        "query": """
+            mutation UpdateSearchContext($id: ID!, $searchContext: SearchContextEditInput!, $repositories: [SearchContextRepositoryRevisionsInput!]!) {
+                updateSearchContext(id: $id, searchContext: $searchContext, repositories: $repositories) {
+                    id
+                }
+            }
+        """,
+        "variables": ["id", "searchContext", "repositories"],
+        "success_key": "updateSearchContext"
+    },
+    "FetchSearchContextBySpec": {
+        "query": """
+            query FetchSearchContextBySpec($spec: String!) {
+              searchContextBySpec(spec: $spec) {
+                  id
+                  name
+                  namespace {
+                    __typename
+                    id
+                    namespaceName
+                  }
+                  spec
+                  description
+                  public
+              }
+            }
+        """,
+        "variables": ["spec"],
+        "success_key": "searchContextBySpec"
     }
 }
 
@@ -106,7 +137,7 @@ def build_tree(projects):
             if part in current and not isinstance(current[part], dict):
                 current[part] = {"__project__": current[part]}
             current = current.setdefault(part, {})
-        
+
         if parts[-1] in current and isinstance(current[parts[-1]], dict):
             current[parts[-1]]["__project__"] = {
                 "name": project["name"],
@@ -130,7 +161,7 @@ def generate_markdown(tree, indent=0):
     for key, value in sorted(tree.items()):
         if key == "__project__":
             continue
-            
+
         if isinstance(value, dict):
             if "name" in value and "__project__" not in value:
                 markdown += " " * indent + f"- [{key}/]({value['remote_url']})\n"
@@ -161,55 +192,71 @@ def generate_markdown(tree, indent=0):
     return markdown
 
 
-def create_search_context(endpoint, headers, projects, context_name):
+def create_or_update_search_context(endpoint, headers, projects, context_name):
+    # Determine whether the search context already exists
+    context_spec_variables = {
+        "spec": context_name
+    }
+
+    context_exists = False
+    existing_context_id = None
+    existing_context_result = execute_graphql_operation(endpoint, headers, "FetchSearchContextBySpec", context_spec_variables)
+
+    if "data" in existing_context_result and existing_context_result["data"]["searchContextBySpec"] is not None:
+        context_exists = True
+        existing_context_id = existing_context_result["data"]["searchContextBySpec"]["id"]
+    elif "errors" in existing_context_result:
+        for error in existing_context_result["errors"]:
+            if "search context not found" not in error.get("message", ""):
+                return {"error": f"Failed to check for existing search context: {existing_context_result['errors']}"}
+
     repo_names = [project["remote_url"].replace("http://", "").replace("https://", "") for project in projects]
-    
+
     all_repos = []
     after_cursor = None
     page_size = 1000
-    
-    # Fetch repositories with pagination support
+
+    # Fetch repository IDs with pagination support
     while True:
         repo_variables = {
             "names": repo_names,
             "first": page_size,
             "after": after_cursor
         }
-        
+
         repo_result = execute_graphql_operation(endpoint, headers, "RepositoriesByNames", repo_variables)
-        
+
         if "errors" in repo_result:
             return {"error": f"Failed to fetch repositories: {repo_result['errors']}"}
-        
+
         if "data" not in repo_result or "repositories" not in repo_result["data"]:
             return {"error": "Invalid response from GraphQL API"}
-            
+
         nodes = repo_result["data"]["repositories"]["nodes"]
         all_repos.extend(nodes)
-        
-        # Check if we need to fetch more pages
+
         page_info = repo_result["data"]["repositories"]["pageInfo"]
         if not page_info["hasNextPage"]:
             break
-            
+
         after_cursor = page_info["endCursor"]
-    
+
     if not all_repos:
         return {"error": "No repositories found. Check that repository URLs are correct and accessible in Sourcegraph."}
-    
+
     repositories = []
-    
-    # Attempt to match projects by name or remote URL for flexibility      
+
+    # Attempt to match projects by name or remote URL for flexibility
     project_by_name = {}
     project_by_url = {}
 
     for project in projects:
         project_by_name[project["name"]] = project
         project_by_url[project["remote_url"].replace("http://", "").replace("https://", "")] = project
-        
+
     for repo in all_repos:
         matched_project = None
-        
+
         if repo["name"] in project_by_name:
             matched_project = project_by_name[repo["name"]]
         elif repo["name"] in project_by_url:
@@ -220,43 +267,58 @@ def create_search_context(endpoint, headers, projects, context_name):
                 if url.strip('/') == clean_name:
                     matched_project = project
                     break
-        
+
         if matched_project:
             repositories.append({
                 "repositoryID": repo["id"],
                 "revisions": [matched_project["revision"]]
             })
-    
+
     if not repositories:
         return {"error": "Could not match any repositories with project URLs. Check URL formatting."}
-    
-    context_variables = {
-        "input": {
-            "name": context_name,
-            "description": "",
-            "public": True,
-            "namespace": None,
-            "query": ""
-        },
-        "repositories": repositories
-    }
-    
-    context_result = execute_graphql_operation(endpoint, headers, "CreateSearchContext", context_variables)
-    
-    if "errors" in context_result:
-        return {"error": f"Failed to create search context: {context_result['errors']}"}
-    
+
+    # Update existing search context or create new one
+    if context_exists and existing_context_id:
+        update_variables = {
+            "id": existing_context_id,
+            "searchContext": {
+                "name": context_name,
+                "description": "",
+                "public": True,
+                "namespace": None,
+                "query": ""
+            },
+            "repositories": repositories
+        }
+        context_result = execute_graphql_operation(endpoint, headers, "UpdateSearchContext", update_variables)
+        if "errors" in context_result:
+            return {"error": f"Failed to update search context: {context_result['errors']}"}
+    else:
+        create_variables = {
+            "input": {
+                "name": context_name,
+                "description": "",
+                "public": True,
+                "namespace": None,
+                "query": ""
+            },
+            "repositories": repositories
+        }
+        context_result = execute_graphql_operation(endpoint, headers, "CreateSearchContext", create_variables)
+        if "errors" in context_result:
+            return {"error": f"Failed to create search context: {context_result['errors']}"}
+
     return context_result
 
 def main():
     parser = argparse.ArgumentParser(description='Generate a Markdown file representing a Gerrit repo XML manifest for use in Sourcegraph.')
     parser.add_argument('file_path', type=str, help='Path to the Gerrit repo XML manifest file')
     parser.add_argument('remote_fetch', type=str, help='Default remote fetch URL')
-    parser.add_argument('--create-context', action='store_true', default=False, 
+    parser.add_argument('--create-context', action='store_true', default=False,
                       help='(optional) Create a Search Context. Requires SRC_ENDPOINT and SRC_ACCESS_TOKEN environment variables to be set.')
-    parser.add_argument('--context-name', type=str, 
+    parser.add_argument('--context-name', type=str,
                       help='(optional) Name for the Search Context (alphanumeric and ._/- characters only). Defaults to manifest filename without extension when not specified.')
-    
+
     parser.epilog = """
 Environment variables:
   SRC_ENDPOINT      Sourcegraph instance URL (required for Search Context creation)
@@ -270,7 +332,7 @@ Environment variables:
     input_filename = os.path.basename(args.file_path)
     base_name = os.path.splitext(input_filename)[0]
     output_filename = base_name + ".md"
-    
+
     if args.context_name is None:
         args.context_name = base_name
 
@@ -281,21 +343,21 @@ Environment variables:
     # Track search context creation status
     context_created = False
     context_url = ""
-    
+
     # Create search context
     if args.create_context:
         endpoint = os.environ.get('SRC_ENDPOINT')
         token = os.environ.get('SRC_ACCESS_TOKEN')
-        
+
         if not endpoint or not token:
             print("Error: SRC_ENDPOINT and SRC_ACCESS_TOKEN environment variables must be set when using --create-context")
             return
-            
+
         headers = {
             "Authorization": f"token {token}",
             "Content-Type": "application/json"
         }
-        result = create_search_context(endpoint, headers, projects, args.context_name)
+        result = create_or_update_search_context(endpoint, headers, projects, args.context_name)
         if "error" in result:
             print(f"Error creating search context: {result['error']}")
             print("The markdown file will still be generated without a search context link.")
@@ -308,11 +370,11 @@ Environment variables:
     markdown = generate_markdown(tree)
     with open(output_filename, "w") as md_file:
         md_file.write(f"# {base_name} project structure\n\n")
-        
+
         # Add search context link if created successfully
         if context_created:
             md_file.write(f"[Search in Sourcegraph]({context_url})\n\n")
-            
+
         md_file.write(markdown)
 
 if __name__ == "__main__":
