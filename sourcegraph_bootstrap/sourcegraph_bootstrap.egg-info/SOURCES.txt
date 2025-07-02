@@ -1,0 +1,8 @@
+README.md
+main.py
+pyproject.toml
+sourcegraph_bootstrap.egg-info/PKG-INFO
+sourcegraph_bootstrap.egg-info/SOURCES.txt
+sourcegraph_bootstrap.egg-info/dependency_links.txt
+sourcegraph_bootstrap.egg-info/requires.txt
+sourcegraph_bootstrap.egg-info/top_level.txt
