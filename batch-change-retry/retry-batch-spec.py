@@ -180,6 +180,26 @@ def handle_list_batch_specs(endpoint, auth_token):
         print(f"Error: {e}")
         sys.exit(1)
 
+def handle_retry_failed_batch_spec(batch_spec_id, include_completed, endpoint, auth_token):
+    headers = {
+        "Authorization": f"token {auth_token}",
+        "Content-Type": "application/json"
+    }
+    
+    variables = {
+        "batchSpec": batch_spec_id,
+        "includeCompleted": include_completed
+    }
+    
+    result = execute_graphql_operation(endpoint, headers, "RetryBatchSpec", variables)
+    
+    if "errors" in result:
+        print(f"Failed to retry batch spec {batch_spec_id}: {result['errors'][0]['message']}")
+        sys.exit(1)
+    else:
+        print(f"Successfully retried batch spec: {batch_spec_id}")
+        print(f"  New state: {result['data']['retryBatchSpecExecution']['state']}")
+
 def handle_retry_failed_batch_specs(include_completed, endpoint, auth_token):
     headers = {
         "Authorization": f"token {auth_token}",
@@ -267,6 +287,7 @@ def main():
             "  SRC_ACCESS_TOKEN: Sourcegraph access token\n\n"
             "Commands:\n"
             "  list-batch-specs\n"
+            "  retry-failed-batch-spec <batch_spec_id> [--include-completed]\n"
             "  retry-failed-batch-specs [--include-completed]\n"
         ),
         add_help=False
@@ -285,6 +306,14 @@ def main():
         add_help=False
     )
 
+    retry_single_parser = subparsers.add_parser(
+        "retry-failed-batch-spec",
+        help="Retry a specific batch spec by ID",
+        add_help=False
+    )
+    retry_single_parser.add_argument("batch_spec_id", help="The batch spec ID to retry")
+    retry_single_parser.add_argument("--include-completed", action="store_true", default=False, help="Include completed workspaces in retry")
+
     retry_all_parser = subparsers.add_parser(
         "retry-failed-batch-specs",
         help="Automatically retry all batch specs with failed workspaces",
@@ -302,6 +331,8 @@ def main():
 
     if args.command == "list-batch-specs":
         handle_list_batch_specs(endpoint, auth_token)
+    elif args.command == "retry-failed-batch-spec":
+        handle_retry_failed_batch_spec(args.batch_spec_id, args.include_completed, endpoint, auth_token)
     elif args.command == "retry-failed-batch-specs":
         handle_retry_failed_batch_specs(args.include_completed, endpoint, auth_token)
     else:

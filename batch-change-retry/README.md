@@ -24,7 +24,7 @@ export SRC_ACCESS_TOKEN=sgp_your_token_here
 
 ## Usage
 
-The script provides two commands:
+The script provides three commands:
 
 ### 1. List Batch Specs with Failed Workspaces
 
@@ -39,7 +39,32 @@ This command:
 - Filters client-side for specs with `errored > 0`
 - Displays the batch spec name, ID, state, and workspace statistics
 
-### 2. Retry All Failed Batch Specs
+### 2. Retry a Specific Batch Spec
+
+Retry a specific batch spec by providing its ID:
+
+```bash
+python retry-batch-spec.py retry-failed-batch-spec <batch_spec_id>
+```
+
+This command:
+- Takes a batch spec ID as an argument
+- Calls the `RetryBatchSpec` GraphQL mutation for that specific spec
+- Reports the result and new state
+
+**Finding the batch spec ID:**
+
+You can find the batch spec ID in two ways:
+1. Run `list-batch-specs` command and copy the ID from the output
+2. Navigate to the batch change execution in Sourcegraph UI and copy the ID from the URL (e.g., `https://sourcegraph.example.com/users/username/batch-changes/my-batch-change/executions/<batch-spec-id>/execution`)
+
+**Include completed workspaces in retry:**
+
+```bash
+python retry-batch-spec.py retry-failed-batch-spec <batch_spec_id> --include-completed
+```
+
+### 3. Retry All Failed Batch Specs
 
 Automatically retry all batch specs with failed workspaces:
 
