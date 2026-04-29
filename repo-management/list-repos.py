@@ -74,66 +74,79 @@ DEFAULT_LOG_FILE = "repos.log"
 
 # --- GraphQL queries ----------------------------------------------------------
 
-GRAPHQL_QUERY = """
+# Shared field-set used by both the all-repos listing query (GRAPHQL_QUERY)
+# and the single-repo lookup query (SINGLE_REPO_QUERY) so a change to the
+# CSV row schema can't drift between the two paths. Keeping it as a GraphQL
+# fragment in the same document is a standard pattern that the Sourcegraph
+# server supports.
+REPO_NODE_FRAGMENT = """
+fragment RepoNodeFields on Repository {
+  id
+  name
+  url
+  createdAt
+  isFork
+  isArchived
+  isPrivate
+  mirrorInfo {
+    remoteURL
+    cloned
+    cloneInProgress
+    isCorrupted
+    lastError
+    lastSyncOutput
+    corruptionLogs {
+      timestamp
+      reason
+    }
+    byteSize
+    lastChanged
+    updatedAt
+    nextSyncAt
+    updateSchedule {
+      intervalSeconds
+    }
+    shard
+  }
+  textSearchIndex {
+    status {
+      updatedAt
+      contentByteSize
+      contentFilesCount
+      indexByteSize
+      indexShardsCount
+      newLinesCount
+      defaultBranchNewLinesCount
+      otherBranchesNewLinesCount
+    }
+    host {
+      name
+    }
+    refs {
+      ref {
+        displayName
+      }
+      skippedIndexed {
+        count
+        query
+      }
+    }
+  }
+  externalServices(first: 100) {
+    nodes {
+      displayName
+    }
+  }
+}
+"""
+
+GRAPHQL_QUERY = (
+    REPO_NODE_FRAGMENT
+    + """
 query ListRepos($first: Int!, $after: String) {
   repositories(first: $first, after: $after) {
     nodes {
-      id
-      name
-      url
-      createdAt
-      isFork
-      isArchived
-      isPrivate
-      mirrorInfo {
-        remoteURL
-        cloned
-        cloneInProgress
-        isCorrupted
-        lastError
-        lastSyncOutput
-        corruptionLogs {
-          timestamp
-          reason
-        }
-        byteSize
-        lastChanged
-        updatedAt
-        nextSyncAt
-        updateSchedule {
-          intervalSeconds
-        }
-        shard
-      }
-      textSearchIndex {
-        status {
-          updatedAt
-          contentByteSize
-          contentFilesCount
-          indexByteSize
-          indexShardsCount
-          newLinesCount
-          defaultBranchNewLinesCount
-          otherBranchesNewLinesCount
-        }
-        host {
-          name
-        }
-        refs {
-          ref {
-            displayName
-          }
-          skippedIndexed {
-            count
-            query
-          }
-        }
-      }
-      externalServices(first: 100) {
-        nodes {
-          displayName
-        }
-      }
+      ...RepoNodeFields
     }
     totalCount
     pageInfo {
@@ -143,6 +156,22 @@ query ListRepos($first: Int!, $after: String) {
   }
 }
 """
+)
+
+# Single-repo lookup used by the scoped variants of --count-commits / --reclone
+# / --reindex. Returns the same field set as the listing query (via the shared
+# fragment) so the rest of the pipeline (build_row, write_csv, the error/skip
+# detectors, etc.) can treat the result identically to a listing-page node.
+SINGLE_REPO_QUERY = (
+    REPO_NODE_FRAGMENT
+    + """
+query SingleRepo($name: String!) {
+  repository(name: $name) {
+    ...RepoNodeFields
+  }
+}
+"""
+)
 
 
 CURRENT_USER_QUERY = """
@@ -163,9 +192,9 @@ query { currentUser { username } }
 # or non-admin tokens; the COMMIT_COUNT_OPTIMIZATION_COLUMNS extractors
 # tolerate that with empty cells.
 COMMIT_COUNT_QUERY = """
-query CommitCount($name: String!, $allRefsSearch: String!) {
+query CommitCount($name: String!, $rev: String!, $allRefsSearch: String!) {
   repository(name: $name) {
-    commit(rev: "HEAD") {
+    commit(rev: $rev) {
       ancestors {
         totalCount
       }
@@ -483,15 +512,20 @@ def fetch_commit_count(
     endpoint: str,
     token: str,
     repo_name: str,
+    rev: str = "HEAD",
 ) -> tuple[int | None, int | None, float, list[Any]]:
     """Run the per-repo COMMIT_COUNT_QUERY and return per-repo commit metrics.
+
+    `rev` defaults to "HEAD" (the repo's default branch) and can be set to
+    any revspec (branch name, tag, commit SHA) when --count-commits was
+    invoked in scoped mode with REPO@REV. The all-refs search count is not
+    affected by `rev` — it always counts across every branch and tag.
 
     Returns (default_branch_count, all_refs_count, elapsed_seconds,
     optimization_values).
 
     - default_branch_count: exact git rev-list count of commits reachable from
-      HEAD on the repo's default branch (from
-      commit(rev:"HEAD").ancestors.totalCount).
+      `rev` (the default branch HEAD when not overridden).
     - all_refs_count: search-based count of commits reachable across every
       branch and tag (refs/heads/* + refs/tags/*). This is a Sourcegraph
       *search* count, not a git rev-list count, and is therefore NOT
@@ -515,7 +549,11 @@ def fetch_commit_count(
             endpoint,
             token,
             COMMIT_COUNT_QUERY,
-            {"name": repo_name, "allRefsSearch": build_all_refs_search(repo_name)},
+            {
+                "name": repo_name,
+                "rev": rev,
+                "allRefsSearch": build_all_refs_search(repo_name),
+            },
         )
     except (GraphQLError, HTTPRequestError) as exc:
         elapsed = time.monotonic() - start
@@ -863,6 +901,27 @@ def fetch_current_username(endpoint: str, token: str) -> str:
     """
     data = graphql_request(endpoint, token, CURRENT_USER_QUERY, {})
     return str(data["currentUser"]["username"])
+
+
+def fetch_single_repo(
+    endpoint: str,
+    token: str,
+    repo_name: str,
+) -> dict[str, Any]:
+    """Return a single repo node in the same shape as the listing query.
+
+    Used by the scoped (`--count-commits REPO[@REV]`, `--reclone REPO[@REV]`,
+    `--reindex REPO[@REV]`) modes so the rest of the pipeline (build_row,
+    write_csv, has_cloning_error, etc.) can treat the result identically to
+    a node from the all-repos listing.
+
+    Exits via die() when the repository name is unknown to the instance.
+    """
+    data = graphql_request(endpoint, token, SINGLE_REPO_QUERY, {"name": repo_name})
+    repo = data.get("repository")
+    if repo is None:
+        die(f"repository {repo_name!r} not found on {endpoint}")
+    return cast("dict[str, Any]", repo)
 
 
 def trigger_reclone(endpoint: str, token: str, repo_id: str) -> bool:
@@ -1227,6 +1286,8 @@ def fetch_repos(
     endpoint: str,
     token: str,
     max_repos: int | None = None,
+    *,
+    scope_repo: str | None = None,
 ) -> Iterator[tuple[int, int, dict[str, Any]]]:
     """Yield (index, target, repo) tuples by paginating through the GraphQL API.
 
@@ -1239,7 +1300,19 @@ def fetch_repos(
     Logs "Fetching X of Y total repositories..." once, after the first page
     returns its totalCount, so the user sees the target before per-page
     progress lines start. Avoids a separate count-only round-trip.
+
+    When `scope_repo` is set (single-repo mode used by the scoped variants
+    of --count-commits / --reclone / --reindex), only that one repository is
+    fetched (via fetch_single_repo) and yielded as a one-element iterator.
+    `max_repos` is ignored in that case because the result is always one
+    repo.
     """
+    if scope_repo is not None:
+        repo = fetch_single_repo(endpoint, token, scope_repo)
+        logger.info("Scope: single repository %s", scope_repo)
+        yield 1, 1, repo
+        logger.info("Fetched 1/1 repositories...")
+        return
     cursor: str | None = None
     total_fetched = 0
     first_page = True
@@ -1352,6 +1425,8 @@ def write_csv(
     reclone: bool = False,
     reindex: bool = False,
     count_commits: bool = False,
+    scope_repo: str | None = None,
+    count_commits_rev: str = "HEAD",
 ) -> tuple[int, int, int]:
     """Stream repos directly to CSV rather than collecting them first.
 
@@ -1374,6 +1449,17 @@ def write_csv(
 
     Memory stays constant regardless of how many repos are fetched.
 
+    When `scope_repo` is set (single-repo mode triggered by passing a
+    REPO[@REV] argument to --count-commits / --reclone / --reindex), only
+    that one repository is fetched. Reclone/reindex mutations are then
+    applied unconditionally (the user explicitly requested them for that
+    repo), bypassing the has_cloning_error / has_indexing_error guard used
+    in full-repo iteration mode.
+
+    `count_commits_rev` overrides the rev used for the default-branch
+    ancestors count when --count-commits was scoped with REPO@REV; it has
+    no effect on the all-refs search count (which always covers every ref).
+
     Returns (total, reclone_total, reindex_total).
     """
     writer = csv.writer(out)
@@ -1382,7 +1468,12 @@ def write_csv(
     total = 0
     reclone_total = 0
     reindex_total = 0
-    for index, target, repo in fetch_repos(endpoint, token, max_repos):
+    for index, target, repo in fetch_repos(
+        endpoint,
+        token,
+        max_repos,
+        scope_repo=scope_repo,
+    ):
         row = build_row(repo, endpoint)
         commit_count: int | None = None
         all_refs_count: int | None = None
@@ -1395,7 +1486,7 @@ def write_csv(
                 all_refs_count,
                 elapsed_seconds,
                 optimization_values,
-            ) = fetch_commit_count(endpoint, token, repo_name)
+            ) = fetch_commit_count(endpoint, token, repo_name, count_commits_rev)
             # The "[N/Total]" prefix lets users tail repos.log and see how
             # far through the run we are without scrolling back to the
             # per-page "Fetched N/Total" line.
@@ -1437,7 +1528,9 @@ def write_csv(
             ),
         )
         total += 1
-        if has_cloning_error(repo):
+        repo_has_cloning_error = has_cloning_error(repo)
+        repo_has_indexing_error = has_indexing_error(repo)
+        if repo_has_cloning_error:
             cloning_writer.writerow(
                 append_commit_count(
                     row + [extract(repo) for _, extract in CLONING_ERROR_EXTRA_COLUMNS],
@@ -1448,9 +1541,14 @@ def write_csv(
                     count_commits=count_commits,
                 ),
             )
-            if reclone and trigger_reclone(endpoint, token, repo["id"]):
+        # In single-repo (scope_repo) mode the user explicitly asked for
+        # this repo, so trigger the mutation regardless of error state. In
+        # full-repo mode keep the existing "only fix repos with errors"
+        # guard so a blanket --reclone doesn't reclone the whole instance.
+        if reclone and (scope_repo is not None or repo_has_cloning_error):
+            if trigger_reclone(endpoint, token, repo["id"]):
                 reclone_total += 1
-        if has_indexing_error(repo):
+        if repo_has_indexing_error:
             indexing_writer.writerow(
                 append_commit_count(
                     row,
@@ -1461,7 +1559,8 @@ def write_csv(
                     count_commits=count_commits,
                 ),
             )
-            if reindex and trigger_reindex(endpoint, token, repo["id"]):
+        if reindex and (scope_repo is not None or repo_has_indexing_error):
+            if trigger_reindex(endpoint, token, repo["id"]):
                 reindex_total += 1
         if skipped_writer is not None and has_skipped_files(repo):
             skipped_writer.writerow(
@@ -1667,22 +1766,56 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--reclone",
-        action="store_true",
+        nargs="?",
+        const=True,
+        default=False,
+        metavar="REPO[@REV]",
         help=(
-            "Force reclone all repos with a cloning error "
-            "(corrupted, errored, or not cloned)"
+            "Without an argument: force reclone every repo with a cloning error\n"
+            "(corrupted, errored, or not cloned).\n"
+            "\n"
+            "With a REPO[@REV] argument (same format as --skipped-files-reason):\n"
+            "scope the reclone to that single repository, regardless of whether\n"
+            "it is currently in an error state. The @REV portion is accepted\n"
+            "for symmetry with --count-commits but is ignored — recloneRepository\n"
+            "operates on the whole repository.\n"
+            "Example: --reclone github.com/org/repo"
         ),
     )
     parser.add_argument(
         "--reindex",
-        action="store_true",
-        help=("Force reindex all repos with an indexing error"),
+        nargs="?",
+        const=True,
+        default=False,
+        metavar="REPO[@REV]",
+        help=(
+            "Without an argument: force reindex every repo with an indexing\n"
+            "error.\n"
+            "\n"
+            "With a REPO[@REV] argument: scope the reindex to that single\n"
+            "repository, regardless of whether it is currently in an error\n"
+            "state. The @REV portion is accepted but ignored —\n"
+            "reindexRepository operates on the whole repository.\n"
+            "Example: --reindex github.com/org/repo"
+        ),
     )
     parser.add_argument(
         "--count-commits",
-        action="store_true",
+        nargs="?",
+        const=True,
+        default=False,
+        metavar="REPO[@REV]",
         help=(
-            "Append the following columns to all output CSVs:\n"
+            "With a REPO[@REV] argument (same format as --skipped-files-reason):\n"
+            "scope the commit-count GraphQL queries to that single repository.\n"
+            "The optional @REV controls which revision the default-branch\n"
+            "ancestors count is computed from (defaults to HEAD); the all-refs\n"
+            "search count is unaffected by @REV because it always counts across\n"
+            "every branch and tag.\n"
+            "Example: --count-commits github.com/org/repo@develop\n"
+            "\n"
+            "Without an argument: append the following columns to all output\n"
+            "CSVs (one row per repo in the full listing):\n"
             "  defaultBranch.target.commit.ancestors.totalCount\n"
             "    Exact git rev-list count of commits reachable from HEAD on\n"
             "    each repo's default branch (computed by gitserver).\n"
@@ -1736,6 +1869,61 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def collect_scope(args: argparse.Namespace) -> tuple[str, str] | None:
+    """Determine the single-repo scope from --count-commits / --reclone / --reindex.
+
+    Each of those args is either:
+      - False (flag not given)
+      - True  (flag given without an argument — full-repo iteration)
+      - str   (flag given with REPO[@REV] — scoped to that one repository)
+
+    Returns:
+      None when no scoped value is set (full-repo iteration mode).
+      (repo_name, rev) tuple otherwise. `rev` defaults to "HEAD" when none of
+      the scoped args specified one. The rev only affects --count-commits;
+      --reclone and --reindex operate on the whole repo regardless.
+
+    Exits via die() if multiple scoped flags reference different repos —
+    we deliberately don't try to run two single-repo operations on
+    different repos in one invocation, so the user can re-run if needed.
+    """
+    scoped: list[tuple[str, str]] = [
+        (flag_name, value)
+        for flag_name, value in (
+            ("--count-commits", args.count_commits),
+            ("--reclone", args.reclone),
+            ("--reindex", args.reindex),
+        )
+        if isinstance(value, str)
+    ]
+    if not scoped:
+        return None
+    parsed = [
+        (flag_name, parse_repo_name(value), parse_repo_rev(value))
+        for flag_name, value in scoped
+    ]
+    repo_names = {name for _, name, _ in parsed}
+    if len(repo_names) > 1:
+        details = ", ".join(f"{flag}={name}" for flag, name, _ in parsed)
+        die(
+            "scoped flags reference different repositories ("
+            + details
+            + "); pass the same REPO[@REV] to each, or run them in separate "
+            "invocations.",
+        )
+    repo_name = next(iter(repo_names))
+    # The rev only matters for --count-commits; if it was scoped, take its
+    # rev. Otherwise default to "HEAD". For --reclone and --reindex the rev
+    # is ignored (the recloneRepository / reindexRepository mutations are
+    # repo-level), so we don't bother checking that scoped revs match.
+    rev = "HEAD"
+    for flag, _, candidate_rev in parsed:
+        if flag == "--count-commits":
+            rev = candidate_rev
+            break
+    return repo_name, rev
+
+
 def run(args: argparse.Namespace, endpoint: str, token: str) -> None:
     """Confirm the connection, then stream every repo to the CSV file."""
     if args.count_commits:
@@ -1750,6 +1938,21 @@ def run(args: argparse.Namespace, endpoint: str, token: str) -> None:
             "(timeout=%ds per request)",
             REQUEST_TIMEOUT_SECONDS,
         )
+    scope = collect_scope(args)
+    if scope is not None:
+        scope_repo, scope_rev = scope
+        logger.info(
+            "Scoped run: repository=%s, rev=%s "
+            "(reclone=%s, reindex=%s, count-commits=%s)",
+            scope_repo,
+            scope_rev,
+            bool(args.reclone),
+            bool(args.reindex),
+            bool(args.count_commits),
+        )
+    else:
+        scope_repo = None
+        scope_rev = "HEAD"
     username = fetch_current_username(endpoint, token)
     logger.info("Connected to: %s as: %s", endpoint, username)
 
@@ -1783,15 +1986,25 @@ def run(args: argparse.Namespace, endpoint: str, token: str) -> None:
 
     # Prefix per-instance outputs with the sanitized endpoint so a customer
     # comparing results across multiple Sourcegraph instances doesn't overwrite
-    # outputs from other runs.
+    # outputs from other runs. When scoped to a single repo, also include the
+    # sanitized repo name (and rev when --count-commits used REPO@REV) in the
+    # prefix so a single-repo run doesn't clobber the full-listing CSVs.
     endpoint_sanitized = sanitize_endpoint_for_filename(endpoint)
-    output_path = Path(f"{endpoint_sanitized}-{DEFAULT_OUTPUT_FILE}")
-    cloning_errors_path = Path(f"{endpoint_sanitized}-{DEFAULT_CLONING_ERRORS_FILE}")
-    indexing_errors_path = Path(f"{endpoint_sanitized}-{DEFAULT_INDEXING_ERRORS_FILE}")
+    if scope_repo is not None:
+        scope_suffix = sanitize_for_filename(scope_repo)
+        # Only embed the rev in the filename when --count-commits actually
+        # specified one (rev != "HEAD"); --reclone/--reindex ignore rev so
+        # adding it would just clutter the filename for those modes.
+        if args.count_commits and scope_rev != "HEAD":
+            scope_suffix = f"{scope_suffix}-{sanitize_for_filename(scope_rev)}"
+        prefix = f"{endpoint_sanitized}-{scope_suffix}"
+    else:
+        prefix = endpoint_sanitized
+    output_path = Path(f"{prefix}-{DEFAULT_OUTPUT_FILE}")
+    cloning_errors_path = Path(f"{prefix}-{DEFAULT_CLONING_ERRORS_FILE}")
+    indexing_errors_path = Path(f"{prefix}-{DEFAULT_INDEXING_ERRORS_FILE}")
     skipped_files_path = (
-        Path(f"{endpoint_sanitized}-{DEFAULT_SKIPPED_FILES_FILE}")
-        if args.skipped_files
-        else None
+        Path(f"{prefix}-{DEFAULT_SKIPPED_FILES_FILE}") if args.skipped_files else None
     )
     # Clear any stale outputs from a previous run; LazyCSVWriter will only
     # recreate these files if matching rows are encountered this time.
@@ -1800,20 +2013,21 @@ def run(args: argparse.Namespace, endpoint: str, token: str) -> None:
     if skipped_files_path is not None:
         skipped_files_path.unlink(missing_ok=True)
 
+    count_commits_enabled = bool(args.count_commits)
     cloning_writer = LazyCSVWriter(
         cloning_errors_path,
-        csv_columns_for(CLONING_ERROR_CSV_COLUMNS, count_commits=args.count_commits),
+        csv_columns_for(CLONING_ERROR_CSV_COLUMNS, count_commits=count_commits_enabled),
     )
     indexing_writer = LazyCSVWriter(
         indexing_errors_path,
-        csv_columns_for(CSV_COLUMNS, count_commits=args.count_commits),
+        csv_columns_for(CSV_COLUMNS, count_commits=count_commits_enabled),
     )
     skipped_writer = (
         LazyCSVWriter(
             skipped_files_path,
             csv_columns_for(
                 SKIPPED_FILES_CSV_COLUMNS,
-                count_commits=args.count_commits,
+                count_commits=count_commits_enabled,
             ),
         )
         if skipped_files_path is not None
@@ -1839,9 +2053,11 @@ def run(args: argparse.Namespace, endpoint: str, token: str) -> None:
             endpoint,
             token,
             args.limit,
-            reclone=args.reclone,
-            reindex=args.reindex,
-            count_commits=args.count_commits,
+            reclone=bool(args.reclone),
+            reindex=bool(args.reindex),
+            count_commits=bool(args.count_commits),
+            scope_repo=scope_repo,
+            count_commits_rev=scope_rev,
         )
 
     logger.info("Wrote %d repos to %s", total, output_path.name)
