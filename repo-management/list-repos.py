@@ -163,7 +163,7 @@ query { currentUser { username } }
 # or non-admin tokens; the COMMIT_COUNT_OPTIMIZATION_COLUMNS extractors
 # tolerate that with empty cells.
 COMMIT_COUNT_QUERY = """
-query CommitCount($name: String!) {
+query CommitCount($name: String!, $allRefsSearch: String!) {
   repository(name: $name) {
     commit(rev: "HEAD") {
       ancestors {
@@ -187,8 +187,50 @@ query CommitCount($name: String!) {
       }
     }
   }
+  search(query: $allRefsSearch, version: V3) {
+    results {
+      matchCount
+    }
+  }
 }
 """
+
+# Search query template used to count commits across every branch and tag,
+# returned alongside the default-branch ancestors count in the same request.
+# Sourcegraph's GraphQL has no field for `git rev-list --all --count` and
+# the obvious GraphQL alternatives don't work:
+#   - commit(rev:"--all") is rejected as an invalid revspec
+#   - summing ancestors.totalCount over every gitRefs node massively
+#     overcounts shared history (e.g. github.com/curl/curl explodes from
+#     ~38k on default to ~4.4M when summed across 231 tags + 19 branches)
+# The search-API count is internally consistent across repos and lets users
+# spot which repos have meaningful activity beyond their default branch.
+# IMPORTANT: this counts commits *as seen by Sourcegraph's commit search*
+# and is therefore NOT directly comparable to the
+# defaultBranch.target.commit.ancestors.totalCount column above (which is
+# an exact git rev-list count from gitserver). The two columns use
+# different methodologies — see the --count-commits help text for details.
+#
+# Only refs/heads/* and refs/tags/* are included; refs/pull/N/head and
+# similar internal refs would otherwise inflate the count by tens of
+# thousands of GitHub-PR refs. The repo name is regex-anchored and
+# escaped so a name with regex specials (a real possibility for code-host
+# slugs) can't break the query.
+# `timeout:` is a Sourcegraph search-side limiter: if the search engine can't
+# complete in that wall-clock budget, the API returns whatever it has so far
+# (often with an `alert`) instead of holding the HTTP connection open until
+# the gateway or our REQUEST_TIMEOUT_SECONDS_WITH_COMMIT_COUNT fires. Without
+# this, repos like github.com/chromium/chromium (1.7M+ commits, thousands of
+# refs) would block the run indefinitely and burn all our HTTP retries.
+ALL_REFS_COMMIT_SEARCH_TEMPLATE = (
+    "r:^{repo}$ rev:*refs/heads/*:*refs/tags/* type:commit count:all timeout:120s"
+)
+
+
+def build_all_refs_search(repo_name: str) -> str:
+    """Build the SG search query that counts commits across all branches+tags."""
+    return ALL_REFS_COMMIT_SEARCH_TEMPLATE.format(repo=re.escape(repo_name))
+
 
 RECLONE_MUTATION = """
 mutation Reclone($repo: ID!) {
@@ -441,31 +483,44 @@ def fetch_commit_count(
     endpoint: str,
     token: str,
     repo_name: str,
-) -> tuple[int | None, float, list[Any]]:
-    """Run the per-repo COMMIT_COUNT_QUERY and return (count, elapsed_seconds, optimization_values).
+) -> tuple[int | None, int | None, float, list[Any]]:
+    """Run the per-repo COMMIT_COUNT_QUERY and return per-repo commit metrics.
 
-    optimization_values is a list aligned with COMMIT_COUNT_OPTIMIZATION_COLUMNS
-    so callers can append it directly to a CSV row. Each element is the raw
-    GraphQL value (DateTime as ISO string, Int, Boolean) or None when the
-    field was not returned (e.g. repositoryStatistics is admin-only and
-    returns null for non-cloned repos or non-admin tokens).
+    Returns (default_branch_count, all_refs_count, elapsed_seconds,
+    optimization_values).
 
-    Returns (None, elapsed, [None, ...]) when:
-      - The repo has no default branch (empty repo / unresolved HEAD).
-      - The GraphQL response is partial / errors out (logged as a warning).
-      - The HTTP request fails after retries (logged as a warning).
+    - default_branch_count: exact git rev-list count of commits reachable from
+      HEAD on the repo's default branch (from
+      commit(rev:"HEAD").ancestors.totalCount).
+    - all_refs_count: search-based count of commits reachable across every
+      branch and tag (refs/heads/* + refs/tags/*). This is a Sourcegraph
+      *search* count, not a git rev-list count, and is therefore NOT
+      directly comparable to default_branch_count — see
+      ALL_REFS_COMMIT_SEARCH_TEMPLATE for why we cannot get an exact
+      rev-list-style count via GraphQL.
+    - elapsed_seconds: wall-clock time of the GraphQL request (ALWAYS
+      returned, even on failure, so the CSV always has a timing value).
+    - optimization_values: aligned with COMMIT_COUNT_OPTIMIZATION_COLUMNS so
+      callers can append it directly to a CSV row.
 
-    The elapsed wall-clock time is always returned so the CSV always has a
-    timing value in its query-time column, even on failure rows.
+    Returns (None, None, elapsed, [None, ...]) when the GraphQL request
+    errors out at the transport level. Either count may be None
+    independently of the other (e.g. an empty repo has no HEAD but the
+    search may still return 0 across refs, or vice versa).
     """
     empty_extras: list[Any] = [None] * len(COMMIT_COUNT_OPTIMIZATION_COLUMNS)
     start = time.monotonic()
     try:
-        data = graphql_request(endpoint, token, COMMIT_COUNT_QUERY, {"name": repo_name})
+        data = graphql_request(
+            endpoint,
+            token,
+            COMMIT_COUNT_QUERY,
+            {"name": repo_name, "allRefsSearch": build_all_refs_search(repo_name)},
+        )
     except (GraphQLError, HTTPRequestError) as exc:
         elapsed = time.monotonic() - start
         logger.warning("commit-count query failed for %s: %s", repo_name, exc)
-        return None, elapsed, empty_extras
+        return None, None, elapsed, empty_extras
     except OSError as exc:
         elapsed = time.monotonic() - start
         logger.warning(
@@ -473,16 +528,24 @@ def fetch_commit_count(
             repo_name,
             exc,
         )
-        return None, elapsed, empty_extras
+        return None, None, elapsed, empty_extras
     elapsed = time.monotonic() - start
     repo: dict[str, Any] = data.get("repository") or {}
     commit: dict[str, Any] = repo.get("commit") or {}
     ancestors: dict[str, Any] = commit.get("ancestors") or {}
-    count = ancestors.get("totalCount")
-    optimization_values = [extract(repo) for _, extract in COMMIT_COUNT_OPTIMIZATION_COLUMNS]
-    if isinstance(count, int):
-        return count, elapsed, optimization_values
-    return None, elapsed, optimization_values
+    default_count_raw = ancestors.get("totalCount")
+    default_count: int | None = (
+        default_count_raw if isinstance(default_count_raw, int) else None
+    )
+    search_results: dict[str, Any] = (data.get("search") or {}).get("results") or {}
+    all_refs_count_raw = search_results.get("matchCount")
+    all_refs_count: int | None = (
+        all_refs_count_raw if isinstance(all_refs_count_raw, int) else None
+    )
+    optimization_values = [
+        extract(repo) for _, extract in COMMIT_COUNT_OPTIMIZATION_COLUMNS
+    ]
+    return default_count, all_refs_count, elapsed, optimization_values
 
 
 # --- CSV format -----------------------------------------------------------
@@ -564,9 +627,7 @@ URL_COLUMN_INDEX = CSV_COLUMNS.index("url")
 # repositoryStatistics is admin-only and returns null for non-cloned repos
 # or non-admin tokens — get_path() returns None in that case, which writes
 # an empty cell.
-COMMIT_COUNT_OPTIMIZATION_COLUMNS: list[
-    tuple[str, Callable[[dict[str, Any]], Any]]
-] = [
+COMMIT_COUNT_OPTIMIZATION_COLUMNS: list[tuple[str, Callable[[dict[str, Any]], Any]]] = [
     ("mirrorInfo.lastCleanedAt", lambda r: get_path(r, "mirrorInfo.lastCleanedAt")),
     (
         "mirrorInfo.cleanupSchedule.due",
@@ -603,6 +664,9 @@ COMMIT_COUNT_OPTIMIZATION_COLUMNS: list[
 # the optimization metadata fetched in the same request.
 COMMIT_COUNT_COLUMNS: list[str] = [
     "defaultBranch.target.commit.ancestors.totalCount",
+    # Side-by-side with the default-branch count for easy visual comparison.
+    # See ALL_REFS_COMMIT_SEARCH_TEMPLATE for the methodology and caveats.
+    "allRefs.search.matchCount",
     "commitCount.queryTimeSeconds",
     *(name for name, _ in COMMIT_COUNT_OPTIMIZATION_COLUMNS),
 ]
@@ -1163,8 +1227,14 @@ def fetch_repos(
     endpoint: str,
     token: str,
     max_repos: int | None = None,
-) -> Iterator[dict[str, Any]]:
-    """Yield repository nodes by paginating through the GraphQL API.
+) -> Iterator[tuple[int, int, dict[str, Any]]]:
+    """Yield (index, target, repo) tuples by paginating through the GraphQL API.
+
+    `index` is the 1-based position of `repo` in the run; `target` is the
+    total number of repos in scope (min(max_repos, totalCount) when --limit
+    is set, else totalCount). Both are surfaced so per-repo log lines (e.g.
+    the --count-commits commit-count messages) can show "[N/Total]" without
+    the caller having to re-derive the target.
 
     Logs "Fetching X of Y total repositories..." once, after the first page
     returns its totalCount, so the user sees the target before per-page
@@ -1194,9 +1264,10 @@ def fetch_repos(
             )
             first_page = False
 
-        yield from connection["nodes"]
+        for repo in connection["nodes"]:
+            total_fetched += 1
+            yield total_fetched, target, repo
 
-        total_fetched += len(connection["nodes"])
         logger.info("Fetched %d/%d repositories...", total_fetched, target)
 
         if not connection["pageInfo"]["hasNextPage"]:
@@ -1226,22 +1297,40 @@ def build_row(repo: dict[str, Any], endpoint: str) -> list[Any]:
 def append_commit_count(
     row: list[Any],
     commit_count: int | None,
+    all_refs_count: int | None,
     elapsed_seconds: float | None,
+    optimization_values: list[Any] | None = None,
     *,
     count_commits: bool,
 ) -> list[Any]:
-    """Append (commit_count, elapsed_seconds) to row when count_commits is True.
+    """Append commit-count fields to row when count_commits is True.
+
+    Order matches COMMIT_COUNT_COLUMNS:
+      1. commit_count        (defaultBranch.target.commit.ancestors.totalCount)
+      2. all_refs_count      (allRefs.search.matchCount)
+      3. elapsed_seconds     (commitCount.queryTimeSeconds)
+      4. *optimization_values (mirrorInfo.* cleanup/repack metadata)
 
     elapsed_seconds is rendered to 3 decimal places (millisecond resolution)
     when present so spreadsheets sort it numerically; None becomes an empty
     cell — matching csv.writer's default formatting for None.
+
+    optimization_values must be aligned with COMMIT_COUNT_OPTIMIZATION_COLUMNS.
+    Pass None when the per-repo query was skipped (e.g. for a row built
+    before fetch_commit_count was attempted) to fill the columns with empty
+    cells, keeping every row the same width.
     """
     if not count_commits:
         return row
     elapsed_cell: str | None = (
         f"{elapsed_seconds:.3f}" if elapsed_seconds is not None else None
     )
-    return [*row, commit_count, elapsed_cell]
+    extras = (
+        optimization_values
+        if optimization_values is not None
+        else [None] * len(COMMIT_COUNT_OPTIMIZATION_COLUMNS)
+    )
+    return [*row, commit_count, all_refs_count, elapsed_cell, *extras]
 
 
 def csv_columns_for(base_columns: list[str], *, count_commits: bool) -> list[str]:
@@ -1293,39 +1382,57 @@ def write_csv(
     total = 0
     reclone_total = 0
     reindex_total = 0
-    for repo in fetch_repos(endpoint, token, max_repos):
+    for index, target, repo in fetch_repos(endpoint, token, max_repos):
         row = build_row(repo, endpoint)
         commit_count: int | None = None
+        all_refs_count: int | None = None
         elapsed_seconds: float | None = None
+        optimization_values: list[Any] | None = None
         if count_commits:
             repo_name = str(repo.get("name") or "")
-            commit_count, elapsed_seconds = fetch_commit_count(
-                endpoint,
-                token,
-                repo_name,
-            )
+            (
+                commit_count,
+                all_refs_count,
+                elapsed_seconds,
+                optimization_values,
+            ) = fetch_commit_count(endpoint, token, repo_name)
+            # The "[N/Total]" prefix lets users tail repos.log and see how
+            # far through the run we are without scrolling back to the
+            # per-page "Fetched N/Total" line.
+            position = f"[{index}/{target}]"
+            # Render counts as "?" rather than "None" in the log so the line
+            # stays compact when one or both counts are missing.
+            default_str = "?" if commit_count is None else f"{commit_count}"
+            all_refs_str = "?" if all_refs_count is None else f"{all_refs_count}"
             if commit_count is None:
                 # Common for empty / not-yet-cloned repos. Log so users
                 # grepping the log can spot which repos returned no count
                 # without it being a noisy WARNING.
                 logger.info(
-                    "No commit count for %s (no default branch or unresolved HEAD) "
+                    "%s No commit count for %s (default=%s, allRefs=%s) "
                     "[query took %.3fs]",
+                    position,
                     repo_name or repo.get("url") or repo.get("id"),
+                    default_str,
+                    all_refs_str,
                     elapsed_seconds,
                 )
             else:
                 logger.info(
-                    "Commit count for %s: %d [query took %.3fs]",
+                    "%s Commit count for %s: default=%s, allRefs=%s [query took %.3fs]",
+                    position,
                     repo_name or repo.get("url") or repo.get("id"),
-                    commit_count,
+                    default_str,
+                    all_refs_str,
                     elapsed_seconds,
                 )
         writer.writerow(
             append_commit_count(
                 row,
                 commit_count,
+                all_refs_count,
                 elapsed_seconds,
+                optimization_values,
                 count_commits=count_commits,
             ),
         )
@@ -1335,7 +1442,9 @@ def write_csv(
                 append_commit_count(
                     row + [extract(repo) for _, extract in CLONING_ERROR_EXTRA_COLUMNS],
                     commit_count,
+                    all_refs_count,
                     elapsed_seconds,
+                    optimization_values,
                     count_commits=count_commits,
                 ),
             )
@@ -1346,7 +1455,9 @@ def write_csv(
                 append_commit_count(
                     row,
                     commit_count,
+                    all_refs_count,
                     elapsed_seconds,
+                    optimization_values,
                     count_commits=count_commits,
                 ),
             )
@@ -1357,7 +1468,9 @@ def write_csv(
                 append_commit_count(
                     row + [extract(repo) for _, extract in SKIPPED_FILES_EXTRA_COLUMNS],
                     commit_count,
+                    all_refs_count,
                     elapsed_seconds,
+                    optimization_values,
                     count_commits=count_commits,
                 ),
             )
@@ -1569,15 +1682,43 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--count-commits",
         action="store_true",
         help=(
-            "Append two columns to all output CSVs:\n"
+            "Append the following columns to all output CSVs:\n"
             "  defaultBranch.target.commit.ancestors.totalCount\n"
-            "    The total number of commits on each repo's default branch.\n"
+            "    Exact git rev-list count of commits reachable from HEAD on\n"
+            "    each repo's default branch (computed by gitserver).\n"
+            "  allRefs.search.matchCount\n"
+            "    Sourcegraph search-API count of commits reachable across all\n"
+            "    branches and tags (refs/heads/* + refs/tags/*). Useful for\n"
+            "    spotting repos whose work happens off the default branch.\n"
+            "    Note: NOT directly comparable to the column above —\n"
+            "    Sourcegraph has no GraphQL field exposing\n"
+            "    `git rev-list --all --count`, and this is the\n"
+            "    closest available proxy. It may differ in absolute value\n"
+            "    because it counts what Sourcegraph's commit search sees.\n"
             "  commitCount.queryTimeSeconds\n"
-            "    The wall-clock time of the commit-count GraphQL query.\n"
+            "    The wall-clock time of the per-repo commit-count GraphQL\n"
+            "    query (which fetches both counts above plus the\n"
+            "    optimization metadata below in a single round-trip).\n"
+            "  mirrorInfo.lastCleanedAt\n"
+            "    When the repo was last successfully cleaned (optimized).\n"
+            "  mirrorInfo.cleanupSchedule.due\n"
+            "    When the repo is next due to be enqueued for cleanup.\n"
+            "  mirrorInfo.cleanupSchedule.intervalSeconds\n"
+            "    Scheduling interval (seconds) used for the next due time.\n"
+            "  mirrorInfo.cleanupQueue.index\n"
+            "    Position of the repo in the cleanup queue (if queued).\n"
+            "  mirrorInfo.cleanupQueue.optimizing\n"
+            "    True if the repo is being optimized right now.\n"
+            "  mirrorInfo.repositoryStatistics.packfiles.lastFullRepack\n"
+            "    Timestamp of the most recent full repack of the repo's\n"
+            "    packfiles (admin-only; empty for non-admin tokens or for\n"
+            "    repos that are not currently cloned).\n"
             "Each repo gets its own GraphQL request to keep the per-repo timing\n"
             "accurate; this can be slow on big monorepos, so only enable when\n"
             "needed. The per-request HTTP timeout is bumped automatically when\n"
-            "this flag is set."
+            "this flag is set. The schema does NOT expose before/after stats\n"
+            "from a specific optimization run; only the current/last values\n"
+            "above are available."
         ),
     )
     parser.add_argument(
@@ -1806,6 +1947,11 @@ def main() -> None:
     args = parse_args(sys.argv[1:])
     load_dotenv()
     endpoint, token = require_credentials(args)
+    logger.info(
+        "Running: %s (SRC_ENDPOINT=%s)",
+        redact_argv_for_log(sys.argv),
+        endpoint,
+    )
 
     try:
         run(args, endpoint, token)
