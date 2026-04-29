@@ -1,6 +1,12 @@
+__pycache__
 .DS_Store
 .env
 .idea
+.ruff_cache
 .src_users_backup.json
 .vscode
 bin/
+
+/repo-management/schema.graphql
+/repo-management/**.log
+/repo-management/**.csv
