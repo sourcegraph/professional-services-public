@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-"""List all repositories on a Sourcegraph instance via the GraphQL API.
-
-Outputs a CSV file with the list of repos and metadata.
+"""List all repositories on a Sourcegraph instance via the GraphQL API,
+and outputs CSV files with the list of repos and metadata.
 
 What this script does:
   1. Get SRC_ENDPOINT and SRC_ACCESS_TOKEN from environment variables, falling
@@ -16,12 +15,12 @@ What this script does:
 Usage:
   export SRC_ENDPOINT="https://sourcegraph.example.com"
   export SRC_ACCESS_TOKEN="sgp_..."
-  # ...or place those in a `.env` file in the working directory.
+  # ...or place those in a `.env` file in the working directory
+
   python3 list-repos.py                       # writes all repos to ENDPOINT-repos.csv
   python3 list-repos.py --limit 100           # fetch only 100 repos
-  python3 list-repos.py --output some.csv     # write to a different file
 
-Only Python's standard library is used. No third-party packages required.
+Only Python's standard library is used. No additional packages required.
 
 To download the GraphQL schema from your SG instance, to make changes to this script,
 run a command like the following to get it from the introspection service:
@@ -137,10 +136,6 @@ query ListRepos($first: Int!, $after: String) {
 
 CURRENT_USER_QUERY = """
 query { currentUser { username } }
-"""
-
-REPO_COUNT_QUERY = """
-query { repositories(first: 1) { totalCount } }
 """
 
 RECLONE_MUTATION = """
@@ -285,11 +280,9 @@ def join_corruption_logs(repo: dict[str, Any]) -> str:
 def truncate_sync_output(repo: dict[str, Any]) -> str | None:
     """Return lastSyncOutput truncated to first 5 + last 5 lines if >10 lines.
 
-    Suppressed for healthy 'cloned' repos so the column only shows sync output
-    for repos in a non-cloned/errored/corrupted/cloning state.
+    Only invoked for cloning-error rows (see CLONING_ERROR_EXTRA_COLUMNS), so
+    we don't need to filter out healthy 'cloned' repos here.
     """
-    if derive_mirror_status(repo) == "cloned":
-        return None
     value = get_path(repo, "mirrorInfo.lastSyncOutput")
     if not isinstance(value, str):
         return None
@@ -647,12 +640,6 @@ def fetch_current_username(endpoint: str, token: str) -> str:
     return user.get("username", "") or ""
 
 
-def fetch_repo_count(endpoint: str, token: str) -> int:
-    """Return the total number of repositories on the instance."""
-    data = graphql_request(endpoint, token, REPO_COUNT_QUERY, {})
-    return int(data["repositories"]["totalCount"])
-
-
 def trigger_reclone(endpoint: str, token: str, repo_id: str) -> bool:
     """Send recloneRepository mutation. Returns True on success, False on GraphQL error."""
     try:
@@ -862,16 +849,11 @@ def write_skipped_files_reason(
 
     # Sort by chunkMatches.content so files with the same NOT-INDEXED reason
     # are grouped together; ties broken by byteSize, extension, then file_url.
-    # The key coerces byteSize to int (treating missing values as -1) so an
-    # int/str union can't blow up the comparator.
-    def _sort_key(
-        row: tuple[str, int | str, str, str],
-    ) -> tuple[str, int, str, str]:
-        content, byte_size, extension, url = row
-        size = byte_size if isinstance(byte_size, int) else -1
-        return (content, size, extension, url)
-
-    rows.sort(key=_sort_key)
+    # Coerce byteSize to int (treating missing values as -1) so an int/str
+    # union can't blow up the comparator.
+    rows.sort(
+        key=lambda r: (r[0], r[1] if isinstance(r[1], int) else -1, r[2], r[3]),
+    )
 
     with files_path.open("w", newline="") as out:
         writer = csv.writer(out)
@@ -901,6 +883,39 @@ def write_skipped_files_reason(
 
 
 # --- Repo CSV pipeline --------------------------------------------------------
+
+
+class LazyCSVWriter:
+    """csv.writer wrapper that opens its file on the first writerow() call.
+
+    For optional outputs that may end up empty (no cloning/indexing/skipped
+    rows): if no rows are written, no file is created at all — eliminating
+    the create-then-delete-if-empty dance. Memory cost is constant; rows
+    pass straight through to csv.writer just like before, only the open()
+    and header-write are deferred.
+    """
+
+    def __init__(self, path: Path, columns: list[str]) -> None:
+        self.path = path
+        self.columns = columns
+        self.count = 0
+        self._file: TextIO | None = None
+        self._writer: Any = None
+
+    def writerow(self, row: list[Any]) -> None:
+        if self._writer is None:
+            self._file = self.path.open("w", newline="")
+            self._writer = csv.writer(self._file)
+            self._writer.writerow(self.columns)
+        self._writer.writerow(row)
+        self.count += 1
+
+    def __enter__(self) -> LazyCSVWriter:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        if self._file is not None:
+            self._file.close()
 
 
 def fetch_repos(
@@ -952,49 +967,41 @@ def build_row(repo: dict[str, Any], endpoint: str) -> list[Any]:
 
 def write_csv(
     out: TextIO,
-    cloning_errors_out: TextIO,
-    indexing_errors_out: TextIO,
-    skipped_files_out: TextIO | None,
+    cloning_writer: LazyCSVWriter,
+    indexing_writer: LazyCSVWriter,
+    skipped_writer: LazyCSVWriter | None,
     endpoint: str,
     token: str,
     max_repos: int | None = None,
     *,
     reclone: bool = False,
     reindex: bool = False,
-) -> tuple[int, int, int, int, int, int]:
+) -> tuple[int, int, int]:
     """Stream repos directly to CSV rather than collecting them first.
 
-    Repos with cloning/mirror errors are written to cloning_errors_out (with
+    Repos with cloning/mirror errors are written to cloning_writer (with
     extra mirror-error detail columns appended); repos that are cloned but
-    missing a search index are written to indexing_errors_out; repos whose
+    missing a search index are written to indexing_writer; repos whose
     index has at least one skipped file (zoekt SkipReason) are written to
-    skipped_files_out with per-ref counts and the search query that lists the
+    skipped_writer with per-ref counts and the search query that lists the
     skipped files. If reclone is set, the recloneRepository mutation is sent
     for each cloning-error repo; if reindex is set, the reindexRepository
     mutation is sent for each indexing-error repo. Skipped-file reporting has
     no remediation mutation — fixes are configuration-level (search.largeFiles
     or .sourcegraph/ignore).
 
+    The optional writers are LazyCSVWriter instances that defer file creation
+    until the first matching row, so empty error/skipped CSVs are never
+    created. Per-category counts are tracked on each writer's `.count`.
+
     Memory stays constant regardless of how many repos are fetched.
 
-    Returns (total, cloning_total, indexing_total, skipped_total,
-    reclone_total, reindex_total).
+    Returns (total, reclone_total, reindex_total).
     """
     writer = csv.writer(out)
     writer.writerow(CSV_COLUMNS)
-    cloning_writer = csv.writer(cloning_errors_out)
-    cloning_writer.writerow(CLONING_ERROR_CSV_COLUMNS)
-    indexing_writer = csv.writer(indexing_errors_out)
-    indexing_writer.writerow(INDEXING_ERROR_CSV_COLUMNS)
-    skipped_writer = None
-    if skipped_files_out is not None:
-        skipped_writer = csv.writer(skipped_files_out)
-        skipped_writer.writerow(SKIPPED_FILES_CSV_COLUMNS)
 
     total = 0
-    cloning_total = 0
-    indexing_total = 0
-    skipped_total = 0
     reclone_total = 0
     reindex_total = 0
     for repo in fetch_repos(endpoint, token, max_repos):
@@ -1005,31 +1012,21 @@ def write_csv(
             cloning_writer.writerow(
                 row + [extract(repo) for _, extract in CLONING_ERROR_EXTRA_COLUMNS],
             )
-            cloning_total += 1
             if reclone and trigger_reclone(endpoint, token, repo["id"]):
                 reclone_total += 1
         if has_indexing_error(repo):
             indexing_writer.writerow(row)
-            indexing_total += 1
             if reindex and trigger_reindex(endpoint, token, repo["id"]):
                 reindex_total += 1
         if skipped_writer is not None and has_skipped_files(repo):
             skipped_writer.writerow(
                 row + [extract(repo) for _, extract in SKIPPED_FILES_EXTRA_COLUMNS],
             )
-            skipped_total += 1
-    return (
-        total,
-        cloning_total,
-        indexing_total,
-        skipped_total,
-        reclone_total,
-        reindex_total,
-    )
+    return (total, reclone_total, reindex_total)
 
 
 def log_http_error(exc: HTTPRequestError) -> None:
-    """Log status, headers, and body of a non-2xx HTTP response."""
+    """Log status, headers, body, and traceback of a non-2xx HTTP response."""
     logger.error("HTTP %s %s", exc.status, exc.reason)
     logger.error("URL: %s", exc.url)
     for header, value in exc.headers:
@@ -1037,6 +1034,7 @@ def log_http_error(exc: HTTPRequestError) -> None:
     body = exc.body.decode(errors="replace")
     if body:
         logger.error("Response body:\n%s", body)
+    logger.error("HTTP request failed", exc_info=exc)
 
 
 def load_dotenv() -> None:
@@ -1140,10 +1138,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             "with metadata for repo clone and index statuses\n"
             "\n"
             "Requires SRC_ENDPOINT and SRC_ACCESS_TOKEN, "
-            "configured via either args or environment variables"
+            "configured via either environment variables or args"
             "\n"
         ),
-        epilog=(""),
+        epilog=("Source: https://github.com/sourcegraph/professional-services-public"),
         formatter_class=lambda prog: BlankLineHelpFormatter(
             prog,
             max_help_position=36,
@@ -1182,17 +1180,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--reclone",
         action="store_true",
         help=(
-            "Send the recloneRepository GraphQL mutation for every repo with a "
-            "cloning error (lastError, isCorrupted, corruptionLogs, or not cloned)."
+            "Force reclone all repos with a cloning error "
+            "(lastError, isCorrupted, corruptionLogs, or not cloned)"
         ),
     )
     parser.add_argument(
         "--reindex",
         action="store_true",
-        help=(
-            "Send the reindexRepository GraphQL mutation for every repo with an "
-            "indexing error (cloned but missing a search index)."
-        ),
+        help=("Force reindex all repos with an indexing error "),
     )
     parser.add_argument(
         "--src-endpoint",
@@ -1220,10 +1215,6 @@ def run(args: argparse.Namespace, endpoint: str, token: str) -> None:
         write_skipped_files_reason(endpoint, token, args.skipped_files_reason)
         return
 
-    total_count = fetch_repo_count(endpoint, token)
-    target = min(args.limit, total_count) if args.limit is not None else total_count
-    logger.info("Fetching %d of %d total repositories...", target, total_count)
-
     # Prefix per-instance outputs with the sanitized endpoint so a customer
     # comparing results across multiple Sourcegraph instances doesn't overwrite
     # outputs from other runs.
@@ -1236,58 +1227,67 @@ def run(args: argparse.Namespace, endpoint: str, token: str) -> None:
         if args.skipped_files
         else None
     )
-    skipped_cm = (
-        skipped_files_path.open("w", newline="")
+    # Clear any stale outputs from a previous run; LazyCSVWriter will only
+    # recreate these files if matching rows are encountered this time.
+    cloning_errors_path.unlink(missing_ok=True)
+    indexing_errors_path.unlink(missing_ok=True)
+    if skipped_files_path is not None:
+        skipped_files_path.unlink(missing_ok=True)
+
+    cloning_writer = LazyCSVWriter(cloning_errors_path, CLONING_ERROR_CSV_COLUMNS)
+    indexing_writer = LazyCSVWriter(indexing_errors_path, INDEXING_ERROR_CSV_COLUMNS)
+    skipped_writer = (
+        LazyCSVWriter(skipped_files_path, SKIPPED_FILES_CSV_COLUMNS)
         if skipped_files_path is not None
-        else contextlib.nullcontext()
+        else None
+    )
+    # The skipped-files writer is optional (only when --skipped-files is set),
+    # but it has to participate in the same `with` block as the always-on
+    # writers. Use contextlib.nullcontext() as a no-op stand-in when disabled.
+    skipped_cm = (
+        skipped_writer if skipped_writer is not None else contextlib.nullcontext()
     )
     with (
         output_path.open("w", newline="") as out,
-        cloning_errors_path.open("w", newline="") as cloning_out,
-        indexing_errors_path.open("w", newline="") as indexing_out,
-        skipped_cm as skipped_out,
+        cloning_writer,
+        indexing_writer,
+        skipped_cm,
     ):
-        (
-            total,
-            cloning_total,
-            indexing_total,
-            skipped_total,
-            reclone_total,
-            reindex_total,
-        ) = write_csv(
+        total, reclone_total, reindex_total = write_csv(
             out,
-            cloning_out,
-            indexing_out,
-            skipped_out,
+            cloning_writer,
+            indexing_writer,
+            skipped_writer,
             endpoint,
             token,
             args.limit,
             reclone=args.reclone,
             reindex=args.reindex,
         )
+
     logger.info("Wrote %d repos to %s", total, output_path.name)
-    report_or_delete_extra_csv(cloning_errors_path, cloning_total, "cloning errors")
-    report_or_delete_extra_csv(indexing_errors_path, indexing_total, "indexing errors")
-    if skipped_files_path is not None:
-        report_or_delete_extra_csv(skipped_files_path, skipped_total, "skipped files")
+    if cloning_writer.count:
+        logger.info(
+            "Wrote %d repos with cloning errors to %s",
+            cloning_writer.count,
+            cloning_errors_path.name,
+        )
+    if indexing_writer.count:
+        logger.info(
+            "Wrote %d repos with indexing errors to %s",
+            indexing_writer.count,
+            indexing_errors_path.name,
+        )
+    if skipped_writer is not None and skipped_writer.count:
+        logger.info(
+            "Wrote %d repos with skipped files to %s",
+            skipped_writer.count,
+            skipped_writer.path.name,
+        )
     if args.reclone:
         logger.info("Triggered recloneRepository for %d repo(s)", reclone_total)
     if args.reindex:
         logger.info("Triggered reindexRepository for %d repo(s)", reindex_total)
-
-
-def report_or_delete_extra_csv(path: Path, count: int, kind: str) -> None:
-    """Log the row count and path, or delete the file if it has no data rows."""
-    if count_data_rows(path) == 0:
-        path.unlink()
-        return
-    logger.info("Wrote %d repos with %s to %s", count, kind, path.name)
-
-
-def count_data_rows(path: Path) -> int:
-    """Return the number of CSV data rows (lines minus the header) in path."""
-    with path.open(newline="") as f:
-        return max(0, sum(1 for _ in f) - 1)
 
 
 def configure_logging(log_path: Path) -> None:
@@ -1309,11 +1309,38 @@ def configure_logging(log_path: Path) -> None:
     root.addHandler(file_handler)
 
 
+def _log_uncaught_exception(
+    exc_type: type[BaseException],
+    exc_value: BaseException,
+    exc_traceback: Any,
+) -> None:
+    """sys.excepthook that routes uncaught exceptions through the logger.
+
+    Without this, Python's default hook writes the traceback to stderr only,
+    so repos.log would miss it. Logging via logger.error(exc_info=...) sends
+    the full traceback to both handlers (stderr + repos.log).
+
+    KeyboardInterrupt (Ctrl-C) is treated as a user-initiated graceful exit:
+    a one-line message is logged with no traceback, since a stack dump for an
+    intentional abort is just noise.
+    """
+    if issubclass(exc_type, KeyboardInterrupt):
+        logger.warning("Interrupted by user (Ctrl-C); exiting.")
+        return
+    logger.error(
+        "Uncaught exception",
+        exc_info=(exc_type, exc_value, exc_traceback),
+    )
+
+
 def main() -> None:
     """Entry point: configure logging, load env, parse args, run, handle errors."""
     configure_logging(Path(DEFAULT_LOG_FILE))
+    # Anything that escapes the try/except below (or is raised before it, e.g.
+    # in parse_args / load_dotenv / require_credentials) lands in repos.log
+    # with a full traceback via this hook.
+    sys.excepthook = _log_uncaught_exception
 
-    # Parse args first so --help works without requiring valid credentials.
     args = parse_args(sys.argv[1:])
     load_dotenv()
     endpoint, token = require_credentials(args)
