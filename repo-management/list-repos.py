@@ -59,9 +59,17 @@ logger = logging.getLogger(__name__)
 # --- Tune-ables -----------------------------------------------------------------
 
 PAGE_SIZE = 500
+# When --count-commits is set we ask Sourcegraph to compute a non-paginated
+# ancestors.totalCount per repo. That is far more expensive server-side than
+# the rest of the listing query, so we use a much smaller page size to keep
+# each request well under the gateway timeout.
+PAGE_SIZE_WITH_COMMIT_COUNT = 25
 MAX_RETRIES = 3
 RETRY_DELAY_SECONDS = 5
 REQUEST_TIMEOUT_SECONDS = 60
+# Counting commits server-side can be slow on big monorepos. Bump the per-
+# request timeout so we don't fail on long-but-still-progressing requests.
+REQUEST_TIMEOUT_SECONDS_WITH_COMMIT_COUNT = 600
 DEFAULT_OUTPUT_FILE = "repos.csv"
 DEFAULT_CLONING_ERRORS_FILE = "repos-with-cloning-errors.csv"
 DEFAULT_INDEXING_ERRORS_FILE = "repos-with-indexing-errors.csv"
@@ -70,7 +78,23 @@ DEFAULT_LOG_FILE = "repos.log"
 
 # --- GraphQL queries ----------------------------------------------------------
 
-GRAPHQL_QUERY = """
+# The optional defaultBranch sub-tree is opt-in via --count-commits because
+# ancestors.totalCount makes Sourcegraph walk every commit on the default
+# branch (no `first:` argument, otherwise the field is null per the schema).
+# That is expensive on big monorepos, so we only ask for it when explicitly
+# requested.
+COMMIT_COUNT_FRAGMENT = """
+      defaultBranch {
+        target {
+          commit {
+            ancestors {
+              totalCount
+            }
+          }
+        }
+      }"""
+
+GRAPHQL_QUERY_TEMPLATE = """
 query ListRepos($first: Int!, $after: String) {
   repositories(first: $first, after: $after) {
     nodes {
@@ -79,7 +103,7 @@ query ListRepos($first: Int!, $after: String) {
       createdAt
       isFork
       isArchived
-      isPrivate
+      isPrivate__COMMIT_COUNT_FRAGMENT__
       mirrorInfo {
         remoteURL
         cloned
@@ -138,6 +162,21 @@ query ListRepos($first: Int!, $after: String) {
   }
 }
 """
+
+
+_COMMIT_COUNT_PLACEHOLDER = "__COMMIT_COUNT_FRAGMENT__"
+
+
+def build_repos_query(*, count_commits: bool) -> str:
+    """Return the GraphQL listing query, optionally with the commit-count fragment.
+
+    Uses a literal placeholder + str.replace rather than str.format so that
+    the GraphQL query body's many `{` / `}` braces don't trip up the format
+    parser.
+    """
+    fragment = COMMIT_COUNT_FRAGMENT if count_commits else ""
+    return GRAPHQL_QUERY_TEMPLATE.replace(_COMMIT_COUNT_PLACEHOLDER, fragment)
+
 
 CURRENT_USER_QUERY = """
 query { currentUser { username } }
@@ -390,6 +429,25 @@ def has_skipped_files(repo: dict[str, Any]) -> bool:
     return total_skipped_files(repo) > 0
 
 
+def default_branch_commit_count(repo: dict[str, Any]) -> int | None:
+    """Return the number of commits on the repo's default branch.
+
+    Returns None when the repo has no default branch (e.g. an empty repo,
+    or one whose clone has not progressed far enough for HEAD to resolve),
+    or when --count-commits was not requested (in which case the listing
+    query never asked for the field and the path is missing).
+    """
+    value = get_path(repo, "defaultBranch.target.commit.ancestors.totalCount")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return None
+    return None
+
+
 # --- CSV format -----------------------------------------------------------
 # Each entry is (csv_column_name, extractor_function). Keeping the column name
 # next to the function that produces its value eliminates the risk of the
@@ -451,6 +509,14 @@ COLUMNS: list[tuple[str, Callable[[dict[str, Any]], Any]]] = [
 
 CSV_COLUMNS = [name for name, _ in COLUMNS]
 URL_COLUMN_INDEX = CSV_COLUMNS.index("url")
+
+# Optional column appended to every CSV (main, cloning-errors, indexing-errors,
+# skipped-files) when --count-commits is set. Kept separate from COLUMNS so
+# the default CSV format is unchanged for users who don't pass the flag.
+COMMIT_COUNT_COLUMN: tuple[str, Callable[[dict[str, Any]], Any]] = (
+    "defaultBranch.target.commit.ancestors.totalCount",
+    default_branch_commit_count,
+)
 
 # Extra columns appended only to the cloning-errors CSV.
 CLONING_ERROR_EXTRA_COLUMNS: list[tuple[str, Callable[[dict[str, Any]], Any]]] = [
@@ -1008,24 +1074,33 @@ def fetch_repos(
     endpoint: str,
     token: str,
     max_repos: int | None = None,
+    *,
+    count_commits: bool = False,
 ) -> Iterator[dict[str, Any]]:
     """Yield repository nodes by paginating through the GraphQL API.
 
     Logs "Fetching X of Y total repositories..." once, after the first page
     returns its totalCount, so the user sees the target before per-page
     progress lines start. Avoids a separate count-only round-trip.
+
+    When count_commits is True, the listing query is augmented with a
+    defaultBranch.target.commit.ancestors.totalCount sub-tree (computed
+    server-side per repo) and a smaller page size is used because that
+    field is significantly more expensive than the rest of the query.
     """
+    query = build_repos_query(count_commits=count_commits)
+    base_page_size = PAGE_SIZE_WITH_COMMIT_COUNT if count_commits else PAGE_SIZE
     cursor: str | None = None
     total_fetched = 0
     first_page = True
     while True:
-        page_size = PAGE_SIZE
+        page_size = base_page_size
         if max_repos is not None:
             page_size = min(page_size, max_repos - total_fetched)
         data = graphql_request(
             endpoint,
             token,
-            GRAPHQL_QUERY,
+            query,
             {"first": page_size, "after": cursor},
         )
         connection = data["repositories"]
@@ -1056,12 +1131,35 @@ def build_row(repo: dict[str, Any], endpoint: str) -> list[Any]:
 
     The 'url' column is stored relative in GraphQL (e.g. '/github.com/foo/bar');
     we rewrite it to an absolute URL here so the CSV is directly clickable.
+
+    The commit-count column is intentionally NOT added here — callers append
+    it after any per-CSV extra columns so it always lands in the rightmost
+    position, matching the header produced by csv_columns_for().
     """
     base = endpoint.rstrip("/")
     row = [extract(repo) for _, extract in COLUMNS]
     if row[URL_COLUMN_INDEX]:
         row[URL_COLUMN_INDEX] = base + row[URL_COLUMN_INDEX]
     return row
+
+
+def append_commit_count(
+    row: list[Any],
+    repo: dict[str, Any],
+    *,
+    count_commits: bool,
+) -> list[Any]:
+    """Return row with the commit-count value appended when count_commits is True."""
+    if count_commits:
+        return [*row, COMMIT_COUNT_COLUMN[1](repo)]
+    return row
+
+
+def csv_columns_for(base_columns: list[str], *, count_commits: bool) -> list[str]:
+    """Return the CSV header list, with the commit-count column appended if requested."""
+    if count_commits:
+        return [*base_columns, COMMIT_COUNT_COLUMN[0]]
+    return list(base_columns)
 
 
 def write_csv(
@@ -1075,6 +1173,7 @@ def write_csv(
     *,
     reclone: bool = False,
     reindex: bool = False,
+    count_commits: bool = False,
 ) -> tuple[int, int, int]:
     """Stream repos directly to CSV rather than collecting them first.
 
@@ -1100,28 +1199,54 @@ def write_csv(
     Returns (total, reclone_total, reindex_total).
     """
     writer = csv.writer(out)
-    writer.writerow(CSV_COLUMNS)
+    writer.writerow(csv_columns_for(CSV_COLUMNS, count_commits=count_commits))
 
     total = 0
     reclone_total = 0
     reindex_total = 0
-    for repo in fetch_repos(endpoint, token, max_repos):
+    for repo in fetch_repos(endpoint, token, max_repos, count_commits=count_commits):
         row = build_row(repo, endpoint)
-        writer.writerow(row)
+        writer.writerow(append_commit_count(row, repo, count_commits=count_commits))
         total += 1
+        if count_commits:
+            commit_count = default_branch_commit_count(repo)
+            if commit_count is None:
+                # Common for empty / not-yet-cloned repos. Log so users
+                # grepping the log can spot which repos returned no count
+                # without it being a noisy WARNING.
+                logger.info(
+                    "No commit count for %s (no default branch or unresolved HEAD)",
+                    repo.get("url") or repo.get("id"),
+                )
+            else:
+                logger.info(
+                    "Commit count for %s: %d",
+                    repo.get("url") or repo.get("id"),
+                    commit_count,
+                )
         if has_cloning_error(repo):
             cloning_writer.writerow(
-                row + [extract(repo) for _, extract in CLONING_ERROR_EXTRA_COLUMNS],
+                append_commit_count(
+                    row + [extract(repo) for _, extract in CLONING_ERROR_EXTRA_COLUMNS],
+                    repo,
+                    count_commits=count_commits,
+                ),
             )
             if reclone and trigger_reclone(endpoint, token, repo["id"]):
                 reclone_total += 1
         if has_indexing_error(repo):
-            indexing_writer.writerow(row)
+            indexing_writer.writerow(
+                append_commit_count(row, repo, count_commits=count_commits),
+            )
             if reindex and trigger_reindex(endpoint, token, repo["id"]):
                 reindex_total += 1
         if skipped_writer is not None and has_skipped_files(repo):
             skipped_writer.writerow(
-                row + [extract(repo) for _, extract in SKIPPED_FILES_EXTRA_COLUMNS],
+                append_commit_count(
+                    row + [extract(repo) for _, extract in SKIPPED_FILES_EXTRA_COLUMNS],
+                    repo,
+                    count_commits=count_commits,
+                ),
             )
     return (total, reclone_total, reindex_total)
 
@@ -1328,6 +1453,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help=("Force reindex all repos with an indexing error"),
     )
     parser.add_argument(
+        "--count-commits",
+        action="store_true",
+        help=(
+            "Add a 'defaultBranch.target.commit.ancestors.totalCount' column to all\n"
+            "output CSVs containing the total number of commits on each repo's\n"
+            "default branch. This issues a more expensive GraphQL query and uses a\n"
+            "smaller page size to avoid timeouts, so only enable when needed."
+        ),
+    )
+    parser.add_argument(
         "--src-endpoint",
         default=None,
         metavar="URL",
@@ -1344,6 +1479,18 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def run(args: argparse.Namespace, endpoint: str, token: str) -> None:
     """Confirm the connection, then stream every repo to the CSV file."""
+    if args.count_commits:
+        # Counting commits server-side can take a long time on monorepos. Bump
+        # the per-request HTTP timeout so we wait long enough for these queries
+        # to return before retrying. open_connection() reads this on each call,
+        # so a global update is sufficient.
+        global REQUEST_TIMEOUT_SECONDS  # noqa: PLW0603
+        REQUEST_TIMEOUT_SECONDS = REQUEST_TIMEOUT_SECONDS_WITH_COMMIT_COUNT
+        logger.info(
+            "--count-commits enabled: page size=%d, request timeout=%ds",
+            PAGE_SIZE_WITH_COMMIT_COUNT,
+            REQUEST_TIMEOUT_SECONDS,
+        )
     username = fetch_current_username(endpoint, token)
     logger.info("Connected to: %s as: %s", endpoint, username)
 
@@ -1362,6 +1509,7 @@ def run(args: argparse.Namespace, endpoint: str, token: str) -> None:
                 ("--reindex", args.reindex),
                 ("--limit", args.limit is not None),
                 ("--skipped-files", args.skipped_files),
+                ("--count-commits", args.count_commits),
             )
             if set_
         ]
@@ -1393,10 +1541,22 @@ def run(args: argparse.Namespace, endpoint: str, token: str) -> None:
     if skipped_files_path is not None:
         skipped_files_path.unlink(missing_ok=True)
 
-    cloning_writer = LazyCSVWriter(cloning_errors_path, CLONING_ERROR_CSV_COLUMNS)
-    indexing_writer = LazyCSVWriter(indexing_errors_path, CSV_COLUMNS)
+    cloning_writer = LazyCSVWriter(
+        cloning_errors_path,
+        csv_columns_for(CLONING_ERROR_CSV_COLUMNS, count_commits=args.count_commits),
+    )
+    indexing_writer = LazyCSVWriter(
+        indexing_errors_path,
+        csv_columns_for(CSV_COLUMNS, count_commits=args.count_commits),
+    )
     skipped_writer = (
-        LazyCSVWriter(skipped_files_path, SKIPPED_FILES_CSV_COLUMNS)
+        LazyCSVWriter(
+            skipped_files_path,
+            csv_columns_for(
+                SKIPPED_FILES_CSV_COLUMNS,
+                count_commits=args.count_commits,
+            ),
+        )
         if skipped_files_path is not None
         else None
     )
@@ -1422,6 +1582,7 @@ def run(args: argparse.Namespace, endpoint: str, token: str) -> None:
             args.limit,
             reclone=args.reclone,
             reindex=args.reindex,
+            count_commits=args.count_commits,
         )
 
     logger.info("Wrote %d repos to %s", total, output_path.name)
