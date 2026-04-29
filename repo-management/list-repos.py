@@ -2,6 +2,8 @@
 """List all repositories on a Sourcegraph instance via the GraphQL API,
 and outputs CSV files with the list of repos and metadata.
 
+Only Python's standard library is used. No additional packages required.
+
 What this script does:
   1. Get SRC_ENDPOINT and SRC_ACCESS_TOKEN from environment variables, falling
      back to a `.env` file in the working directory
@@ -17,10 +19,13 @@ Usage:
   export SRC_ACCESS_TOKEN="sgp_..."
   # ...or place those in a `.env` file in the working directory
 
-  python3 list-repos.py                       # writes all repos to ENDPOINT-repos.csv
-  python3 list-repos.py --limit 100           # fetch only 100 repos
+  python3 list-repos.py
+  python3 list-repos.py --limit 100     # fetch only 100 repos
+  python3 list-repos.py -h              # print helper text
 
-Only Python's standard library is used. No additional packages required.
+Versions:
+- Minimum supported version of Python is 3.10
+- Minimum supported version of Sourcegraph is v5.2.0
 
 To download the GraphQL schema from your SG instance, to make changes to this script,
 run a command like the following to get it from the introspection service:
@@ -161,7 +166,6 @@ query SkippedFileReasons($query: String!) {
       results {
         ... on FileMatch {
           repository {
-            id
             name
           }
           file {
@@ -458,10 +462,8 @@ CLONING_ERROR_EXTRA_COLUMNS: list[tuple[str, Callable[[dict[str, Any]], Any]]] =
 CLONING_ERROR_CSV_COLUMNS = CSV_COLUMNS + [
     name for name, _ in CLONING_ERROR_EXTRA_COLUMNS
 ]
-# The indexing-errors CSV uses just the base columns — Sourcegraph's GraphQL
-# does not expose any per-repo zoekt error fields, so there is nothing extra
-# to add beyond textSearchIndex.status (which is already in CSV_COLUMNS).
-INDEXING_ERROR_CSV_COLUMNS = CSV_COLUMNS
+# The indexing-errors CSV reuses CSV_COLUMNS verbatim — Sourcegraph's GraphQL
+# does not expose any per-repo zoekt error fields beyond textSearchIndex.status.
 
 # Extra columns appended only to the skipped-files CSV. The query is the
 # Sourcegraph search query produced by the API; running it lists each skipped
@@ -634,10 +636,14 @@ def graphql_request(
 
 
 def fetch_current_username(endpoint: str, token: str) -> str:
-    """Return the username of the authenticated user, or empty string if anonymous."""
+    """Return the username of the authenticated user.
+
+    All GraphQL queries used by this script require authentication, so an
+    invalid/anonymous token is rejected by validate_token (or by the server
+    via HTTPRequestError) before this is ever called.
+    """
     data = graphql_request(endpoint, token, CURRENT_USER_QUERY, {})
-    user: dict[str, Any] = data.get("currentUser") or {}
-    return user.get("username", "") or ""
+    return str(data["currentUser"]["username"])
 
 
 def trigger_reclone(endpoint: str, token: str, repo_id: str) -> bool:
@@ -660,13 +666,9 @@ def trigger_reindex(endpoint: str, token: str, repo_id: str) -> bool:
     return True
 
 
-_NOT_INDEXED_RE = re.compile(r"NOT-INDEXED:\s*(.+)")
-_FILENAME_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
-
-
 def sanitize_for_filename(text: str) -> str:
     """Replace non-[A-Za-z0-9._-] chars with '_' so the string is filesystem-safe."""
-    return _FILENAME_SAFE_RE.sub("_", text).strip("_")
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", text).strip("_")
 
 
 def sanitize_endpoint_for_filename(endpoint: str) -> str:
@@ -761,21 +763,29 @@ def file_url(endpoint: str, repo_name: str, rev: str, file_path: str) -> str:
     return f"{base}/{repo_name}{rev_segment}/-/blob/{file_path}"
 
 
-def extract_not_indexed_reason(content: str) -> str:
-    """Pull the 'NOT-INDEXED: <reason>' text out of a chunk match content blob."""
-    match = _NOT_INDEXED_RE.search(content)
-    return match.group(1).strip() if match else ""
-
-
 def fetch_skipped_file_matches(
     endpoint: str,
     token: str,
-    repo_rev: str,
+    name: str,
+    rev: str,
 ) -> list[dict[str, Any]]:
-    """Run the SkippedFileReasons search query and return non-empty FileMatch results."""
-    search_query = (
-        f"r:^{repo_rev} type:file index:only patternType:regexp count:all ^NOT-INDEXED:"
-    )
+    """Run the SkippedFileReasons search query and return non-empty FileMatch results.
+
+    The repo filter is built as `r:^<escaped-name>$@<rev>` so that:
+      - the regex is anchored on both ends (a bare prefix like
+        "github.com/org/repo" no longer also matches
+        "github.com/org/repo-fork" or "github.com/org/repository").
+      - dots and other regex specials in the name are escaped (otherwise
+        "github.com/foo/bar" would match "githubXcom/foo/bar").
+      - the resolved rev is sent explicitly so the search runs against the
+        same revision shown in the output filenames and file URLs (rather
+        than relying on the server's HEAD pointer, which could shift between
+        the verify_repo_rev call and this query).
+    """
+    repo_filter = f"^{re.escape(name)}$"
+    if rev and rev != "HEAD":
+        repo_filter += f"@{rev}"
+    search_query = f"r:{repo_filter} type:file index:only patternType:regexp count:all ^NOT-INDEXED:"
     data = graphql_request(
         endpoint,
         token,
@@ -822,30 +832,60 @@ def write_skipped_files_reason(
         files_path.unlink(missing_ok=True)
         stats_path.unlink(missing_ok=True)
 
-    matches = fetch_skipped_file_matches(endpoint, token, repo_rev)
+    # (header, extractor) tables — same pattern as the module-level COLUMNS
+    # table — to keep the CSV header and row values in lockstep. Adding,
+    # removing, or reordering a column here updates both at once.
+    # Path.suffix returns ".ext" (or "" for no extension or for dotfiles like
+    # ".env"); we strip the leading dot to display "go" rather than ".go".
+    file_columns: list[tuple[str, Callable[[dict[str, Any]], Any]]] = [
+        (
+            "chunkMatches.content",
+            lambda m: "\n".join(
+                str(c.get("content") or "") for c in (m.get("chunkMatches") or [])
+            ),
+        ),
+        (
+            "file.byteSize",
+            lambda m: (
+                int(bs)
+                if (bs := (m.get("file") or {}).get("byteSize")) is not None
+                else ""
+            ),
+        ),
+        (
+            "file.extension",
+            lambda m: Path(
+                str((m.get("file") or {}).get("path") or ""),
+            ).suffix.lstrip("."),
+        ),
+        (
+            "file_url",
+            lambda m: file_url(
+                endpoint,
+                str((m.get("repository") or {}).get("name") or ""),
+                rev,
+                str((m.get("file") or {}).get("path") or ""),
+            ),
+        ),
+    ]
+    stats_columns: list[tuple[str, Callable[[tuple[str, int]], Any]]] = [
+        ("reason", lambda r: r[0]),
+        ("count", lambda r: r[1]),
+    ]
+
+    matches = fetch_skipped_file_matches(endpoint, token, name, rev)
 
     reason_counts: collections.Counter[str] = collections.Counter()
-    rows: list[tuple[str, int | str, str, str]] = []
+    rows: list[list[Any]] = []
     for match in matches:
-        repository: dict[str, Any] = match.get("repository") or {}
-        repo_name = str(repository.get("name") or "")
-        file_node: dict[str, Any] = match.get("file") or {}
-        path = str(file_node.get("path") or "")
-        byte_size_raw = file_node.get("byteSize")
-        byte_size: int | str = int(byte_size_raw) if byte_size_raw is not None else ""
-        # Path.suffix returns the trailing ".ext" (or "" for no extension);
-        # strip the leading dot to display "go" rather than ".go". For dotfiles
-        # like ".env" Path.suffix returns "" so they correctly come out blank.
-        extension = Path(path).suffix.lstrip(".")
-        chunks: list[dict[str, Any]] = match.get("chunkMatches") or []
-        content = "\n".join(str(c.get("content") or "") for c in chunks)
-        for chunk in chunks:
-            reason = extract_not_indexed_reason(str(chunk.get("content") or ""))
-            if reason:
-                reason_counts[reason] += 1
-        rows.append(
-            (content, byte_size, extension, file_url(endpoint, repo_name, rev, path)),
-        )
+        rows.append([extract(match) for _, extract in file_columns])
+        for chunk in match.get("chunkMatches") or []:
+            reason_match = re.search(
+                r"NOT-INDEXED:\s*(.+)",
+                str(chunk.get("content") or ""),
+            )
+            if reason_match:
+                reason_counts[reason_match.group(1).strip()] += 1
 
     # Sort by chunkMatches.content so files with the same NOT-INDEXED reason
     # are grouped together; ties broken by byteSize, extension, then file_url.
@@ -857,18 +897,15 @@ def write_skipped_files_reason(
 
     with files_path.open("w", newline="") as out:
         writer = csv.writer(out)
-        writer.writerow(
-            ["chunkMatches.content", "file.byteSize", "file.extension", "file_url"],
-        )
-        for row in rows:
-            writer.writerow(row)
+        writer.writerow([n for n, _ in file_columns])
+        writer.writerows(rows)
     files_written = len(rows)
 
     with stats_path.open("w", newline="") as out:
         writer = csv.writer(out)
-        writer.writerow(["reason", "count"])
-        for reason, count in reason_counts.most_common():
-            writer.writerow([reason, count])
+        writer.writerow([n for n, _ in stats_columns])
+        for record in reason_counts.most_common():
+            writer.writerow([extract(record) for _, extract in stats_columns])
 
     logger.info(
         "Wrote %d skipped-file match(es) to %s",
@@ -990,9 +1027,11 @@ def write_csv(
     no remediation mutation — fixes are configuration-level (search.largeFiles
     or .sourcegraph/ignore).
 
-    The optional writers are LazyCSVWriter instances that defer file creation
-    until the first matching row, so empty error/skipped CSVs are never
-    created. Per-category counts are tracked on each writer's `.count`.
+    All three extra writers are LazyCSVWriter instances that defer file
+    creation until the first matching row, so empty error/skipped CSVs are
+    never created. cloning_writer and indexing_writer are always passed in;
+    skipped_writer is None when --skipped-files was not requested. Per-
+    category row counts are tracked on each writer's `.count`.
 
     Memory stays constant regardless of how many repos are fetched.
 
@@ -1073,11 +1112,12 @@ def validate_endpoint(endpoint: str) -> None:
 def validate_token(token: str) -> None:
     """Reject obviously-bad SRC_ACCESS_TOKEN values with a friendly message."""
     if not token.startswith("sgp_"):
-        # Don't log the full token — show just length and the first 5 chars.
+        # Don't log any of the token bytes — even a 5-char prefix can leak
+        # info about the source/format. Length alone is enough to confirm
+        # something was set without echoing secret material.
         die(
             f"SRC_ACCESS_TOKEN must be a Sourcegraph access token starting "
-            f"with 'sgp_' (got {len(token)} chars starting with "
-            f"{token[:5]!r})",
+            f"with 'sgp_' (got a {len(token)}-character value).",
         )
 
 
@@ -1181,7 +1221,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help=(
             "Force reclone all repos with a cloning error "
-            "(lastError, isCorrupted, corruptionLogs, or not cloned)"
+            "(corrupted, errored, or not cloned)"
         ),
     )
     parser.add_argument(
@@ -1207,7 +1247,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 def run(args: argparse.Namespace, endpoint: str, token: str) -> None:
     """Confirm the connection, then stream every repo to the CSV file."""
     username = fetch_current_username(endpoint, token)
-    logger.info("Connected to: %s as: %s", endpoint, username or "<anonymous>")
+    logger.info("Connected to: %s as: %s", endpoint, username)
 
     # When the user only wants the per-repo SkippedFileReasons report, skip the
     # full repo iteration — that query is targeted and doesn't need the listing.
@@ -1235,7 +1275,7 @@ def run(args: argparse.Namespace, endpoint: str, token: str) -> None:
         skipped_files_path.unlink(missing_ok=True)
 
     cloning_writer = LazyCSVWriter(cloning_errors_path, CLONING_ERROR_CSV_COLUMNS)
-    indexing_writer = LazyCSVWriter(indexing_errors_path, INDEXING_ERROR_CSV_COLUMNS)
+    indexing_writer = LazyCSVWriter(indexing_errors_path, CSV_COLUMNS)
     skipped_writer = (
         LazyCSVWriter(skipped_files_path, SKIPPED_FILES_CSV_COLUMNS)
         if skipped_files_path is not None
