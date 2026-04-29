@@ -49,7 +49,7 @@ import textwrap
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn, TextIO, cast
-from urllib.parse import ParseResult, urlparse
+from urllib.parse import ParseResult, urlparse, urlsplit
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -676,22 +676,71 @@ def sanitize_endpoint_for_filename(endpoint: str) -> str:
     return sanitize_for_filename(re.sub(r"^https?://", "", endpoint))
 
 
+_SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+\-.]*://")
+
+
+def _split_name_rev(repo_rev: str) -> tuple[str, str | None]:
+    """Split 'name[@rev]' into (name, rev_or_None).
+
+    Two paths, depending on whether the input has a URL scheme:
+
+      - With scheme (`https://`, `ssh://`, `git+ssh://`, …): use
+        urllib.parse.urlsplit so user[:password]@host is parsed and dropped
+        cleanly. After that the only `@` that can remain is the rev
+        separator, even if the rev itself contains `/` (e.g. `feature/foo`).
+
+      - Without scheme: the rightmost `@` is the rev separator unless the
+        part after it contains a `:` *before* any `/` — that pattern means
+        scp-style `user@host:path` (e.g. `git@github.com:org/repo`), so we
+        drop the `user@` prefix instead.
+    """
+    rev: str | None = None
+    if _SCHEME_RE.match(repo_rev):
+        u = urlsplit(repo_rev)
+        # u.hostname is lower-cased and userinfo-stripped.
+        name = (u.hostname or "") + u.path
+        if "@" in name:
+            before, after = name.rsplit("@", 1)
+            name, rev = before, after
+        return name, rev
+
+    name = repo_rev
+    if "@" in name:
+        before, after = name.rsplit("@", 1)
+        slash = after.find("/")
+        colon = after.find(":")
+        if colon != -1 and (slash == -1 or colon < slash):
+            # scp-style 'user@host:path' — drop the 'user@'.
+            name = after
+        else:
+            name, rev = before, after
+    return name, rev
+
+
 def parse_repo_rev(repo_rev: str) -> str:
-    """Extract the revision from 'repo[$]@rev'. Returns 'HEAD' if no '@' is present."""
-    if "@" in repo_rev:
-        return repo_rev.rsplit("@", 1)[1]
-    return "HEAD"
+    """Extract the revision from 'repo[$]@rev'. Returns 'HEAD' if no '@rev' is present."""
+    _, rev = _split_name_rev(repo_rev)
+    return rev if rev is not None else "HEAD"
 
 
 def parse_repo_name(repo_rev: str) -> str:
     """Extract the canonical repo name from 'repo[$]@rev'.
 
-    Strips a leading '^' and trailing '$' anchor (used in Sourcegraph repo
-    regex patterns) so the name can be passed to the `repository(name:)`
-    GraphQL field, which expects an exact name.
+    Normalizes common copy-paste shapes so a user can hand us anything that
+    visually identifies a repo:
+      - Strips a leading URL scheme (`http://`, `https://`, `ssh://`,
+        `git+ssh://`, …). Sourcegraph stores repos as bare names like
+        `github.com/foo/bar`, so a pasted URL would otherwise miss.
+      - Drops an SSH `user@host` prefix (e.g. `ssh://git@github.com/foo/bar`
+        becomes `github.com/foo/bar`).
+      - Strips a leading '^' and trailing '$' anchor (Sourcegraph repo regex
+        syntax) so the result is safe to pass to `repository(name:)`, which
+        expects an exact name.
+      - Strips a trailing slash (common when copying URLs from a browser).
     """
-    name = repo_rev.rsplit("@", 1)[0] if "@" in repo_rev else repo_rev
-    return name.removeprefix("^").removesuffix("$")
+    name, _ = _split_name_rev(repo_rev)
+    name = name.removeprefix("^").removesuffix("$")
+    return name.rstrip("/")
 
 
 def verify_repo_rev(endpoint: str, token: str, repo_rev: str) -> str:
@@ -960,9 +1009,15 @@ def fetch_repos(
     token: str,
     max_repos: int | None = None,
 ) -> Iterator[dict[str, Any]]:
-    """Yield repository nodes by paginating through the GraphQL API."""
+    """Yield repository nodes by paginating through the GraphQL API.
+
+    Logs "Fetching X of Y total repositories..." once, after the first page
+    returns its totalCount, so the user sees the target before per-page
+    progress lines start. Avoids a separate count-only round-trip.
+    """
     cursor: str | None = None
     total_fetched = 0
+    first_page = True
     while True:
         page_size = PAGE_SIZE
         if max_repos is not None:
@@ -975,11 +1030,18 @@ def fetch_repos(
         )
         connection = data["repositories"]
         total_count = connection["totalCount"]
+        target = min(max_repos, total_count) if max_repos is not None else total_count
+        if first_page:
+            logger.info(
+                "Fetching %d of %d total repositories...",
+                target,
+                total_count,
+            )
+            first_page = False
 
         yield from connection["nodes"]
 
         total_fetched += len(connection["nodes"])
-        target = min(max_repos, total_count) if max_repos is not None else total_count
         logger.info("Fetched %d/%d repositories...", total_fetched, target)
 
         if not connection["pageInfo"]["hasNextPage"]:
@@ -1085,7 +1147,25 @@ def load_dotenv() -> None:
     env_file = Path(".env")
     if not env_file.is_file():
         return
-    for line in env_file.read_text(encoding="utf-8").splitlines():
+    for lineno, raw in enumerate(
+        env_file.read_text(encoding="utf-8").splitlines(),
+        start=1,
+    ):
+        line = raw.strip()
+        # Blank lines and comments are normal `.env` content; skip silently.
+        if not line or line.startswith("#"):
+            continue
+        # Anything else without an '=' is malformed (e.g. "SRC_ENDPOINT https://…"
+        # missing the '='). Warn so the user gets a clearer hint than the
+        # downstream "set SRC_ENDPOINT and SRC_ACCESS_TOKEN" error. We log the
+        # line number only — never the line content, since a malformed line
+        # could be carrying a secret like SRC_ACCESS_TOKEN.
+        if "=" not in line:
+            logger.warning(
+                ".env line %d is malformed (missing '='); skipping.",
+                lineno,
+            )
+            continue
         key, _, value = line.partition("=")
         if key.strip() in ("SRC_ENDPOINT", "SRC_ACCESS_TOKEN"):
             # setdefault: real env wins over .env
@@ -1170,6 +1250,24 @@ class BlankLineHelpFormatter(argparse.RawDescriptionHelpFormatter):
         return lines
 
 
+def positive_int(value: str) -> int:
+    """argparse type for ints >= 1.
+
+    Used by --limit. The Sourcegraph GraphQL `repositories(first:)` field
+    panics on negative values, so we reject them at the CLI boundary with a
+    friendly message instead of letting a server-side panic surface.
+    """
+    try:
+        n = int(value)
+    except ValueError:
+        msg = f"must be an integer, got {value!r}"
+        raise argparse.ArgumentTypeError(msg) from None
+    if n < 1:
+        msg = f"must be a positive integer (>=1), got {n}"
+        raise argparse.ArgumentTypeError(msg)
+    return n
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     """Parse command-line arguments into a Namespace."""
     parser = argparse.ArgumentParser(
@@ -1189,10 +1287,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--limit",
-        type=int,
+        type=positive_int,
         default=None,
         metavar="int",
-        help="Fetch at most <int> repositories",
+        help="Fetch at most <int> repositories (must be >=1)",
     )
     parser.add_argument(
         "--skipped-files",
@@ -1213,7 +1311,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             "Output file: ENDPOINT-REPO-REV-skipped-stats.csv\n"
             "Examples: \n"
             "    github.com/org/repo     [use repo's default branch]\n"
-            "    github.com/org/repo@dev [use a non-default, but still indexed branch] \n"
+            "    github.com/org/repo@dev [use a non-default, but still indexed branch]\n"
         ),
     )
     parser.add_argument(
@@ -1227,7 +1325,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--reindex",
         action="store_true",
-        help=("Force reindex all repos with an indexing error "),
+        help=("Force reindex all repos with an indexing error"),
     )
     parser.add_argument(
         "--src-endpoint",
@@ -1252,6 +1350,27 @@ def run(args: argparse.Namespace, endpoint: str, token: str) -> None:
     # When the user only wants the per-repo SkippedFileReasons report, skip the
     # full repo iteration — that query is targeted and doesn't need the listing.
     if args.skipped_files_reason:
+        # The other flags only affect the full-repo iteration path. Warn about
+        # any that are set so the user isn't surprised when they have no
+        # effect (we can't enforce this with argparse mutual_exclusive_group
+        # because --skipped-files-reason is exclusive with multiple unrelated
+        # flags rather than with one specific other flag).
+        ignored = [
+            flag
+            for flag, set_ in (
+                ("--reclone", args.reclone),
+                ("--reindex", args.reindex),
+                ("--limit", args.limit is not None),
+                ("--skipped-files", args.skipped_files),
+            )
+            if set_
+        ]
+        if ignored:
+            logger.warning(
+                "Ignoring %s: --skipped-files-reason runs a single targeted "
+                "query and does not iterate the repo list.",
+                ", ".join(ignored),
+            )
         write_skipped_files_reason(endpoint, token, args.skipped_files_reason)
         return
 
