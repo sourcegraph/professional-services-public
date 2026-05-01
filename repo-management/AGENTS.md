@@ -11,7 +11,7 @@ These instructions apply to any work under this directory.
 
 - Lint the files you touched, using:
   - Ruff
-  - Pylance
+  - Pyright
   - Markdownlint
 - Fix every lint issue in the code itself.
   **Never** disable, suppress, ignore, or `# noqa`-out a lint check
@@ -31,3 +31,7 @@ These instructions apply to any work under this directory.
   - Do not rely on your cached copy of the files, always read them
 - This script runs standalone, do not worry about a calling parent Python module
   - Do not bother with prepending function names wih `_`
+- Use only standard libraries, do not require customers to install additional
+  packages
+- Keep the minimum required versions of Python and Sourcegraph up to date in
+  the README.md file

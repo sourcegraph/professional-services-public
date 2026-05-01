@@ -7,6 +7,15 @@ GraphQL schema (`schema.graphql`) but rewritten for human readers —
 units, admin-only fields, and locally-derived columns are called out
 explicitly.
 
+Columns prefixed with `[Site admin]` in the lists below come from
+GraphQL fields that the Sourcegraph server only exposes to site
+admins. When you run the script with a non-admin token, the script
+either omits the underlying selection (for `externalServices`) or
+the server silently returns null (for the `mirrorInfo.*` fields), so
+those columns appear in the CSV with empty cells. Every other column
+is populated for any authenticated user with read access to the
+repository.
+
 ## Output files
 
 The script always writes its outputs prefixed with the sanitized
@@ -34,13 +43,13 @@ These are written to every CSV file.
   table or admin URLs.
 - `url`: Full URL to the repository on this Sourcegraph instance (the
   `<endpoint>` joined with `Repository.url`).
-- `mirrorInfo.remoteURL`: Clone URL of the upstream repository on the code host
-  (may include embedded credentials). **Site-admin only — empty cell for
-  non-admin tokens.**
-- `externalServices`: Semicolon-joined display names of every external service
-  (code-host connection) that yields this repository. **Site-admin only — empty
-  cell for non-admin tokens; the script omits the underlying GraphQL selection
-  in that case.**
+- [Site admin] `mirrorInfo.remoteURL`: Clone URL of the upstream repository on
+  the code host (may include embedded credentials). **Site-admin only — empty
+  cell for non-admin tokens.**
+- [Site admin] `externalServices`: Semicolon-joined display names of every
+  external service (code-host connection) that yields this repository.
+  **Site-admin only — empty cell for non-admin tokens; the script omits the
+  underlying GraphQL selection in that case.**
 - `mirrorInfo.status`: Single-word summary of the repo's mirror state, derived
   locally from `mirrorInfo`. One of `corrupted`, `errored`, `cloning`,
   `cloned`, `not_cloned`, in priority order (so `corrupted` wins over
@@ -60,8 +69,8 @@ These are written to every CSV file.
   from upstream. May be empty.
 - `mirrorInfo.updateSchedule.intervalSeconds`: Interval, in seconds, between
   scheduled mirror updates.
-- `mirrorInfo.shard`: Hostname of the gitserver shard that holds this repo's
-  clone. **Site-admin only — empty cell for non-admin tokens.**
+- [Site admin] `mirrorInfo.shard`: Hostname of the gitserver shard that holds
+  this repo's clone. **Site-admin only — empty cell for non-admin tokens.**
 - `textSearchIndex.status`: Single-word summary of the search-index state,
   derived locally: `indexed` if Zoekt has built an index for this repo,
   `not_indexed` otherwise.
@@ -137,9 +146,10 @@ Appended to every CSV when `--count-commits` is passed.
   so prefer reading this column together with `cleanupQueue.optimizing`.
 - `mirrorInfo.cleanupQueue.optimizing`: Whether gitserver is currently running
   optimization on this repo (`True`/`False`).
-- `mirrorInfo.repositoryStatistics.packfiles.lastFullRepack`: Timestamp of the
-  most recent full repack of this repo's packfiles. **Site-admin only — empty
-  cell for non-admin tokens, and also empty when the repo is not yet cloned.**
+- [Site admin] `mirrorInfo.repositoryStatistics.packfiles.lastFullRepack`: Timestamp
+  of the most recent full repack of this repo's packfiles. **Site-admin only —
+  empty cell for non-admin tokens, and also empty when the repo is not yet
+  cloned.**
 
 ## `--run-search` columns
 
