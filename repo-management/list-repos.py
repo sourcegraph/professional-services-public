@@ -1154,11 +1154,11 @@ def format_columns_list(columns: list[tuple[str, str, bool, str]]) -> str:
     """Render a `[(name, description, requires_admin, value_type), ...]` list
     as a Markdown table with one row per column.
 
-    Columns: `Column` | `Type` | `Description`. When `requires_admin` is
-    True, the column name is prefixed with `[Site admin]` so a reader
-    scanning the table can immediately spot the columns that will be empty
-    for non-admin tokens; the README header explains the convention once
-    at the top.
+    Columns: `Column` | `Type` | `Requires admin` | `Description`. The
+    `Requires admin` cell is `true` for site-admin-only columns and empty
+    otherwise, so a reader scanning the table can immediately spot the
+    columns that will be blank for non-admin tokens; the README header
+    explains the convention once at the top.
 
     Markdown tables can't have line breaks within a row, so individual
     rows will easily exceed Markdownlint's MD013 line-length limit. The
@@ -1166,13 +1166,26 @@ def format_columns_list(columns: list[tuple[str, str, bool, str]]) -> str:
     (`tables: false`), which is the rule's documented way to handle
     tables — MD013 still checks every prose line in every Markdown file.
     """
-    rows = ["| Column | Type | Description |", "| --- | --- | --- |"]
+    rows = [
+        table_row("Column", "Type", "Requires admin", "Description"),
+        table_row("---", "---", "---", "---"),
+    ]
     for name, desc, requires_admin, value_type in columns:
-        prefix = "[Site admin] " if requires_admin else ""
+        admin_cell = "true" if requires_admin else ""
         # Defensive: escape pipes so a description never breaks the table.
         desc_cell = desc.replace("|", "\\|")
-        rows.append(f"| {prefix}`{name}` | {value_type} | {desc_cell} |")
+        rows.append(table_row(f"`{name}`", value_type, admin_cell, desc_cell))
     return "\n".join(rows)
+
+
+def table_row(*cells: str) -> str:
+    """Format a Markdown table row, using `| |` for empty cells.
+
+    Markdownlint's MD060 'compact' style flags `|  |` (two spaces around an
+    empty cell) as having extra spacing, so empty cells need a single space
+    rather than the leading-and-trailing-space we use for non-empty cells.
+    """
+    return "|" + "|".join(f" {c} " if c else " " for c in cells) + "|"
 
 
 def name_desc(
@@ -1214,14 +1227,14 @@ GraphQL schema (`schema.graphql`) but rewritten for human readers —
 units, admin-only fields, and locally-derived columns are called out
 explicitly.
 
-Columns prefixed with `[Site admin]` in the lists below come from
-GraphQL fields that the Sourcegraph server only exposes to site
-admins. When you run the script with an access token from a
-non-admin user, the script either omits the underlying selection
-(for `externalServices`) or the server silently returns null (for
-the `mirrorInfo.*` fields), so those columns appear in the CSV with
-empty cells. Every other column is populated for any authenticated
-user with read access to the repository.
+Columns whose `Requires admin` cell is `true` come from GraphQL fields
+that the Sourcegraph server only exposes to site admins. When you run
+the script with an access token from a non-admin user, the script
+either omits the underlying selection (for `externalServices`) or the
+server silently returns null (for the `mirrorInfo.*` fields), so those
+columns appear in the CSV with empty cells. Every other column is
+populated for any authenticated user with read access to the
+repository.
 
 ## Output files
 
@@ -1229,20 +1242,12 @@ The script always writes its outputs prefixed with the sanitized
 Sourcegraph endpoint (e.g. `sourcegraph.example.com-repos.csv`),
 so the script can run against multiple instances without overwriting files.
 
-- `<prefix>-{DEFAULT_OUTPUT_FILE}`
-  - Written when: always.
-  - Columns: main columns.
-- `<prefix>-{DEFAULT_CLONING_ERRORS_FILE}`
-  - Written when: at least one repo has a cloning error.
-  - Columns: main columns + cloning-error extras.
-- `<prefix>-{DEFAULT_INDEXING_ERRORS_FILE}`
-  - Written when: at least one repo is cloned but missing a search
-    index.
-  - Columns: main columns.
-- `<prefix>-{DEFAULT_SKIPPED_FILES_FILE}`
-  - Written when: `--skipped-files` is set and at least one repo had
-    Zoekt skip files.
-  - Columns: main columns + skipped-files extras.
+| File | Written when | Columns |
+| --- | --- | --- |
+| `<prefix>-{DEFAULT_OUTPUT_FILE}` | always | main columns |
+| `<prefix>-{DEFAULT_CLONING_ERRORS_FILE}` | at least one repo has a cloning error | main columns + cloning-error extras |
+| `<prefix>-{DEFAULT_INDEXING_ERRORS_FILE}` | at least one repo is cloned but missing a search index | main columns |
+| `<prefix>-{DEFAULT_SKIPPED_FILES_FILE}` | `--skipped-files` is set and at least one repo had Zoekt skip files | main columns + skipped-files extras |
 
 The optional `--count-commits` and `--run-search` flags append extra
 columns to *every* CSV listed above, in this order: main columns →

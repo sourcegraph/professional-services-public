@@ -7,14 +7,14 @@ GraphQL schema (`schema.graphql`) but rewritten for human readers —
 units, admin-only fields, and locally-derived columns are called out
 explicitly.
 
-Columns prefixed with `[Site admin]` in the lists below come from
-GraphQL fields that the Sourcegraph server only exposes to site
-admins. When you run the script with an access token from a
-non-admin user, the script either omits the underlying selection
-(for `externalServices`) or the server silently returns null (for
-the `mirrorInfo.*` fields), so those columns appear in the CSV with
-empty cells. Every other column is populated for any authenticated
-user with read access to the repository.
+Columns whose `Requires admin` cell is `true` come from GraphQL fields
+that the Sourcegraph server only exposes to site admins. When you run
+the script with an access token from a non-admin user, the script
+either omits the underlying selection (for `externalServices`) or the
+server silently returns null (for the `mirrorInfo.*` fields), so those
+columns appear in the CSV with empty cells. Every other column is
+populated for any authenticated user with read access to the
+repository.
 
 ## Output files
 
@@ -22,20 +22,12 @@ The script always writes its outputs prefixed with the sanitized
 Sourcegraph endpoint (e.g. `sourcegraph.example.com-repos.csv`),
 so the script can run against multiple instances without overwriting files.
 
-- `<prefix>-repos.csv`
-  - Written when: always.
-  - Columns: main columns.
-- `<prefix>-repos-with-cloning-errors.csv`
-  - Written when: at least one repo has a cloning error.
-  - Columns: main columns + cloning-error extras.
-- `<prefix>-repos-with-indexing-errors.csv`
-  - Written when: at least one repo is cloned but missing a search
-    index.
-  - Columns: main columns.
-- `<prefix>-repos-with-skipped-files.csv`
-  - Written when: `--skipped-files` is set and at least one repo had
-    Zoekt skip files.
-  - Columns: main columns + skipped-files extras.
+| File | Written when | Columns |
+| --- | --- | --- |
+| `<prefix>-repos.csv` | always | main columns |
+| `<prefix>-repos-with-cloning-errors.csv` | at least one repo has a cloning error | main columns + cloning-error extras |
+| `<prefix>-repos-with-indexing-errors.csv` | at least one repo is cloned but missing a search index | main columns |
+| `<prefix>-repos-with-skipped-files.csv` | `--skipped-files` is set and at least one repo had Zoekt skip files | main columns + skipped-files extras |
 
 The optional `--count-commits` and `--run-search` flags append extra
 columns to *every* CSV listed above, in this order: main columns →
@@ -45,78 +37,78 @@ per-CSV extras → commit-count columns → run-search columns.
 
 These are written to every CSV file.
 
-| Column | Type | Description |
-| --- | --- | --- |
-| `id` | integer | Numeric Sourcegraph database ID for the repository, decoded locally from the base64 GraphQL global ID. Useful when correlating with the `repo` table or admin URLs. |
-| `url` | string | Full URL to the repository on this Sourcegraph instance (the `<endpoint>` joined with `Repository.url`). |
-| [Site admin] `mirrorInfo.remoteURL` | string | Clone URL of the upstream repository on the code host (may include embedded credentials). |
-| [Site admin] `externalServices` | string (semicolon-joined) | Semicolon-joined display names of every external service (code-host connection) that yields this repository. |
-| `mirrorInfo.status` | enum (corrupted, errored, cloning, cloned, not_cloned) | Single-word summary of the repo's mirror state, derived locally from `mirrorInfo`. One of `corrupted`, `errored`, `cloning`, `cloned`, `not_cloned`, in priority order (so `corrupted` wins over `errored`, etc.). |
-| `isFork` | boolean | Whether this repository is a fork (`True`/`False`). |
-| `isArchived` | boolean | Whether this repository has been archived on the code host (`True`/`False`). |
-| `isPrivate` | boolean | Whether this repository is private (`True`/`False`). |
-| `mirrorInfo.byteSize(MB)` | float | On-disk size of the cloned repository in megabytes (1 MB = 1024×1024 bytes), converted locally from `mirrorInfo.byteSize`. |
-| `createdAt` | timestamp | Timestamp the repo was first added to your Sourcegraph instance. |
-| `mirrorInfo.lastChanged` | timestamp | Timestamp of the last time the mirror's content actually changed (i.e. when commits were last added). May be empty. |
-| `mirrorInfo.updatedAt` | timestamp | Timestamp of the most recent successful sync from the upstream remote. May be empty. |
-| `mirrorInfo.nextSyncAt` | timestamp | Timestamp the repo is next scheduled to be synced from upstream. May be empty. |
-| `mirrorInfo.updateSchedule.intervalSeconds` | integer | Interval, in seconds, between scheduled mirror updates. |
-| [Site admin] `mirrorInfo.shard` | string | Hostname of the gitserver shard that holds this repo's clone. |
-| `textSearchIndex.status` | enum (indexed, not_indexed) | Single-word summary of the search-index state, derived locally: `indexed` if Zoekt has built an index for this repo, `not_indexed` otherwise. |
-| `textSearchIndex.status.updatedAt` | timestamp | Timestamp the Zoekt index was last refreshed. |
-| `textSearchIndex.status.contentByteSize(MB)` | float | Size, in megabytes, of the source content that was indexed. |
-| `textSearchIndex.status.contentFilesCount` | integer | Number of files included in the index. |
-| `textSearchIndex.status.indexByteSize(MB)` | float | Size, in megabytes, of the on-disk Zoekt index for this repo. |
-| `textSearchIndex.status.indexShardsCount` | integer | Number of Zoekt shards that make up this repo's index. |
-| `textSearchIndex.status.newLinesCount` | integer | Total number of newlines across every indexed branch (experimental field). |
-| `textSearchIndex.status.defaultBranchNewLinesCount` | integer | Number of newlines indexed on the repo's default branch (experimental field). |
-| `textSearchIndex.status.otherBranchesNewLinesCount` | integer | Number of newlines indexed across non-default branches (experimental field). |
-| `textSearchIndex.host.name` | string | Hostname of the indexserver responsible for this repo's index. |
+| Column | Type | Requires admin | Description |
+| --- | --- | --- | --- |
+| `id` | integer | | Numeric Sourcegraph database ID for the repository, decoded locally from the base64 GraphQL global ID. Useful when correlating with the `repo` table or admin URLs. |
+| `url` | string | | Full URL to the repository on this Sourcegraph instance (the `<endpoint>` joined with `Repository.url`). |
+| `mirrorInfo.remoteURL` | string | true | Clone URL of the upstream repository on the code host (may include embedded credentials). |
+| `externalServices` | string (semicolon-joined) | true | Semicolon-joined display names of every external service (code-host connection) that yields this repository. |
+| `mirrorInfo.status` | enum (corrupted, errored, cloning, cloned, not_cloned) | | Single-word summary of the repo's mirror state, derived locally from `mirrorInfo`. One of `corrupted`, `errored`, `cloning`, `cloned`, `not_cloned`, in priority order (so `corrupted` wins over `errored`, etc.). |
+| `isFork` | boolean | | Whether this repository is a fork (`True`/`False`). |
+| `isArchived` | boolean | | Whether this repository has been archived on the code host (`True`/`False`). |
+| `isPrivate` | boolean | | Whether this repository is private (`True`/`False`). |
+| `mirrorInfo.byteSize(MB)` | float | | On-disk size of the cloned repository in megabytes (1 MB = 1024×1024 bytes), converted locally from `mirrorInfo.byteSize`. |
+| `createdAt` | timestamp | | Timestamp the repo was first added to your Sourcegraph instance. |
+| `mirrorInfo.lastChanged` | timestamp | | Timestamp of the last time the mirror's content actually changed (i.e. when commits were last added). May be empty. |
+| `mirrorInfo.updatedAt` | timestamp | | Timestamp of the most recent successful sync from the upstream remote. May be empty. |
+| `mirrorInfo.nextSyncAt` | timestamp | | Timestamp the repo is next scheduled to be synced from upstream. May be empty. |
+| `mirrorInfo.updateSchedule.intervalSeconds` | integer | | Interval, in seconds, between scheduled mirror updates. |
+| `mirrorInfo.shard` | string | true | Hostname of the gitserver shard that holds this repo's clone. |
+| `textSearchIndex.status` | enum (indexed, not_indexed) | | Single-word summary of the search-index state, derived locally: `indexed` if Zoekt has built an index for this repo, `not_indexed` otherwise. |
+| `textSearchIndex.status.updatedAt` | timestamp | | Timestamp the Zoekt index was last refreshed. |
+| `textSearchIndex.status.contentByteSize(MB)` | float | | Size, in megabytes, of the source content that was indexed. |
+| `textSearchIndex.status.contentFilesCount` | integer | | Number of files included in the index. |
+| `textSearchIndex.status.indexByteSize(MB)` | float | | Size, in megabytes, of the on-disk Zoekt index for this repo. |
+| `textSearchIndex.status.indexShardsCount` | integer | | Number of Zoekt shards that make up this repo's index. |
+| `textSearchIndex.status.newLinesCount` | integer | | Total number of newlines across every indexed branch (experimental field). |
+| `textSearchIndex.status.defaultBranchNewLinesCount` | integer | | Number of newlines indexed on the repo's default branch (experimental field). |
+| `textSearchIndex.status.otherBranchesNewLinesCount` | integer | | Number of newlines indexed across non-default branches (experimental field). |
+| `textSearchIndex.host.name` | string | | Hostname of the indexserver responsible for this repo's index. |
 
 ## Cloning-error extras
 
 Appended only to `<prefix>-repos-with-cloning-errors.csv`.
 
-| Column | Type | Description |
-| --- | --- | --- |
-| `mirrorInfo.isCorrupted` | boolean | Whether Sourcegraph has detected the on-disk clone is corrupted (`True`/`False`). |
-| `mirrorInfo.lastError` | string | Last error message returned by gitserver while fetching or cloning this repo, if any. |
-| `mirrorInfo.lastSyncOutput` | string | Output of the most recent sync attempt. The script truncates to the first 5 + last 5 lines (with `... [N lines truncated] ...` between them) when the output is more than 10 lines. |
-| `mirrorInfo.corruptionLogs` | string (semicolon-joined) | Semicolon-joined `timestamp: reason` entries for the most recent corruption events. The server caps the log at 10 entries, ordered newest-first. |
+| Column | Type | Requires admin | Description |
+| --- | --- | --- | --- |
+| `mirrorInfo.isCorrupted` | boolean | | Whether Sourcegraph has detected the on-disk clone is corrupted (`True`/`False`). |
+| `mirrorInfo.lastError` | string | | Last error message returned by gitserver while fetching or cloning this repo, if any. |
+| `mirrorInfo.lastSyncOutput` | string | | Output of the most recent sync attempt. The script truncates to the first 5 + last 5 lines (with `... [N lines truncated] ...` between them) when the output is more than 10 lines. |
+| `mirrorInfo.corruptionLogs` | string (semicolon-joined) | | Semicolon-joined `timestamp: reason` entries for the most recent corruption events. The server caps the log at 10 entries, ordered newest-first. |
 
 ## Skipped-files extras
 
 Appended only to `<prefix>-repos-with-skipped-files.csv`.
 
-| Column | Type | Description |
-| --- | --- | --- |
-| `skippedIndexed.totalCount` | integer | Sum of `skippedIndexed.count` across every indexed ref of this repo — i.e. how many files Zoekt skipped while indexing. |
-| `skippedIndexed.refsWithSkips` | string (semicolon-joined) | Semicolon-joined `<refName>=<count>` entries for every ref that has at least one skipped file. |
-| `skippedIndexed.headQuery` | string | Sourcegraph search query that lists every skipped file on HEAD (or the first ref with skips, when HEAD has none). Paste it into the search bar to enumerate the skipped files and their NOT-INDEXED reasons (too-large, binary, too-many-trigrams, too-small, blob-missing). |
+| Column | Type | Requires admin | Description |
+| --- | --- | --- | --- |
+| `skippedIndexed.totalCount` | integer | | Sum of `skippedIndexed.count` across every indexed ref of this repo — i.e. how many files Zoekt skipped while indexing. |
+| `skippedIndexed.refsWithSkips` | string (semicolon-joined) | | Semicolon-joined `<refName>=<count>` entries for every ref that has at least one skipped file. |
+| `skippedIndexed.headQuery` | string | | Sourcegraph search query that lists every skipped file on HEAD (or the first ref with skips, when HEAD has none). Paste it into the search bar to enumerate the skipped files and their NOT-INDEXED reasons (too-large, binary, too-many-trigrams, too-small, blob-missing). |
 
 ## `--count-commits` columns
 
 Appended to every CSV when `--count-commits` is passed.
 
-| Column | Type | Description |
-| --- | --- | --- |
-| `defaultBranch.target.commit.ancestors.totalCount` | integer | Number of commits reachable from HEAD on the default branch — equivalent to `git rev-list --count HEAD`. Computed by gitserver, so the value is exact. |
-| `allRefs.search.matchCount` | integer | Approximate number of commits across every branch and tag, computed via Sourcegraph's commit-search API. **Not directly comparable** to the default-branch count above — see `--count-commits --help` for the methodology and caveats (server-side `timeout:` may truncate the result). |
-| `commitCount.queryTimeSeconds` | float | Wall-clock seconds the per-repo commit-count GraphQL request took. Useful for spotting which repos are expensive to count. |
-| `mirrorInfo.lastCleanedAt` | timestamp | Timestamp of the last successful gitserver cleanup ('gc') of this repo. May be empty. |
-| `mirrorInfo.cleanupSchedule.due` | timestamp | Timestamp the repo is next scheduled to be cleaned up by gitserver. |
-| `mirrorInfo.cleanupSchedule.intervalSeconds` | integer | Interval, in seconds, between scheduled cleanup runs. |
-| `mirrorInfo.cleanupQueue.index` | integer | Position of the repo in the gitserver cleanup queue. Currently-optimizing repos are pushed to the end of the queue, so prefer reading this column together with `cleanupQueue.optimizing`. |
-| `mirrorInfo.cleanupQueue.optimizing` | boolean | Whether gitserver is currently running optimization on this repo (`True`/`False`). |
-| [Site admin] `mirrorInfo.repositoryStatistics.packfiles.lastFullRepack` | timestamp | Timestamp of the most recent full repack of this repo's packfiles. Empty when the repo is not yet cloned. |
+| Column | Type | Requires admin | Description |
+| --- | --- | --- | --- |
+| `defaultBranch.target.commit.ancestors.totalCount` | integer | | Number of commits reachable from HEAD on the default branch — equivalent to `git rev-list --count HEAD`. Computed by gitserver, so the value is exact. |
+| `allRefs.search.matchCount` | integer | | Approximate number of commits across every branch and tag, computed via Sourcegraph's commit-search API. **Not directly comparable** to the default-branch count above — see `--count-commits --help` for the methodology and caveats (server-side `timeout:` may truncate the result). |
+| `commitCount.queryTimeSeconds` | float | | Wall-clock seconds the per-repo commit-count GraphQL request took. Useful for spotting which repos are expensive to count. |
+| `mirrorInfo.lastCleanedAt` | timestamp | | Timestamp of the last successful gitserver cleanup ('gc') of this repo. May be empty. |
+| `mirrorInfo.cleanupSchedule.due` | timestamp | | Timestamp the repo is next scheduled to be cleaned up by gitserver. |
+| `mirrorInfo.cleanupSchedule.intervalSeconds` | integer | | Interval, in seconds, between scheduled cleanup runs. |
+| `mirrorInfo.cleanupQueue.index` | integer | | Position of the repo in the gitserver cleanup queue. Currently-optimizing repos are pushed to the end of the queue, so prefer reading this column together with `cleanupQueue.optimizing`. |
+| `mirrorInfo.cleanupQueue.optimizing` | boolean | | Whether gitserver is currently running optimization on this repo (`True`/`False`). |
+| `mirrorInfo.repositoryStatistics.packfiles.lastFullRepack` | timestamp | true | Timestamp of the most recent full repack of this repo's packfiles. Empty when the repo is not yet cloned. |
 
 ## `--run-search` columns
 
 Appended to every CSV when `--run-search PATTERN` is passed.
 
-| Column | Type | Description |
-| --- | --- | --- |
-| `runSearch.matchCount` | integer | Number of search matches the Sourcegraph search API reported for the user-supplied `--run-search` pattern, scoped to this single repo. |
-| `runSearch.queryTimeSeconds` | float | Wall-clock seconds the per-repo `--run-search` GraphQL request took. |
-| `runSearch.limitHit` | boolean | `True` when the search engine truncated results before reaching the natural end (so `runSearch.matchCount` is a floor, not the actual total). |
-| `runSearch.alertTitle` | string | Title of the search-API alert when the server's `timeout:` budget was exceeded or the query was malformed; empty cell otherwise. |
+| Column | Type | Requires admin | Description |
+| --- | --- | --- | --- |
+| `runSearch.matchCount` | integer | | Number of search matches the Sourcegraph search API reported for the user-supplied `--run-search` pattern, scoped to this single repo. |
+| `runSearch.queryTimeSeconds` | float | | Wall-clock seconds the per-repo `--run-search` GraphQL request took. |
+| `runSearch.limitHit` | boolean | | `True` when the search engine truncated results before reaching the natural end (so `runSearch.matchCount` is a floor, not the actual total). |
+| `runSearch.alertTitle` | string | | Title of the search-API alert when the server's `timeout:` budget was exceeded or the query was malformed; empty cell otherwise. |
