@@ -7,18 +7,16 @@ GraphQL schema (`schema.graphql`) but rewritten for human readers —
 units, admin-only fields, and locally-derived columns are called out
 explicitly.
 
-Columns whose `Requires admin` cell is `true` come from GraphQL fields
-that the Sourcegraph server only exposes to site admins. When you run
-the script with an access token from a non-admin user, the script
-either omits the underlying selection (for `externalServices`) or the
-server silently returns null (for the `mirrorInfo.*` fields), so those
-columns appear in the CSV with empty cells. Every other column is
+Columns where `Requires admin` is `true` are from GraphQL fields
+which require an access token from a site admin user on the
+instance. When you run the script with an access token from a
+non-admin user, these columns will be empty. Every other column is
 populated for any authenticated user with read access to the
 repository.
 
 ## Output files
 
-The script always writes its outputs prefixed with the sanitized
+The script prefixes output file names with the sanitized
 Sourcegraph endpoint (e.g. `sourcegraph.example.com-repos.csv`),
 so the script can run against multiple instances without overwriting files.
 
@@ -26,7 +24,7 @@ so the script can run against multiple instances without overwriting files.
 | --- | --- | --- |
 | `<prefix>-repos.csv` | always | main columns |
 | `<prefix>-repos-with-cloning-errors.csv` | at least one repo has a cloning error | main columns + cloning-error extras |
-| `<prefix>-repos-with-indexing-errors.csv` | at least one repo is cloned but missing a search index | main columns |
+| `<prefix>-repos-with-indexing-errors.csv` | at least one repo is cloned but is missing a search index | main columns |
 | `<prefix>-repos-with-skipped-files.csv` | `--skipped-files` is set and at least one repo had Zoekt skip files | main columns + skipped-files extras |
 
 The optional `--count-commits` and `--run-search` flags append extra
@@ -40,8 +38,8 @@ These are written to every CSV file.
 | Column | Type | Requires admin | Description |
 | --- | --- | --- | --- |
 | `id` | integer | | Numeric Sourcegraph database ID for the repository, decoded locally from the base64 GraphQL global ID. Useful when correlating with the `repo` table or admin URLs. |
-| `url` | string | | Full URL to the repository on this Sourcegraph instance (the `<endpoint>` joined with `Repository.url`). |
-| `mirrorInfo.remoteURL` | string | true | Clone URL of the upstream repository on the code host (may include embedded credentials). |
+| `url` | string | | URL to the repository on this Sourcegraph instance. |
+| `mirrorInfo.remoteURL` | string | true | Clone URL of the upstream repository on the code host. Any embedded `user[:password]@` credentials are replaced with `REDACTED@` at extraction time, so secrets never reach the CSV. |
 | `externalServices` | string (semicolon-joined) | true | Semicolon-joined display names of every external service (code-host connection) that yields this repository. |
 | `mirrorInfo.status` | enum (corrupted, errored, cloning, cloned, not_cloned) | | Single-word summary of the repo's mirror state, derived locally from `mirrorInfo`. One of `corrupted`, `errored`, `cloning`, `cloned`, `not_cloned`, in priority order (so `corrupted` wins over `errored`, etc.). |
 | `isFork` | boolean | | Whether this repository is a fork (`True`/`False`). |

@@ -50,7 +50,7 @@ import textwrap
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn, TextIO, cast
-from urllib.parse import ParseResult, urlparse, urlsplit
+from urllib.parse import ParseResult, urlparse, urlsplit, urlunsplit
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -440,6 +440,37 @@ def derive_index_status(repo: dict[str, Any]) -> str:
     )
 
 
+def redact_remote_url(repo: dict[str, Any]) -> str | None:
+    """Return mirrorInfo.remoteURL with any embedded credentials redacted.
+
+    Sourcegraph stores the upstream clone URL exactly as configured on the
+    code-host connection, which can include `https://user:password@host/...`
+    or `https://<token>@host/...`. We redact the userinfo immediately at
+    extraction time so secrets never reach the CSV (or anywhere downstream
+    of it: logs, support bundles, screenshots, etc.).
+
+    Strategy: replace the entire userinfo portion of the URL's netloc with
+    a fixed `REDACTED` marker whenever it is non-empty. This errs on the
+    side of redacting bare usernames too — they are not always secret, but
+    PATs are sometimes placed there alone, and a single rule is easier to
+    audit than per-host heuristics. URLs without a userinfo or without a
+    scheme/netloc pass through unchanged.
+    """
+    raw = get_path(repo, "mirrorInfo.remoteURL")
+    if not isinstance(raw, str):
+        return None
+    if not raw:
+        return raw
+    parts = urlsplit(raw)
+    if not parts.scheme or not parts.netloc or "@" not in parts.netloc:
+        return raw
+    _, _, host_port = parts.netloc.rpartition("@")
+    new_netloc = f"REDACTED@{host_port}"
+    return urlunsplit(
+        (parts.scheme, new_netloc, parts.path, parts.query, parts.fragment),
+    )
+
+
 def join_external_services(repo: dict[str, Any]) -> str:
     """Combine all attached code-host display names into one ';'-separated string."""
     services: dict[str, Any] = repo.get("externalServices") or {}
@@ -712,16 +743,17 @@ COLUMNS: list[tuple[str, Callable[[dict[str, Any]], Any], str, bool, str]] = [
     (
         "url",
         lambda r: r.get("url"),
-        "Full URL to the repository on this Sourcegraph instance "
-        "(the `<endpoint>` joined with `Repository.url`).",
+        "URL to the repository on this Sourcegraph instance.",
         False,
         "string",
     ),
     (
         "mirrorInfo.remoteURL",
-        lambda r: get_path(r, "mirrorInfo.remoteURL"),
-        "Clone URL of the upstream repository on the code host (may include "
-        "embedded credentials).",
+        redact_remote_url,
+        "Clone URL of the upstream repository on the code host. Any "
+        "embedded `user[:password]@` credentials are replaced with "
+        "`REDACTED@` at extraction time, so secrets never reach the "
+        "CSV.",
         True,
         "string",
     ),
@@ -1233,16 +1265,15 @@ units, admin-only fields, and locally-derived columns are called out
 explicitly.
 
 Columns where `Requires admin` is `true` are from GraphQL fields
-which require an access token from a site admin user on the instance. When you the script with an access token from a non-admin user, the script
-either omits the underlying selection (for `externalServices`) or the
-server silently returns null (for the `mirrorInfo.*` fields), so those
-columns appear in the CSV with empty cells. Every other column is
+which require an access token from a site admin user on the
+instance. When you run the script with an access token from a
+non-admin user, these columns will be empty. Every other column is
 populated for any authenticated user with read access to the
 repository.
 
 ## Output files
 
-The script always writes its outputs prefixed with the sanitized
+The script prefixes output file names with the sanitized
 Sourcegraph endpoint (e.g. `sourcegraph.example.com-repos.csv`),
 so the script can run against multiple instances without overwriting files.
 
@@ -1250,7 +1281,7 @@ so the script can run against multiple instances without overwriting files.
 | --- | --- | --- |
 | `<prefix>-{DEFAULT_OUTPUT_FILE}` | always | main columns |
 | `<prefix>-{DEFAULT_CLONING_ERRORS_FILE}` | at least one repo has a cloning error | main columns + cloning-error extras |
-| `<prefix>-{DEFAULT_INDEXING_ERRORS_FILE}` | at least one repo is cloned but missing a search index | main columns |
+| `<prefix>-{DEFAULT_INDEXING_ERRORS_FILE}` | at least one repo is cloned but is missing a search index | main columns |
 | `<prefix>-{DEFAULT_SKIPPED_FILES_FILE}` | `--skipped-files` is set and at least one repo had Zoekt skip files | main columns + skipped-files extras |
 
 The optional `--count-commits` and `--run-search` flags append extra
