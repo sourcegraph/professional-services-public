@@ -63,14 +63,15 @@ PAGE_SIZE = 500
 MAX_RETRIES = 3
 RETRY_DELAY_SECONDS = 5
 REQUEST_TIMEOUT_SECONDS = 60
-# Counting commits server-side can be slow on big monorepos. Bump the per-
-# request timeout so we don't fail on long-but-still-progressing requests.
+# Counting commits server-side can be slow on big monorepos. The COMMIT_COUNT
+# call site passes this longer timeout explicitly via graphql_request(timeout=)
+# so we don't fail on long-but-still-progressing requests.
 REQUEST_TIMEOUT_SECONDS_WITH_COMMIT_COUNT = 600
 DEFAULT_OUTPUT_FILE = "repos.csv"
 DEFAULT_CLONING_ERRORS_FILE = "repos-with-cloning-errors.csv"
 DEFAULT_INDEXING_ERRORS_FILE = "repos-with-indexing-errors.csv"
 DEFAULT_SKIPPED_FILES_FILE = "repos-with-skipped-files.csv"
-DEFAULT_LOG_FILE = "repos.log"
+DEFAULT_LOG_FILE = "list-repos.log"
 
 # --- GraphQL queries ----------------------------------------------------------
 
@@ -132,7 +133,7 @@ fragment RepoNodeFields on Repository {
       }
     }
   }
-  externalServices(first: 100) {
+  externalServices(first: 100) @include(if: $includeExternalServices) {
     nodes {
       displayName
     }
@@ -140,10 +141,16 @@ fragment RepoNodeFields on Repository {
 }
 """
 
+# `$includeExternalServices` is wired into the GRAPHQL_QUERY / SINGLE_REPO_QUERY
+# operations below and threaded through @include on Repository.externalServices
+# in REPO_NODE_FRAGMENT. We always send the same query string regardless of
+# token type; we just flip the variable to false when the authenticated user
+# is not a site admin so the server skips that resolver entirely (it would
+# otherwise return "must be site admin" — see admin-permissions.md).
 GRAPHQL_QUERY = (
     REPO_NODE_FRAGMENT
     + """
-query ListRepos($first: Int!, $after: String) {
+query ListRepos($first: Int!, $after: String, $includeExternalServices: Boolean!) {
   repositories(first: $first, after: $after) {
     nodes {
       ...RepoNodeFields
@@ -165,7 +172,7 @@ query ListRepos($first: Int!, $after: String) {
 SINGLE_REPO_QUERY = (
     REPO_NODE_FRAGMENT
     + """
-query SingleRepo($name: String!) {
+query SingleRepo($name: String!, $includeExternalServices: Boolean!) {
   repository(name: $name) {
     ...RepoNodeFields
   }
@@ -174,8 +181,12 @@ query SingleRepo($name: String!) {
 )
 
 
+# `siteAdmin` lets us decide once, at startup, whether to ask the server for
+# admin-only fields (currently just Repository.externalServices via the
+# @include directive on REPO_NODE_FRAGMENT) and whether to allow --reclone /
+# --reindex (which the server hard-blocks for non-admins regardless).
 CURRENT_USER_QUERY = """
-query { currentUser { username } }
+query { currentUser { username siteAdmin } }
 """
 
 # Per-repo commit count query. Run once per repo (only when --count-commits is
@@ -599,6 +610,7 @@ def fetch_commit_count(
                 "rev": rev,
                 "allRefsSearch": build_all_refs_search(repo_name),
             },
+            timeout=REQUEST_TIMEOUT_SECONDS_WITH_COMMIT_COUNT,
         )
     except (GraphQLError, HTTPRequestError) as exc:
         elapsed = time.monotonic() - start
@@ -870,7 +882,10 @@ class HTTPRequestError(RuntimeError):
         self.body = body
 
 
-def open_connection(parsed: ParseResult) -> http.client.HTTPConnection:
+def open_connection(
+    parsed: ParseResult,
+    timeout: int = REQUEST_TIMEOUT_SECONDS,
+) -> http.client.HTTPConnection:
     """Open an HTTP(S) connection, rejecting any scheme other than http/https.
 
     We use http.client directly (rather than urllib.request) so that the set
@@ -884,13 +899,13 @@ def open_connection(parsed: ParseResult) -> http.client.HTTPConnection:
         return http.client.HTTPSConnection(
             parsed.hostname,
             parsed.port,
-            timeout=REQUEST_TIMEOUT_SECONDS,
+            timeout=timeout,
         )
     if parsed.scheme == "http":
         return http.client.HTTPConnection(
             parsed.hostname,
             parsed.port,
-            timeout=REQUEST_TIMEOUT_SECONDS,
+            timeout=timeout,
         )
     msg = f"Unsupported URL scheme: {parsed.scheme!r} (expected http or https)"
     raise ValueError(msg)
@@ -900,13 +915,14 @@ def send_once(
     url: str,
     body: bytes,
     headers: dict[str, str],
+    timeout: int = REQUEST_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     """Send one POST. Returns parsed JSON on 2xx, raises HTTPRequestError on 4xx/5xx."""
     parsed = urlparse(url)
     path = parsed.path or "/"
     if parsed.query:
         path = f"{path}?{parsed.query}"
-    conn = open_connection(parsed)
+    conn = open_connection(parsed, timeout=timeout)
     try:
         conn.request("POST", path, body=body, headers=headers)
         resp = conn.getresponse()
@@ -928,6 +944,7 @@ def send_or_capture_oserror(
     url: str,
     body: bytes,
     headers: dict[str, str],
+    timeout: int = REQUEST_TIMEOUT_SECONDS,
 ) -> dict[str, Any] | OSError:
     """Send once. Re-raises HTTPRequestError; returns OSError instances for retry.
 
@@ -935,7 +952,7 @@ def send_or_capture_oserror(
     avoids the per-iteration exception-handler setup cost.
     """
     try:
-        return send_once(url, body, headers)
+        return send_once(url, body, headers, timeout=timeout)
     except OSError as exc:
         return exc
 
@@ -944,6 +961,7 @@ def send_with_retry(
     url: str,
     body: bytes,
     headers: dict[str, str],
+    timeout: int = REQUEST_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     """Execute an HTTP request, retrying transient network errors only.
 
@@ -952,7 +970,7 @@ def send_with_retry(
     cases (DNS failure, connection refused, timeout, etc.) get retried.
     """
     for attempt in range(1, MAX_RETRIES + 1):
-        result = send_or_capture_oserror(url, body, headers)
+        result = send_or_capture_oserror(url, body, headers, timeout=timeout)
         if not isinstance(result, OSError):
             return result
         if attempt == MAX_RETRIES:
@@ -974,6 +992,7 @@ def graphql_request(
     token: str,
     query: str,
     variables: dict[str, Any],
+    timeout: int = REQUEST_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     """Send a GraphQL query to the Sourcegraph API and return the data block."""
     url = endpoint.rstrip("/") + "/.api/graphql"
@@ -983,7 +1002,7 @@ def graphql_request(
         "Content-Type": "application/json",
         "User-Agent": "list-repos/0.0.1",
     }
-    data = send_with_retry(url, body, headers)
+    data = send_with_retry(url, body, headers, timeout=timeout)
     if data.get("errors"):
         # GraphQL can return both `errors` and partial `data`. If we have data,
         # log the errors and keep going; only abort if no data was returned.
@@ -999,21 +1018,30 @@ def graphql_request(
     return data["data"]
 
 
-def fetch_current_username(endpoint: str, token: str) -> str:
-    """Return the username of the authenticated user.
+def fetch_current_user(endpoint: str, token: str) -> tuple[str, bool]:
+    """Return (username, is_site_admin) for the authenticated user.
 
     All GraphQL queries used by this script require authentication, so an
     invalid/anonymous token is rejected by validate_token (or by the server
     via HTTPRequestError) before this is ever called.
+
+    `is_site_admin` is used to (a) drop the admin-only
+    Repository.externalServices selection from the listing/single-repo
+    queries via the $includeExternalServices @include directive, and
+    (b) refuse --reclone / --reindex up front rather than letting the
+    server return a "must be site admin" mutation error mid-run.
     """
     data = graphql_request(endpoint, token, CURRENT_USER_QUERY, {})
-    return str(data["currentUser"]["username"])
+    user = data["currentUser"] or {}
+    return str(user["username"]), bool(user.get("siteAdmin"))
 
 
 def fetch_single_repo(
     endpoint: str,
     token: str,
     repo_name: str,
+    *,
+    is_site_admin: bool,
 ) -> dict[str, Any]:
     """Return a single repo node in the same shape as the listing query.
 
@@ -1022,9 +1050,18 @@ def fetch_single_repo(
     write_csv, has_cloning_error, etc.) can treat the result identically to
     a node from the all-repos listing.
 
+    `is_site_admin` is passed through as the `$includeExternalServices`
+    GraphQL variable so non-admin tokens skip the admin-only externalServices
+    field instead of triggering a "must be site admin" error.
+
     Exits via die() when the repository name is unknown to the instance.
     """
-    data = graphql_request(endpoint, token, SINGLE_REPO_QUERY, {"name": repo_name})
+    data = graphql_request(
+        endpoint,
+        token,
+        SINGLE_REPO_QUERY,
+        {"name": repo_name, "includeExternalServices": is_site_admin},
+    )
     repo = data.get("repository")
     if repo is None:
         die(f"repository {repo_name!r} not found on {endpoint}")
@@ -1395,6 +1432,7 @@ def fetch_repos(
     max_repos: int | None = None,
     *,
     scope_repo: str | None = None,
+    is_site_admin: bool,
 ) -> Iterator[tuple[int, int, dict[str, Any]]]:
     """Yield (index, target, repo) tuples by paginating through the GraphQL API.
 
@@ -1415,7 +1453,12 @@ def fetch_repos(
     repo.
     """
     if scope_repo is not None:
-        repo = fetch_single_repo(endpoint, token, scope_repo)
+        repo = fetch_single_repo(
+            endpoint,
+            token,
+            scope_repo,
+            is_site_admin=is_site_admin,
+        )
         logger.info("Scope: single repository %s", scope_repo)
         yield 1, 1, repo
         logger.info("Fetched 1/1 repositories...")
@@ -1431,7 +1474,11 @@ def fetch_repos(
             endpoint,
             token,
             GRAPHQL_QUERY,
-            {"first": page_size, "after": cursor},
+            {
+                "first": page_size,
+                "after": cursor,
+                "includeExternalServices": is_site_admin,
+            },
         )
         connection = data["repositories"]
         total_count = connection["totalCount"]
@@ -1579,6 +1626,7 @@ def write_csv(
     scope_repo: str | None = None,
     count_commits_rev: str = "HEAD",
     run_search_pattern: str | None = None,
+    is_site_admin: bool,
 ) -> tuple[int, int, int]:
     """Stream repos directly to CSV rather than collecting them first.
 
@@ -1632,6 +1680,7 @@ def write_csv(
         token,
         max_repos,
         scope_repo=scope_repo,
+        is_site_admin=is_site_admin,
     ):
         row = build_row(repo, endpoint)
         commit_count: int | None = None
@@ -1652,7 +1701,7 @@ def write_csv(
                 elapsed_seconds,
                 optimization_values,
             ) = fetch_commit_count(endpoint, token, repo_name, count_commits_rev)
-            # The "[N/Total]" prefix lets users tail repos.log and see how
+            # The "[N/Total]" prefix lets users tail list-repos.log and see how
             # far through the run we are without scrolling back to the
             # per-page "Fetched N/Total" line.
             # Render counts as "?" rather than "None" in the log so the line
@@ -2146,16 +2195,13 @@ def collect_scope(args: argparse.Namespace) -> tuple[str, str] | None:
 def run(args: argparse.Namespace, endpoint: str, token: str) -> None:
     """Confirm the connection, then stream every repo to the CSV file."""
     if args.count_commits:
-        # Counting commits server-side can take a long time on monorepos. Bump
-        # the per-request HTTP timeout so we wait long enough for these queries
-        # to return before retrying. open_connection() reads this on each call,
-        # so a global update is sufficient.
-        global REQUEST_TIMEOUT_SECONDS  # noqa: PLW0603
-        REQUEST_TIMEOUT_SECONDS = REQUEST_TIMEOUT_SECONDS_WITH_COMMIT_COUNT
+        # The per-repo COMMIT_COUNT_QUERY call site passes its own longer
+        # timeout via graphql_request(timeout=); just announce it here so the
+        # log makes the slower behaviour visible.
         logger.info(
             "--count-commits enabled: per-repo commit-count query "
             "(timeout=%ds per request)",
-            REQUEST_TIMEOUT_SECONDS,
+            REQUEST_TIMEOUT_SECONDS_WITH_COMMIT_COUNT,
         )
     scope = collect_scope(args)
     if scope is not None:
@@ -2172,8 +2218,44 @@ def run(args: argparse.Namespace, endpoint: str, token: str) -> None:
     else:
         scope_repo = None
         scope_rev = "HEAD"
-    username = fetch_current_username(endpoint, token)
-    logger.info("Connected to: %s as: %s", endpoint, username)
+    username, is_site_admin = fetch_current_user(endpoint, token)
+    logger.info(
+        "Connected to: %s as: %s (%s)",
+        endpoint,
+        username,
+        "site admin" if is_site_admin else "non-admin",
+    )
+
+    # --reclone / --reindex hit recloneRepository / reindexRepository GraphQL
+    # mutations that the server hard-blocks for non-admins (see
+    # admin-permissions.md). Refuse up front rather than letting the run get
+    # part-way through and then start emitting per-repo "must be site admin"
+    # warnings from trigger_reclone / trigger_reindex.
+    if not is_site_admin and (args.reclone or args.reindex):
+        flags = ", ".join(
+            flag
+            for flag, set_ in (
+                ("--reclone", bool(args.reclone)),
+                ("--reindex", bool(args.reindex)),
+            )
+            if set_
+        )
+        die(
+            f"site-admin token required for: {flags}. "
+            f"{username!r} is not a site admin on {endpoint}.",
+        )
+
+    if not is_site_admin:
+        # The listing/single-repo queries skip Repository.externalServices via
+        # the @include directive, but mirrorInfo.{remoteURL,shard} and
+        # mirrorInfo.repositoryStatistics still silently return null for
+        # non-admins. Surface that once so users aren't surprised by the
+        # blank CSV columns.
+        logger.warning(
+            "Non-admin token: skipping Repository.externalServices selection; "
+            "mirrorInfo.remoteURL, mirrorInfo.shard, and "
+            "mirrorInfo.repositoryStatistics will be empty in the CSV.",
+        )
 
     # When the user only wants the per-repo SkippedFileReasons report, skip the
     # full repo iteration — that query is targeted and doesn't need the listing.
@@ -2290,6 +2372,7 @@ def run(args: argparse.Namespace, endpoint: str, token: str) -> None:
             scope_repo=scope_repo,
             count_commits_rev=scope_rev,
             run_search_pattern=run_search_pattern,
+            is_site_admin=is_site_admin,
         )
 
     logger.info("Wrote %d repos to %s", total, output_path.name)
@@ -2368,8 +2451,8 @@ def _log_uncaught_exception(
     """sys.excepthook that routes uncaught exceptions through the logger.
 
     Without this, Python's default hook writes the traceback to stderr only,
-    so repos.log would miss it. Logging via logger.error(exc_info=...) sends
-    the full traceback to both handlers (stderr + repos.log).
+    so list-repos.log would miss it. Logging via logger.error(exc_info=...) sends
+    the full traceback to both handlers (stderr + list-repos.log).
 
     KeyboardInterrupt (Ctrl-C) is treated as a user-initiated graceful exit:
     a one-line message is logged with no traceback, since a stack dump for an
@@ -2388,7 +2471,7 @@ def main() -> None:
     """Entry point: configure logging, load env, parse args, run, handle errors."""
     configure_logging(Path(DEFAULT_LOG_FILE))
     # Anything that escapes the try/except below (or is raised before it, e.g.
-    # in parse_args / load_dotenv / require_credentials) lands in repos.log
+    # in parse_args / load_dotenv / require_credentials) lands in list-repos.log
     # with a full traceback via this hook.
     sys.excepthook = _log_uncaught_exception
 
@@ -2413,8 +2496,14 @@ def main() -> None:
         sys.exit(1)
     except ValueError as exc:
         die(str(exc))
-    except GraphQLError:
-        logger.exception("GraphQL request failed")
+    except GraphQLError as exc:
+        if ":53: no such host" in str(exc):
+            logger.error(
+                "There's a problem with your Sourcegraph instance "
+                "(DNS lookup failure for an internal service). Please try again."
+            )
+        else:
+            logger.exception("GraphQL request failed")
         sys.exit(1)
 
 
