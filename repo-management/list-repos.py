@@ -261,6 +261,51 @@ def build_all_refs_search(repo_name: str) -> str:
     return ALL_REFS_COMMIT_SEARCH_TEMPLATE.format(repo=re.escape(repo_name))
 
 
+# --- Per-repo arbitrary search (--run-search) ---------------------------------
+#
+# Per-repo execution of a user-supplied search pattern. The pattern is wrapped
+# with `r:^{repo}$ ... count:all timeout:120s` so each per-repo query is
+# scoped to exactly one repository, returns the full match count rather than
+# a paginated subset, and bounds server-side execution time so a pathological
+# pattern can't block the run for a whole monorepo.
+#
+# count:all -> matchCount reflects the true number of matches up to the
+#              SG search-engine's internal hard cap (limitHit reports the cap).
+# timeout:  -> server-side wall-clock budget; on overrun the API returns
+#              partial results plus an `alert`, never an HTTP timeout.
+RUN_SEARCH_QUERY_TEMPLATE = "r:^{repo}$ {pattern} count:all timeout:120s"
+
+RUN_SEARCH_GRAPHQL = """
+query RunSearch($query: String!) {
+  search(query: $query, version: V3) {
+    results {
+      matchCount
+      limitHit
+      alert {
+        title
+      }
+    }
+  }
+}
+"""
+
+
+def build_run_search_query(repo_name: str, pattern: str) -> str:
+    """Build the SG search query for --run-search, scoped to one repo.
+
+    The user's `pattern` is concatenated verbatim — they pass it through
+    --run-search as a quoted string and are responsible for any necessary
+    Sourcegraph search syntax (patternType:, lang:, file:, etc.). The
+    `r:^{repo}$` filter is added by us so the query runs against exactly
+    one repository, even if the user's pattern already contains a `r:`
+    filter (Sourcegraph treats multiple `r:` filters as additive AND).
+    """
+    return RUN_SEARCH_QUERY_TEMPLATE.format(
+        repo=re.escape(repo_name),
+        pattern=pattern,
+    )
+
+
 RECLONE_MUTATION = """
 mutation Reclone($repo: ID!) {
   recloneRepository(repo: $repo) {
@@ -586,6 +631,52 @@ def fetch_commit_count(
     return default_count, all_refs_count, elapsed, optimization_values
 
 
+def fetch_run_search(
+    endpoint: str,
+    token: str,
+    repo_name: str,
+    pattern: str,
+) -> tuple[int | None, float, bool, str | None]:
+    """Run --run-search's pattern against a single repo and return the result tuple.
+
+    Returns (match_count, elapsed_seconds, limit_hit, alert_title).
+
+    - match_count: number of search matches reported by the SG API. None if
+      the API did not return a numeric matchCount (e.g. transport-level
+      failure, or the search engine returned only an alert with no results
+      block).
+    - elapsed_seconds: wall-clock time of the GraphQL request, ALWAYS
+      returned (so the CSV always has a timing value, even on failure).
+    - limit_hit: True if the SG search engine truncated results before
+      reaching the natural end. Surfaced so the user can tell when a
+      matchCount is a floor rather than the actual total.
+    - alert_title: when the server-side `timeout:` budget is exceeded (or
+      the query is otherwise malformed), Sourcegraph returns the partial
+      result plus an `alert` describing why. The title is propagated to
+      the caller for logging; the row is still written.
+    """
+    start = time.monotonic()
+    query = build_run_search_query(repo_name, pattern)
+    try:
+        data = graphql_request(endpoint, token, RUN_SEARCH_GRAPHQL, {"query": query})
+    except (GraphQLError, HTTPRequestError) as exc:
+        elapsed = time.monotonic() - start
+        logger.warning("run-search query failed for %s: %s", repo_name, exc)
+        return None, elapsed, False, None
+    except OSError as exc:
+        elapsed = time.monotonic() - start
+        logger.warning("run-search network error for %s: %s", repo_name, exc)
+        return None, elapsed, False, None
+    elapsed = time.monotonic() - start
+    results: dict[str, Any] = (data.get("search") or {}).get("results") or {}
+    raw_count = results.get("matchCount")
+    match_count: int | None = raw_count if isinstance(raw_count, int) else None
+    limit_hit = bool(results.get("limitHit"))
+    alert: dict[str, Any] = results.get("alert") or {}
+    alert_title = alert.get("title") if isinstance(alert, dict) else None
+    return match_count, elapsed, limit_hit, alert_title
+
+
 # --- CSV format -----------------------------------------------------------
 # Each entry is (csv_column_name, extractor_function). Keeping the column name
 # next to the function that produces its value eliminates the risk of the
@@ -707,6 +798,22 @@ COMMIT_COUNT_COLUMNS: list[str] = [
     "allRefs.search.matchCount",
     "commitCount.queryTimeSeconds",
     *(name for name, _ in COMMIT_COUNT_OPTIMIZATION_COLUMNS),
+]
+
+# Optional columns appended to every CSV (main, cloning-errors, indexing-errors,
+# skipped-files) when --run-search is set. Placed AFTER COMMIT_COUNT_COLUMNS so
+# the existing column ordering for --count-commits is preserved when both flags
+# are used together.
+#
+# `runSearch.matchCount` is the API's matchCount; `runSearch.limitHit` reports
+# whether the SG search engine truncated results (so the matchCount is a floor
+# rather than a true total); `runSearch.alertTitle` is non-empty when the
+# server-side `timeout:` budget was exceeded or the query was malformed.
+RUN_SEARCH_COLUMNS: list[str] = [
+    "runSearch.matchCount",
+    "runSearch.queryTimeSeconds",
+    "runSearch.limitHit",
+    "runSearch.alertTitle",
 ]
 
 # Extra columns appended only to the cloning-errors CSV.
@@ -1406,11 +1513,55 @@ def append_commit_count(
     return [*row, commit_count, all_refs_count, elapsed_cell, *extras]
 
 
-def csv_columns_for(base_columns: list[str], *, count_commits: bool) -> list[str]:
-    """Return the CSV header list, with the commit-count columns appended if requested."""
+def append_run_search(
+    row: list[Any],
+    match_count: int | None,
+    elapsed_seconds: float | None,
+    limit_hit: bool,
+    alert_title: str | None,
+    *,
+    run_search: bool,
+) -> list[Any]:
+    """Append --run-search fields to row when run_search is True.
+
+    Order matches RUN_SEARCH_COLUMNS:
+      1. match_count        (runSearch.matchCount)
+      2. elapsed_seconds    (runSearch.queryTimeSeconds, 3-decimal seconds)
+      3. limit_hit          (runSearch.limitHit, written as the literal True/False)
+      4. alert_title        (runSearch.alertTitle, empty cell when no alert)
+
+    Like append_commit_count, this is a no-op when the flag is off so
+    every row stays the same width regardless of which optional flags
+    were used.
+    """
+    if not run_search:
+        return row
+    elapsed_cell: str | None = (
+        f"{elapsed_seconds:.3f}" if elapsed_seconds is not None else None
+    )
+    return [*row, match_count, elapsed_cell, limit_hit, alert_title]
+
+
+def csv_columns_for(
+    base_columns: list[str],
+    *,
+    count_commits: bool,
+    run_search: bool = False,
+) -> list[str]:
+    """Return the CSV header list with optional column blocks appended.
+
+    Column block order (when both flags are set, matches the order rows
+    are built by append_commit_count() then append_run_search()):
+      1. base_columns       (always)
+      2. COMMIT_COUNT_COLUMNS  (only when count_commits)
+      3. RUN_SEARCH_COLUMNS    (only when run_search)
+    """
+    cols = list(base_columns)
     if count_commits:
-        return [*base_columns, *COMMIT_COUNT_COLUMNS]
-    return list(base_columns)
+        cols.extend(COMMIT_COUNT_COLUMNS)
+    if run_search:
+        cols.extend(RUN_SEARCH_COLUMNS)
+    return cols
 
 
 def write_csv(
@@ -1427,6 +1578,7 @@ def write_csv(
     count_commits: bool = False,
     scope_repo: str | None = None,
     count_commits_rev: str = "HEAD",
+    run_search_pattern: str | None = None,
 ) -> tuple[int, int, int]:
     """Stream repos directly to CSV rather than collecting them first.
 
@@ -1462,8 +1614,15 @@ def write_csv(
 
     Returns (total, reclone_total, reindex_total).
     """
+    run_search_enabled = run_search_pattern is not None
     writer = csv.writer(out)
-    writer.writerow(csv_columns_for(CSV_COLUMNS, count_commits=count_commits))
+    writer.writerow(
+        csv_columns_for(
+            CSV_COLUMNS,
+            count_commits=count_commits,
+            run_search=run_search_enabled,
+        ),
+    )
 
     total = 0
     reclone_total = 0
@@ -1479,6 +1638,12 @@ def write_csv(
         all_refs_count: int | None = None
         elapsed_seconds: float | None = None
         optimization_values: list[Any] | None = None
+        search_match_count: int | None = None
+        search_elapsed_seconds: float | None = None
+        search_limit_hit = False
+        search_alert_title: str | None = None
+        position = f"[{index}/{target}]"
+        repo_label = repo.get("name") or repo.get("url") or repo.get("id")
         if count_commits:
             repo_name = str(repo.get("name") or "")
             (
@@ -1490,7 +1655,6 @@ def write_csv(
             # The "[N/Total]" prefix lets users tail repos.log and see how
             # far through the run we are without scrolling back to the
             # per-page "Fetched N/Total" line.
-            position = f"[{index}/{target}]"
             # Render counts as "?" rather than "None" in the log so the line
             # stays compact when one or both counts are missing.
             default_str = "?" if commit_count is None else f"{commit_count}"
@@ -1503,7 +1667,7 @@ def write_csv(
                     "%s No commit count for %s (default=%s, allRefs=%s) "
                     "[query took %.3fs]",
                     position,
-                    repo_name or repo.get("url") or repo.get("id"),
+                    repo_label,
                     default_str,
                     all_refs_str,
                     elapsed_seconds,
@@ -1512,33 +1676,73 @@ def write_csv(
                 logger.info(
                     "%s Commit count for %s: default=%s, allRefs=%s [query took %.3fs]",
                     position,
-                    repo_name or repo.get("url") or repo.get("id"),
+                    repo_label,
                     default_str,
                     all_refs_str,
                     elapsed_seconds,
                 )
-        writer.writerow(
-            append_commit_count(
-                row,
-                commit_count,
-                all_refs_count,
-                elapsed_seconds,
-                optimization_values,
+        if run_search_enabled and run_search_pattern is not None:
+            repo_name = str(repo.get("name") or "")
+            (
+                search_match_count,
+                search_elapsed_seconds,
+                search_limit_hit,
+                search_alert_title,
+            ) = fetch_run_search(endpoint, token, repo_name, run_search_pattern)
+            count_str = "?" if search_match_count is None else f"{search_match_count}"
+            limit_suffix = " (limit hit)" if search_limit_hit else ""
+            alert_suffix = (
+                f" alert={search_alert_title!r}" if search_alert_title else ""
+            )
+            logger.info(
+                "%s Search %s in %s: matches=%s%s%s [query took %.3fs]",
+                position,
+                run_search_pattern,
+                repo_label,
+                count_str,
+                limit_suffix,
+                alert_suffix,
+                search_elapsed_seconds,
+            )
+
+        def _augmented(
+            base: list[Any],
+            *,
+            _commit_count: int | None = commit_count,
+            _all_refs_count: int | None = all_refs_count,
+            _elapsed_seconds: float | None = elapsed_seconds,
+            _optimization_values: list[Any] | None = optimization_values,
+            _search_match_count: int | None = search_match_count,
+            _search_elapsed_seconds: float | None = search_elapsed_seconds,
+            _search_limit_hit: bool = search_limit_hit,
+            _search_alert_title: str | None = search_alert_title,
+        ) -> list[Any]:
+            """Apply the optional commit-count and run-search columns in order."""
+            with_commit = append_commit_count(
+                base,
+                _commit_count,
+                _all_refs_count,
+                _elapsed_seconds,
+                _optimization_values,
                 count_commits=count_commits,
-            ),
-        )
+            )
+            return append_run_search(
+                with_commit,
+                _search_match_count,
+                _search_elapsed_seconds,
+                _search_limit_hit,
+                _search_alert_title,
+                run_search=run_search_enabled,
+            )
+
+        writer.writerow(_augmented(row))
         total += 1
         repo_has_cloning_error = has_cloning_error(repo)
         repo_has_indexing_error = has_indexing_error(repo)
         if repo_has_cloning_error:
             cloning_writer.writerow(
-                append_commit_count(
+                _augmented(
                     row + [extract(repo) for _, extract in CLONING_ERROR_EXTRA_COLUMNS],
-                    commit_count,
-                    all_refs_count,
-                    elapsed_seconds,
-                    optimization_values,
-                    count_commits=count_commits,
                 ),
             )
         # In single-repo (scope_repo) mode the user explicitly asked for
@@ -1549,28 +1753,14 @@ def write_csv(
             if trigger_reclone(endpoint, token, repo["id"]):
                 reclone_total += 1
         if repo_has_indexing_error:
-            indexing_writer.writerow(
-                append_commit_count(
-                    row,
-                    commit_count,
-                    all_refs_count,
-                    elapsed_seconds,
-                    optimization_values,
-                    count_commits=count_commits,
-                ),
-            )
+            indexing_writer.writerow(_augmented(row))
         if reindex and (scope_repo is not None or repo_has_indexing_error):
             if trigger_reindex(endpoint, token, repo["id"]):
                 reindex_total += 1
         if skipped_writer is not None and has_skipped_files(repo):
             skipped_writer.writerow(
-                append_commit_count(
+                _augmented(
                     row + [extract(repo) for _, extract in SKIPPED_FILES_EXTRA_COLUMNS],
-                    commit_count,
-                    all_refs_count,
-                    elapsed_seconds,
-                    optimization_values,
-                    count_commits=count_commits,
                 ),
             )
     return (total, reclone_total, reindex_total)
@@ -1855,6 +2045,35 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--run-search",
+        metavar="PATTERN",
+        default=None,
+        help=(
+            "Run an arbitrary Sourcegraph search PATTERN once per repository\n"
+            "and append per-repo result columns to all output CSVs:\n"
+            "  runSearch.matchCount\n"
+            "    Number of matches reported by the search API for the\n"
+            "    pattern, scoped to that repository (count:all).\n"
+            "  runSearch.queryTimeSeconds\n"
+            "    Wall-clock time of the per-repo GraphQL search request.\n"
+            "  runSearch.limitHit\n"
+            "    True when the SG search engine truncated results, meaning\n"
+            "    matchCount is a floor rather than the actual total.\n"
+            "  runSearch.alertTitle\n"
+            "    Non-empty when the server-side timeout: budget was exceeded\n"
+            "    or the query was malformed; the row is still written.\n"
+            "\n"
+            "PATTERN is concatenated verbatim into the search query, so any\n"
+            "Sourcegraph search syntax is the user's responsibility (e.g.\n"
+            "patternType:regexp, lang:go, file:^src/, etc.). The script\n"
+            "wraps it with `r:^REPO$ PATTERN count:all timeout:120s` so it\n"
+            "is scoped to one repo, returns the full match count, and is\n"
+            "bounded server-side so a pathological pattern can't block the\n"
+            "run on a monorepo.\n"
+            "Example: --run-search 'TODO patternType:literal'"
+        ),
+    )
+    parser.add_argument(
         "--src-endpoint",
         default=None,
         metavar="URL",
@@ -1972,6 +2191,7 @@ def run(args: argparse.Namespace, endpoint: str, token: str) -> None:
                 ("--limit", args.limit is not None),
                 ("--skipped-files", args.skipped_files),
                 ("--count-commits", args.count_commits),
+                ("--run-search", args.run_search is not None),
             )
             if set_
         ]
@@ -2014,13 +2234,23 @@ def run(args: argparse.Namespace, endpoint: str, token: str) -> None:
         skipped_files_path.unlink(missing_ok=True)
 
     count_commits_enabled = bool(args.count_commits)
+    run_search_pattern: str | None = args.run_search
+    run_search_enabled = run_search_pattern is not None
     cloning_writer = LazyCSVWriter(
         cloning_errors_path,
-        csv_columns_for(CLONING_ERROR_CSV_COLUMNS, count_commits=count_commits_enabled),
+        csv_columns_for(
+            CLONING_ERROR_CSV_COLUMNS,
+            count_commits=count_commits_enabled,
+            run_search=run_search_enabled,
+        ),
     )
     indexing_writer = LazyCSVWriter(
         indexing_errors_path,
-        csv_columns_for(CSV_COLUMNS, count_commits=count_commits_enabled),
+        csv_columns_for(
+            CSV_COLUMNS,
+            count_commits=count_commits_enabled,
+            run_search=run_search_enabled,
+        ),
     )
     skipped_writer = (
         LazyCSVWriter(
@@ -2028,6 +2258,7 @@ def run(args: argparse.Namespace, endpoint: str, token: str) -> None:
             csv_columns_for(
                 SKIPPED_FILES_CSV_COLUMNS,
                 count_commits=count_commits_enabled,
+                run_search=run_search_enabled,
             ),
         )
         if skipped_files_path is not None
@@ -2058,6 +2289,7 @@ def run(args: argparse.Namespace, endpoint: str, token: str) -> None:
             count_commits=bool(args.count_commits),
             scope_repo=scope_repo,
             count_commits_rev=scope_rev,
+            run_search_pattern=run_search_pattern,
         )
 
     logger.info("Wrote %d repos to %s", total, output_path.name)
