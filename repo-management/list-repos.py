@@ -1749,21 +1749,26 @@ def fetch_skipped_file_matches(
 ) -> list[dict[str, Any]]:
     """Run the SkippedFileReasons search query and return non-empty FileMatch results.
 
-    The repo filter is built as `r:^<escaped-name>$@<rev>` so that:
+    The repo filter is built as `r:^<escaped-name>$` (no `@<rev>`) so that:
       - the regex is anchored on both ends (a bare prefix like
         "github.com/org/repo" no longer also matches
         "github.com/org/repo-fork" or "github.com/org/repository").
       - dots and other regex specials in the name are escaped (otherwise
         "github.com/foo/bar" would match "githubXcom/foo/bar").
-      - the resolved rev is sent explicitly so the search runs against the
-        same revision shown in the output filenames and file URLs (rather
-        than relying on the server's HEAD pointer, which could shift between
-        the verify_repo_rev call and this query).
+      - the rev is *not* pinned. Zoekt only surfaces the synthetic
+        `^NOT-INDEXED: <reason>` rows when the query targets its `@HEAD`
+        virtual ref. Pinning to the resolved branch name (e.g. `@main`)
+        silently returns zero results even when `main` is the indexed
+        default branch. `verify_repo_rev` already validated that the user's
+        rev resolves to the indexed default-ref commit, so omitting the
+        rev pin yields the same skipped-file set the user asked about.
     """
+    _ = rev  # kept for caller symmetry; see docstring for why it isn't used.
     repo_filter = f"^{re.escape(name)}$"
-    if rev and rev != "HEAD":
-        repo_filter += f"@{rev}"
-    search_query = f"r:{repo_filter} type:file index:only patternType:regexp count:all ^NOT-INDEXED:"
+    search_query = (
+        f"r:{repo_filter} type:file index:only "
+        f"patternType:regexp count:all ^NOT-INDEXED:"
+    )
     data = graphql_request(
         endpoint,
         token,
