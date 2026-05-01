@@ -2885,14 +2885,14 @@ def redact_argv_for_log(argv: list[str]) -> str:
     skip_next = False
     for arg in argv:
         if skip_next:
-            redacted.append("***REDACTED***")
+            redacted.append("REDACTED")
             skip_next = False
             continue
         if arg == "--src-access-token":
             redacted.append(arg)
             skip_next = True
         elif arg.startswith("--src-access-token="):
-            redacted.append("--src-access-token=***REDACTED***")
+            redacted.append("--src-access-token=REDACTED")
         else:
             redacted.append(arg)
     return " ".join(shlex.quote(a) for a in redacted)
