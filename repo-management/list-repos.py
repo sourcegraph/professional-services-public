@@ -1360,7 +1360,6 @@ Appended to every CSV when `--run-search PATTERN` is passed.
 {run_search_list}
 """
     path.write_text(content, encoding="utf-8")
-    logger.info("Wrote %s", path)
 
 
 # --- HTTP / GraphQL plumbing --------------------------------------------------
