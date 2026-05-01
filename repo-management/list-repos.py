@@ -1150,43 +1150,29 @@ SKIPPED_FILES_CSV_COLUMNS = CSV_COLUMNS + [
 # placeholder slipping into README.md.
 
 
-README_LINE_WIDTH = 79
-
-
 def format_columns_list(columns: list[tuple[str, str, bool, str]]) -> str:
     """Render a `[(name, description, requires_admin, value_type), ...]` list
-    as a wrapped bullet list with a `Type:` sub-bullet per entry.
+    as a Markdown table with one row per column.
 
-    Markdown tables can't have line breaks within a row, so a description
-    column on a tabular layout will easily exceed Markdownlint's MD013
-    line-length limit. A bullet list with `textwrap`-wrapped descriptions
-    avoids both MD013 (each wrapped line stays under the limit) and
-    MD060 (no table pipes), without needing to suppress either rule.
+    Columns: `Column` | `Type` | `Description`. When `requires_admin` is
+    True, the column name is prefixed with `[Site admin]` so a reader
+    scanning the table can immediately spot the columns that will be empty
+    for non-admin tokens; the README header explains the convention once
+    at the top.
 
-    When `requires_admin` is True, the column name is prefixed with
-    `[Site admin]` so a reader scanning the list can immediately spot the
-    columns that will be empty for non-admin tokens. The README header
-    explains the convention once at the top.
-
-    The value type (e.g. `integer`, `boolean`, `timestamp`, `enum (...)`)
-    is rendered as a `- Type:` sub-bullet so callers can quickly tell how
-    to parse each CSV cell without re-reading the description.
+    Markdown tables can't have line breaks within a row, so individual
+    rows will easily exceed Markdownlint's MD013 line-length limit. The
+    project's `.markdownlint.json` scopes MD013 to non-table content
+    (`tables: false`), which is the rule's documented way to handle
+    tables — MD013 still checks every prose line in every Markdown file.
     """
-    paragraphs: list[str] = []
+    rows = ["| Column | Type | Description |", "| --- | --- | --- |"]
     for name, desc, requires_admin, value_type in columns:
         prefix = "[Site admin] " if requires_admin else ""
-        first = f"- {prefix}`{name}`: "
-        wrapped = textwrap.fill(
-            desc,
-            width=README_LINE_WIDTH,
-            initial_indent=first,
-            # Two-space hanging indent matches the bullet's text column.
-            subsequent_indent="  ",
-            break_long_words=False,
-            break_on_hyphens=False,
-        )
-        paragraphs.append(wrapped + f"\n  - Type: {value_type}")
-    return "\n".join(paragraphs)
+        # Defensive: escape pipes so a description never breaks the table.
+        desc_cell = desc.replace("|", "\\|")
+        rows.append(f"| {prefix}`{name}` | {value_type} | {desc_cell} |")
+    return "\n".join(rows)
 
 
 def name_desc(
