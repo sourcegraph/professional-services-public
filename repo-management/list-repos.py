@@ -44,12 +44,14 @@ import json
 import logging
 import os
 import re
+import shlex
 import sys
 import textwrap
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn, TextIO, cast
-from urllib.parse import ParseResult, urlparse, urlsplit
+from urllib.parse import ParseResult, urlparse, urlsplit, urlunsplit
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -62,73 +64,98 @@ PAGE_SIZE = 500
 MAX_RETRIES = 3
 RETRY_DELAY_SECONDS = 5
 REQUEST_TIMEOUT_SECONDS = 60
+# Counting commits server-side can be slow on big monorepos. The COMMIT_COUNT
+# call site passes this longer timeout explicitly via graphql_request(timeout=)
+# so we don't fail on long-but-still-progressing requests.
+REQUEST_TIMEOUT_SECONDS_WITH_COMMIT_COUNT = 600
 DEFAULT_OUTPUT_FILE = "repos.csv"
 DEFAULT_CLONING_ERRORS_FILE = "repos-with-cloning-errors.csv"
 DEFAULT_INDEXING_ERRORS_FILE = "repos-with-indexing-errors.csv"
 DEFAULT_SKIPPED_FILES_FILE = "repos-with-skipped-files.csv"
-DEFAULT_LOG_FILE = "repos.log"
+DEFAULT_LOG_FILE = "list-repos.log"
+DEFAULT_README_FILE = "README.md"
 
 # --- GraphQL queries ----------------------------------------------------------
 
-GRAPHQL_QUERY = """
-query ListRepos($first: Int!, $after: String) {
+# Shared field-set used by both the all-repos listing query (GRAPHQL_QUERY)
+# and the single-repo lookup query (SINGLE_REPO_QUERY) so a change to the
+# CSV row schema can't drift between the two paths. Keeping it as a GraphQL
+# fragment in the same document is a standard pattern that the Sourcegraph
+# server supports.
+REPO_NODE_FRAGMENT = """
+fragment RepoNodeFields on Repository {
+  id
+  name
+  url
+  createdAt
+  isFork
+  isArchived
+  isPrivate
+  mirrorInfo {
+    remoteURL
+    cloned
+    cloneInProgress
+    isCorrupted
+    lastError
+    lastSyncOutput
+    corruptionLogs {
+      timestamp
+      reason
+    }
+    byteSize
+    lastChanged
+    updatedAt
+    nextSyncAt
+    updateSchedule {
+      intervalSeconds
+    }
+    shard
+  }
+  textSearchIndex {
+    status {
+      updatedAt
+      contentByteSize
+      contentFilesCount
+      indexByteSize
+      indexShardsCount
+      newLinesCount
+      defaultBranchNewLinesCount
+      otherBranchesNewLinesCount
+    }
+    host {
+      name
+    }
+    refs {
+      ref {
+        displayName
+      }
+      skippedIndexed {
+        count
+        query
+      }
+    }
+  }
+  externalServices(first: 100) @include(if: $includeExternalServices) {
+    nodes {
+      displayName
+    }
+  }
+}
+"""
+
+# `$includeExternalServices` is wired into the GRAPHQL_QUERY / SINGLE_REPO_QUERY
+# operations below and threaded through @include on Repository.externalServices
+# in REPO_NODE_FRAGMENT. We always send the same query string regardless of
+# token type; we just flip the variable to false when the authenticated user
+# is not a site admin so the server skips that resolver entirely (it would
+# otherwise return "must be site admin" — see admin-permissions.md).
+GRAPHQL_QUERY = (
+    REPO_NODE_FRAGMENT
+    + """
+query ListRepos($first: Int!, $after: String, $includeExternalServices: Boolean!) {
   repositories(first: $first, after: $after) {
     nodes {
-      id
-      url
-      createdAt
-      isFork
-      isArchived
-      isPrivate
-      mirrorInfo {
-        remoteURL
-        cloned
-        cloneInProgress
-        isCorrupted
-        lastError
-        lastSyncOutput
-        corruptionLogs {
-          timestamp
-          reason
-        }
-        byteSize
-        lastChanged
-        updatedAt
-        nextSyncAt
-        updateSchedule {
-          intervalSeconds
-        }
-        shard
-      }
-      textSearchIndex {
-        status {
-          updatedAt
-          contentByteSize
-          contentFilesCount
-          indexByteSize
-          indexShardsCount
-          newLinesCount
-          defaultBranchNewLinesCount
-          otherBranchesNewLinesCount
-        }
-        host {
-          name
-        }
-        refs {
-          ref {
-            displayName
-          }
-          skippedIndexed {
-            count
-            query
-          }
-        }
-      }
-      externalServices(first: 100) {
-        nodes {
-          displayName
-        }
-      }
+      ...RepoNodeFields
     }
     totalCount
     pageInfo {
@@ -138,10 +165,159 @@ query ListRepos($first: Int!, $after: String) {
   }
 }
 """
+)
 
-CURRENT_USER_QUERY = """
-query { currentUser { username } }
+# Single-repo lookup used by the scoped variants of --count-commits / --reclone
+# / --reindex. Returns the same field set as the listing query (via the shared
+# fragment) so the rest of the pipeline (build_row, write_csv, the error/skip
+# detectors, etc.) can treat the result identically to a listing-page node.
+SINGLE_REPO_QUERY = (
+    REPO_NODE_FRAGMENT
+    + """
+query SingleRepo($name: String!, $includeExternalServices: Boolean!) {
+  repository(name: $name) {
+    ...RepoNodeFields
+  }
+}
 """
+)
+
+
+# `siteAdmin` lets us decide once, at startup, whether to ask the server for
+# admin-only fields (currently just Repository.externalServices via the
+# @include directive on REPO_NODE_FRAGMENT) and whether to allow --reclone /
+# --reindex (which the server hard-blocks for non-admins regardless).
+CURRENT_USER_QUERY = """
+query { currentUser { username siteAdmin } }
+"""
+
+# Per-repo commit count query. Run once per repo (only when --count-commits is
+# set) so we can time each query individually and surface per-repo costs in
+# the CSV alongside the count itself. ancestors.totalCount is null when a
+# `first:` argument is provided, so we deliberately omit it to ask Sourcegraph
+# for the full count of commits reachable from HEAD on the repo's default
+# branch.
+#
+# This query also fetches repo-cleanup ("optimization") metadata so the
+# --count-commits CSV exposes when each repo was last cleaned, when its
+# next cleanup is scheduled, and the most recent full-repack timestamp.
+# repositoryStatistics is admin-only and returns null for non-cloned repos
+# or non-admin tokens; the COMMIT_COUNT_OPTIMIZATION_COLUMNS extractors
+# tolerate that with empty cells.
+COMMIT_COUNT_QUERY = """
+query CommitCount($name: String!, $rev: String!, $allRefsSearch: String!) {
+  repository(name: $name) {
+    commit(rev: $rev) {
+      ancestors {
+        totalCount
+      }
+    }
+    mirrorInfo {
+      lastCleanedAt
+      cleanupSchedule {
+        due
+        intervalSeconds
+      }
+      cleanupQueue {
+        index
+        optimizing
+      }
+      repositoryStatistics {
+        packfiles {
+          lastFullRepack
+        }
+      }
+    }
+  }
+  search(query: $allRefsSearch, version: V3) {
+    results {
+      matchCount
+    }
+  }
+}
+"""
+
+# Search query template used to count commits across every branch and tag,
+# returned alongside the default-branch ancestors count in the same request.
+# Sourcegraph's GraphQL has no field for `git rev-list --all --count` and
+# the obvious GraphQL alternatives don't work:
+#   - commit(rev:"--all") is rejected as an invalid revspec
+#   - summing ancestors.totalCount over every gitRefs node massively
+#     overcounts shared history (e.g. github.com/curl/curl explodes from
+#     ~38k on default to ~4.4M when summed across 231 tags + 19 branches)
+# The search-API count is internally consistent across repos and lets users
+# spot which repos have meaningful activity beyond their default branch.
+# IMPORTANT: this counts commits *as seen by Sourcegraph's commit search*
+# and is therefore NOT directly comparable to the
+# defaultBranch.target.commit.ancestors.totalCount column above (which is
+# an exact git rev-list count from gitserver). The two columns use
+# different methodologies — see the --count-commits help text for details.
+#
+# Only refs/heads/* and refs/tags/* are included; refs/pull/N/head and
+# similar internal refs would otherwise inflate the count by tens of
+# thousands of GitHub-PR refs. The repo name is regex-anchored and
+# escaped so a name with regex specials (a real possibility for code-host
+# slugs) can't break the query.
+# `timeout:` is a Sourcegraph search-side limiter: if the search engine can't
+# complete in that wall-clock budget, the API returns whatever it has so far
+# (often with an `alert`) instead of holding the HTTP connection open until
+# the gateway or our REQUEST_TIMEOUT_SECONDS_WITH_COMMIT_COUNT fires. Without
+# this, repos like github.com/chromium/chromium (1.7M+ commits, thousands of
+# refs) would block the run indefinitely and burn all our HTTP retries.
+ALL_REFS_COMMIT_SEARCH_TEMPLATE = (
+    "r:^{repo}$ rev:*refs/heads/*:*refs/tags/* type:commit count:all timeout:120s"
+)
+
+
+def build_all_refs_search(repo_name: str) -> str:
+    """Build the SG search query that counts commits across all branches+tags."""
+    return ALL_REFS_COMMIT_SEARCH_TEMPLATE.format(repo=re.escape(repo_name))
+
+
+# --- Per-repo arbitrary search (--run-search) ---------------------------------
+#
+# Per-repo execution of a user-supplied search pattern. The pattern is wrapped
+# with `r:^{repo}$ ... count:all timeout:120s` so each per-repo query is
+# scoped to exactly one repository, returns the full match count rather than
+# a paginated subset, and bounds server-side execution time so a pathological
+# pattern can't block the run for a whole monorepo.
+#
+# count:all -> matchCount reflects the true number of matches up to the
+#              SG search-engine's internal hard cap (limitHit reports the cap).
+# timeout:  -> server-side wall-clock budget; on overrun the API returns
+#              partial results plus an `alert`, never an HTTP timeout.
+RUN_SEARCH_QUERY_TEMPLATE = "r:^{repo}$ {pattern} count:all timeout:120s"
+
+RUN_SEARCH_GRAPHQL = """
+query RunSearch($query: String!) {
+  search(query: $query, version: V3) {
+    results {
+      matchCount
+      limitHit
+      alert {
+        title
+      }
+    }
+  }
+}
+"""
+
+
+def build_run_search_query(repo_name: str, pattern: str) -> str:
+    """Build the SG search query for --run-search, scoped to one repo.
+
+    The user's `pattern` is concatenated verbatim — they pass it through
+    --run-search as a quoted string and are responsible for any necessary
+    Sourcegraph search syntax (patternType:, lang:, file:, etc.). The
+    `r:^{repo}$` filter is added by us so the query runs against exactly
+    one repository, even if the user's pattern already contains a `r:`
+    filter (Sourcegraph treats multiple `r:` filters as additive AND).
+    """
+    return RUN_SEARCH_QUERY_TEMPLATE.format(
+        repo=re.escape(repo_name),
+        pattern=pattern,
+    )
+
 
 RECLONE_MUTATION = """
 mutation Reclone($repo: ID!) {
@@ -256,12 +432,67 @@ def derive_mirror_status(repo: dict[str, Any]) -> str:
     return "not_cloned"
 
 
+def seconds_relative_to_now(timestamp: object, *, future: bool) -> int | None:
+    """Return the integer second-delta between `timestamp` and now (UTC).
+
+    `future=False` returns now - timestamp (seconds since the past event).
+    `future=True`  returns timestamp - now (seconds until the future event).
+    Either side can be negative when the actual ordering is reversed
+    (e.g. a `nextSyncAt` whose schedule slot already elapsed). Returns
+    `None` if the timestamp is missing or unparseable.
+
+    Sourcegraph emits timestamps as RFC 3339 strings with `Z` suffix;
+    `datetime.fromisoformat` accepts the `Z` form starting with Python
+    3.11, but we normalize defensively for older interpreters.
+    """
+    if not isinstance(timestamp, str) or not timestamp:
+        return None
+    try:
+        ts = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    now = datetime.now(timezone.utc)
+    delta = (ts - now) if future else (now - ts)
+    return int(delta.total_seconds())
+
+
 def derive_index_status(repo: dict[str, Any]) -> str:
     """Summarize the repo's search-index state as 'indexed' or 'not_indexed'."""
     return (
         "indexed"
         if get_path(repo, "textSearchIndex.status") is not None
         else "not_indexed"
+    )
+
+
+def redact_remote_url(repo: dict[str, Any]) -> str | None:
+    """Return mirrorInfo.remoteURL with any embedded credentials redacted.
+
+    Sourcegraph stores the upstream clone URL exactly as configured on the
+    code-host connection, which can include `https://user:password@host/...`
+    or `https://<token>@host/...`. We redact the userinfo immediately at
+    extraction time so secrets never reach the CSV (or anywhere downstream
+    of it: logs, support bundles, screenshots, etc.).
+
+    Strategy: replace the entire userinfo portion of the URL's netloc with
+    a fixed `REDACTED` marker whenever it is non-empty. This errs on the
+    side of redacting bare usernames too — they are not always secret, but
+    PATs are sometimes placed there alone, and a single rule is easier to
+    audit than per-host heuristics. URLs without a userinfo or without a
+    scheme/netloc pass through unchanged.
+    """
+    raw = get_path(repo, "mirrorInfo.remoteURL")
+    if not isinstance(raw, str):
+        return None
+    if not raw:
+        return raw
+    parts = urlsplit(raw)
+    if not parts.scheme or not parts.netloc or "@" not in parts.netloc:
+        return raw
+    _, _, host_port = parts.netloc.rpartition("@")
+    new_netloc = f"REDACTED@{host_port}"
+    return urlunsplit(
+        (parts.scheme, new_netloc, parts.path, parts.query, parts.fragment),
     )
 
 
@@ -390,77 +621,558 @@ def has_skipped_files(repo: dict[str, Any]) -> bool:
     return total_skipped_files(repo) > 0
 
 
+def fetch_commit_count(
+    endpoint: str,
+    token: str,
+    repo_name: str,
+    rev: str = "HEAD",
+) -> tuple[int | None, int | None, float, list[Any]]:
+    """Run the per-repo COMMIT_COUNT_QUERY and return per-repo commit metrics.
+
+    `rev` defaults to "HEAD" (the repo's default branch) and can be set to
+    any revspec (branch name, tag, commit SHA) when --count-commits was
+    invoked in scoped mode with REPO@REV. The all-refs search count is not
+    affected by `rev` — it always counts across every branch and tag.
+
+    Returns (default_branch_count, all_refs_count, elapsed_seconds,
+    optimization_values).
+
+    - default_branch_count: exact git rev-list count of commits reachable from
+      `rev` (the default branch HEAD when not overridden).
+    - all_refs_count: search-based count of commits reachable across every
+      branch and tag (refs/heads/* + refs/tags/*). This is a Sourcegraph
+      *search* count, not a git rev-list count, and is therefore NOT
+      directly comparable to default_branch_count — see
+      ALL_REFS_COMMIT_SEARCH_TEMPLATE for why we cannot get an exact
+      rev-list-style count via GraphQL.
+    - elapsed_seconds: wall-clock time of the GraphQL request (ALWAYS
+      returned, even on failure, so the CSV always has a timing value).
+    - optimization_values: aligned with COMMIT_COUNT_OPTIMIZATION_COLUMNS so
+      callers can append it directly to a CSV row.
+
+    Returns (None, None, elapsed, [None, ...]) when the GraphQL request
+    errors out at the transport level. Either count may be None
+    independently of the other (e.g. an empty repo has no HEAD but the
+    search may still return 0 across refs, or vice versa).
+    """
+    empty_extras: list[Any] = [None] * len(COMMIT_COUNT_OPTIMIZATION_COLUMNS)
+    start = time.monotonic()
+    try:
+        data = graphql_request(
+            endpoint,
+            token,
+            COMMIT_COUNT_QUERY,
+            {
+                "name": repo_name,
+                "rev": rev,
+                "allRefsSearch": build_all_refs_search(repo_name),
+            },
+            timeout=REQUEST_TIMEOUT_SECONDS_WITH_COMMIT_COUNT,
+        )
+    except (GraphQLError, HTTPRequestError) as exc:
+        elapsed = time.monotonic() - start
+        logger.warning("commit-count query failed for %s: %s", repo_name, exc)
+        return None, None, elapsed, empty_extras
+    except OSError as exc:
+        elapsed = time.monotonic() - start
+        logger.warning(
+            "commit-count network error for %s: %s",
+            repo_name,
+            exc,
+        )
+        return None, None, elapsed, empty_extras
+    elapsed = time.monotonic() - start
+    repo: dict[str, Any] = data.get("repository") or {}
+    commit: dict[str, Any] = repo.get("commit") or {}
+    ancestors: dict[str, Any] = commit.get("ancestors") or {}
+    default_count_raw = ancestors.get("totalCount")
+    default_count: int | None = (
+        default_count_raw if isinstance(default_count_raw, int) else None
+    )
+    search_block: dict[str, Any] = data.get("search") or {}
+    search_results: dict[str, Any] = search_block.get("results") or {}
+    all_refs_count_raw = search_results.get("matchCount")
+    all_refs_count: int | None = (
+        all_refs_count_raw if isinstance(all_refs_count_raw, int) else None
+    )
+    optimization_values = [
+        extract(repo) for _, extract, _, _, _ in COMMIT_COUNT_OPTIMIZATION_COLUMNS
+    ]
+    return default_count, all_refs_count, elapsed, optimization_values
+
+
+def fetch_run_search(
+    endpoint: str,
+    token: str,
+    repo_name: str,
+    pattern: str,
+) -> tuple[int | None, float, bool, str | None]:
+    """Run --run-search's pattern against a single repo and return the result tuple.
+
+    Returns (match_count, elapsed_seconds, limit_hit, alert_title).
+
+    - match_count: number of search matches reported by the SG API. None if
+      the API did not return a numeric matchCount (e.g. transport-level
+      failure, or the search engine returned only an alert with no results
+      block).
+    - elapsed_seconds: wall-clock time of the GraphQL request, ALWAYS
+      returned (so the CSV always has a timing value, even on failure).
+    - limit_hit: True if the SG search engine truncated results before
+      reaching the natural end. Surfaced so the user can tell when a
+      matchCount is a floor rather than the actual total.
+    - alert_title: when the server-side `timeout:` budget is exceeded (or
+      the query is otherwise malformed), Sourcegraph returns the partial
+      result plus an `alert` describing why. The title is propagated to
+      the caller for logging; the row is still written.
+    """
+    start = time.monotonic()
+    query = build_run_search_query(repo_name, pattern)
+    try:
+        data = graphql_request(endpoint, token, RUN_SEARCH_GRAPHQL, {"query": query})
+    except (GraphQLError, HTTPRequestError) as exc:
+        elapsed = time.monotonic() - start
+        logger.warning("run-search query failed for %s: %s", repo_name, exc)
+        return None, elapsed, False, None
+    except OSError as exc:
+        elapsed = time.monotonic() - start
+        logger.warning("run-search network error for %s: %s", repo_name, exc)
+        return None, elapsed, False, None
+    elapsed = time.monotonic() - start
+    search_block: dict[str, Any] = data.get("search") or {}
+    results: dict[str, Any] = search_block.get("results") or {}
+    raw_count = results.get("matchCount")
+    match_count: int | None = raw_count if isinstance(raw_count, int) else None
+    limit_hit = bool(results.get("limitHit"))
+    alert: dict[str, Any] = results.get("alert") or {}
+    alert_title_raw = alert.get("title")
+    alert_title: str | None = (
+        alert_title_raw if isinstance(alert_title_raw, str) else None
+    )
+    return match_count, elapsed, limit_hit, alert_title
+
+
 # --- CSV format -----------------------------------------------------------
 # Each entry is (csv_column_name, extractor_function). Keeping the column name
 # next to the function that produces its value eliminates the risk of the
 # header drifting out of sync with the row data.
-COLUMNS: list[tuple[str, Callable[[dict[str, Any]], Any]]] = [
-    ("id", lambda r: decode_repo_id(r["id"])),
-    ("url", lambda r: r.get("url")),
-    ("mirrorInfo.remoteURL", lambda r: get_path(r, "mirrorInfo.remoteURL")),
-    ("externalServices", join_external_services),
-    ("mirrorInfo.status", derive_mirror_status),
-    ("isFork", lambda r: r.get("isFork")),
-    ("isArchived", lambda r: r.get("isArchived")),
-    ("isPrivate", lambda r: r.get("isPrivate")),
-    ("mirrorInfo.byteSize(MB)", lambda r: get_path_mb(r, "mirrorInfo.byteSize")),
-    ("createdAt", lambda r: r.get("createdAt")),
-    ("mirrorInfo.lastChanged", lambda r: get_path(r, "mirrorInfo.lastChanged")),
-    ("mirrorInfo.updatedAt", lambda r: get_path(r, "mirrorInfo.updatedAt")),
-    ("mirrorInfo.nextSyncAt", lambda r: get_path(r, "mirrorInfo.nextSyncAt")),
+COLUMNS: list[tuple[str, Callable[[dict[str, Any]], Any], str, bool, str]] = [
+    (
+        "id",
+        lambda r: decode_repo_id(r["id"]),
+        "Numeric Sourcegraph database ID for the repository, decoded "
+        "locally from the base64 GraphQL global ID. Useful when correlating "
+        "with the `repo` table or admin URLs.",
+        False,
+        "integer",
+    ),
+    (
+        "url",
+        lambda r: r.get("url"),
+        "URL to the repository on this Sourcegraph instance.",
+        False,
+        "string",
+    ),
+    (
+        "mirrorInfo.remoteURL",
+        redact_remote_url,
+        "Clone URL of the upstream repository on the code host. Any "
+        "embedded `user[:password]@` credentials are replaced with "
+        "`REDACTED@` at extraction time, so secrets never reach the "
+        "CSV.",
+        True,
+        "string",
+    ),
+    (
+        "externalServices",
+        join_external_services,
+        "Display names of the external service(s) "
+        "(code-host connection(s)) which yields this repository.",
+        True,
+        "string (semicolon-joined)",
+    ),
+    (
+        "mirrorInfo.status",
+        derive_mirror_status,
+        "Single-word summary of the repo's mirror state, derived locally "
+        "from `mirrorInfo`.",
+        False,
+        "enum (corrupted, errored, cloning, cloned, not_cloned)",
+    ),
+    (
+        "isFork",
+        lambda r: r.get("isFork"),
+        "Whether this repository is a fork.",
+        False,
+        "boolean",
+    ),
+    (
+        "isArchived",
+        lambda r: r.get("isArchived"),
+        "Whether this repository has been archived on the code host.",
+        False,
+        "boolean",
+    ),
+    (
+        "isPrivate",
+        lambda r: r.get("isPrivate"),
+        "Whether this repository is private.",
+        False,
+        "boolean",
+    ),
+    (
+        "mirrorInfo.byteSize(MB)",
+        lambda r: get_path_mb(r, "mirrorInfo.byteSize"),
+        "On-disk size of the bare-cloned repository, in megabytes.",
+        False,
+        "float",
+    ),
+    (
+        "createdAt",
+        lambda r: r.get("createdAt"),
+        "Timestamp the repo was first cloned to your Sourcegraph instance.",
+        False,
+        "timestamp",
+    ),
+    (
+        "mirrorInfo.lastChanged",
+        lambda r: get_path(r, "mirrorInfo.lastChanged"),
+        "Timestamp of the most recent commit in the repo.",
+        False,
+        "timestamp",
+    ),
+    (
+        "mirrorInfo.updatedAt",
+        lambda r: get_path(r, "mirrorInfo.updatedAt"),
+        "Timestamp of the most recent successful sync of the repo from the code host.",
+        False,
+        "timestamp",
+    ),
+    (
+        "mirrorInfo.secondsSinceUpdatedAt",
+        lambda r: seconds_relative_to_now(
+            get_path(r, "mirrorInfo.updatedAt"),
+            future=False,
+        ),
+        "Integer seconds elapsed between `mirrorInfo.updatedAt` and the "
+        "moment the script extracted this row (UTC). Computed locally. "
+        "Negative when the upstream timestamp is in the future relative "
+        "to this machine's clock; empty when `mirrorInfo.updatedAt` is "
+        "empty or unparseable.",
+        False,
+        "integer",
+    ),
+    (
+        "mirrorInfo.nextSyncAt",
+        lambda r: get_path(r, "mirrorInfo.nextSyncAt"),
+        "Timestamp the repo is next scheduled to be synced from upstream.",
+        False,
+        "timestamp",
+    ),
+    (
+        "mirrorInfo.secondsUntilNextSyncAt",
+        lambda r: seconds_relative_to_now(
+            get_path(r, "mirrorInfo.nextSyncAt"),
+            future=True,
+        ),
+        "Integer seconds remaining until `mirrorInfo.nextSyncAt`, computed "
+        "locally against the script's wall clock (UTC). Negative when the "
+        "scheduled sync time has already passed (gitserver is overdue or "
+        "the repo is mid-sync); empty when `mirrorInfo.nextSyncAt` is "
+        "empty or unparseable.",
+        False,
+        "integer",
+    ),
     (
         "mirrorInfo.updateSchedule.intervalSeconds",
         lambda r: get_path(r, "mirrorInfo.updateSchedule.intervalSeconds"),
+        "Interval, in seconds, between scheduled mirror updates. Default max is 28800 seconds (8 hours), but is shortened for busy / popular repos.",
+        False,
+        "integer",
     ),
-    ("mirrorInfo.shard", lambda r: get_path(r, "mirrorInfo.shard")),
-    ("textSearchIndex.status", derive_index_status),
+    (
+        "mirrorInfo.shard",
+        lambda r: get_path(r, "mirrorInfo.shard"),
+        "Pod name of the gitserver shard which holds this repo's clone.",
+        True,
+        "string",
+    ),
+    (
+        "textSearchIndex.status",
+        derive_index_status,
+        "Search-index state, derived locally: "
+        "`indexed` if Zoekt has built an index for this repo, "
+        "`not_indexed` otherwise.",
+        False,
+        "enum (indexed, not_indexed)",
+    ),
     (
         "textSearchIndex.status.updatedAt",
         lambda r: get_path(r, "textSearchIndex.status.updatedAt"),
-    ),
-    (
-        "textSearchIndex.status.contentByteSize(MB)",
-        lambda r: get_path_mb(r, "textSearchIndex.status.contentByteSize"),
+        "Timestamp the repo was last indexed for fast search. It should be shortly after mirrorInfo.lastChanged, as indexing jobs are scheduled after new commits are fetched.",
+        False,
+        "timestamp",
     ),
     (
         "textSearchIndex.status.contentFilesCount",
         lambda r: get_path(r, "textSearchIndex.status.contentFilesCount"),
+        "Number of files included in the index. Note that some files are excluded from indexing, ex. binary files.",
+        False,
+        "integer",
+    ),
+    (
+        "textSearchIndex.status.contentByteSize(MB)",
+        lambda r: get_path_mb(r, "textSearchIndex.status.contentByteSize"),
+        "Size, in megabytes, of the source content that was indexed. Note that some files are excluded from indexing, ex. binary files.",
+        False,
+        "float",
     ),
     (
         "textSearchIndex.status.indexByteSize(MB)",
         lambda r: get_path_mb(r, "textSearchIndex.status.indexByteSize"),
+        "Size of the Zoekt search index for this repo, in megabytes.",
+        False,
+        "float",
     ),
     (
         "textSearchIndex.status.indexShardsCount",
         lambda r: get_path(r, "textSearchIndex.status.indexShardsCount"),
+        "Number of Zoekt shards that make up this repo's index.",
+        False,
+        "integer",
     ),
     (
         "textSearchIndex.status.newLinesCount",
         lambda r: get_path(r, "textSearchIndex.status.newLinesCount"),
+        "Total number of lines across every indexed branch.",
+        False,
+        "integer",
     ),
     (
         "textSearchIndex.status.defaultBranchNewLinesCount",
         lambda r: get_path(r, "textSearchIndex.status.defaultBranchNewLinesCount"),
+        "Number of lines indexed on the repo's default branch.",
+        False,
+        "integer",
     ),
     (
         "textSearchIndex.status.otherBranchesNewLinesCount",
         lambda r: get_path(r, "textSearchIndex.status.otherBranchesNewLinesCount"),
+        "Number of lines indexed across non-default branches.",
+        False,
+        "integer",
     ),
-    ("textSearchIndex.host.name", lambda r: get_path(r, "textSearchIndex.host.name")),
+    (
+        "textSearchIndex.host.name",
+        lambda r: get_path(r, "textSearchIndex.host.name"),
+        "Pod name of the indexserver shard which holds this repo's index.",
+        False,
+        "string",
+    ),
 ]
 
-CSV_COLUMNS = [name for name, _ in COLUMNS]
+CSV_COLUMNS = [name for name, _, _, _, _ in COLUMNS]
 URL_COLUMN_INDEX = CSV_COLUMNS.index("url")
 
+# Repo-cleanup ("optimization") columns piggybacked on the same per-repo
+# GraphQL request the commit-count flow already makes. Each entry is
+# (csv_column_name, extractor_function); the extractor receives the
+# `repository` object returned by COMMIT_COUNT_QUERY (NOT the bulk-listing
+# repo node), so it can read the mirrorInfo/repositoryStatistics fields
+# requested in that query. Kept separate from COLUMNS so the default CSV
+# format is unchanged for users who don't pass --count-commits.
+#
+# The schema does NOT expose before/after snapshots of an optimization job,
+# so we surface only what is queryable: when each repo was last cleaned, the
+# next scheduled cleanup time / interval, the repo's current cleanup-queue
+# position and whether it is being optimized right now, and (when allowed)
+# the most recent full-repack timestamp from packfile stats.
+#
+# repositoryStatistics is admin-only and returns null for non-cloned repos
+# or non-admin tokens — get_path() returns None in that case, which writes
+# an empty cell.
+COMMIT_COUNT_OPTIMIZATION_COLUMNS: list[
+    tuple[str, Callable[[dict[str, Any]], Any], str, bool, str]
+] = [
+    (
+        "mirrorInfo.lastCleanedAt",
+        lambda r: get_path(r, "mirrorInfo.lastCleanedAt"),
+        "Timestamp of the last successful gitserver cleanup ('gc') of this repo.",
+        False,
+        "timestamp",
+    ),
+    (
+        "mirrorInfo.cleanupSchedule.due",
+        lambda r: get_path(r, "mirrorInfo.cleanupSchedule.due"),
+        "Timestamp the repo is next scheduled to be cleaned up by gitserver.",
+        False,
+        "timestamp",
+    ),
+    (
+        "mirrorInfo.cleanupSchedule.intervalSeconds",
+        lambda r: get_path(r, "mirrorInfo.cleanupSchedule.intervalSeconds"),
+        "Interval, in seconds, between scheduled cleanup runs.",
+        False,
+        "integer",
+    ),
+    (
+        "mirrorInfo.cleanupQueue.index",
+        lambda r: get_path(r, "mirrorInfo.cleanupQueue.index"),
+        "Position of the repo in the gitserver cleanup queue. "
+        "Currently-optimizing repos are pushed to the end of the queue, "
+        "so prefer reading this column together with `cleanupQueue."
+        "optimizing`.",
+        False,
+        "integer",
+    ),
+    (
+        "mirrorInfo.cleanupQueue.optimizing",
+        lambda r: get_path(r, "mirrorInfo.cleanupQueue.optimizing"),
+        "Whether gitserver is currently running optimization on this repo.",
+        False,
+        "boolean",
+    ),
+    (
+        "mirrorInfo.repositoryStatistics.packfiles.lastFullRepack",
+        lambda r: get_path(
+            r,
+            "mirrorInfo.repositoryStatistics.packfiles.lastFullRepack",
+        ),
+        "Timestamp of the most recent full repack of this repo's packfiles.",
+        True,
+        "timestamp",
+    ),
+]
+
+# Optional columns appended to every CSV (main, cloning-errors, indexing-errors,
+# skipped-files) when --count-commits is set. Kept separate from COLUMNS so the
+# default CSV format is unchanged for users who don't pass the flag.
+#
+# The second column (queryTimeSeconds) is the wall-clock time taken by the
+# per-repo COMMIT_COUNT_QUERY GraphQL request, so users can spot which repos
+# are expensive to count on the Sourcegraph instance. Subsequent columns are
+# the optimization metadata fetched in the same request.
+#
+# Each entry is (csv_column_name, description). No extractor is needed because
+# these values are appended in append_commit_count() from already-fetched
+# scalars rather than re-derived from a repo dict.
+COMMIT_COUNT_COLUMNS: list[tuple[str, str, bool, str]] = [
+    (
+        "defaultBranch.target.commit.ancestors.totalCount",
+        "Number of commits reachable from HEAD on the default branch — "
+        "equivalent to `git rev-list --count HEAD`. Computed by gitserver, "
+        "so the value is exact.",
+        False,
+        "integer",
+    ),
+    # Side-by-side with the default-branch count for easy visual comparison.
+    # See ALL_REFS_COMMIT_SEARCH_TEMPLATE for the methodology and caveats.
+    (
+        "allRefs.search.matchCount",
+        "Approximate number of commits across every branch and tag, "
+        "computed via Sourcegraph's commit-search API. **Not directly "
+        "comparable** to the default-branch count above — see "
+        "`--count-commits --help` for the methodology and caveats "
+        "(server-side `timeout:` may truncate the result).",
+        False,
+        "integer",
+    ),
+    (
+        "commitCount.queryTimeSeconds",
+        "Wall-clock seconds the per-repo commit-count GraphQL request "
+        "took. Useful for spotting which repos are expensive to count.",
+        False,
+        "float",
+    ),
+    *(
+        (name, desc, admin, vtype)
+        for name, _, desc, admin, vtype in COMMIT_COUNT_OPTIMIZATION_COLUMNS
+    ),
+]
+
+# Optional columns appended to every CSV (main, cloning-errors, indexing-errors,
+# skipped-files) when --run-search is set. Placed AFTER COMMIT_COUNT_COLUMNS so
+# the existing column ordering for --count-commits is preserved when both flags
+# are used together.
+#
+# `runSearch.matchCount` is the API's matchCount; `runSearch.limitHit` reports
+# whether the SG search engine truncated results (so the matchCount is a floor
+# rather than a true total); `runSearch.alertTitle` is non-empty when the
+# server-side `timeout:` budget was exceeded or the query was malformed.
+#
+# Each entry is (csv_column_name, description); see COMMIT_COUNT_COLUMNS for
+# why no extractor is bundled.
+RUN_SEARCH_COLUMNS: list[tuple[str, str, bool, str]] = [
+    (
+        "runSearch.matchCount",
+        "Number of search matches the Sourcegraph search API reported "
+        "for the user-supplied `--run-search` pattern, scoped to this "
+        "single repo.",
+        False,
+        "integer",
+    ),
+    (
+        "runSearch.queryTimeSeconds",
+        "Wall-clock seconds the per-repo `--run-search` GraphQL request took.",
+        False,
+        "float",
+    ),
+    (
+        "runSearch.limitHit",
+        "`True` when the search engine truncated results before reaching "
+        "the natural end (so `runSearch.matchCount` is a floor, not the "
+        "actual total).",
+        False,
+        "boolean",
+    ),
+    (
+        "runSearch.alertTitle",
+        "Title of the search-API alert when the server's `timeout:` "
+        "budget was exceeded or the query was malformed; empty cell "
+        "otherwise.",
+        False,
+        "string",
+    ),
+]
+
 # Extra columns appended only to the cloning-errors CSV.
-CLONING_ERROR_EXTRA_COLUMNS: list[tuple[str, Callable[[dict[str, Any]], Any]]] = [
-    ("mirrorInfo.isCorrupted", lambda r: get_path(r, "mirrorInfo.isCorrupted")),
-    ("mirrorInfo.lastError", lambda r: get_path(r, "mirrorInfo.lastError")),
-    ("mirrorInfo.lastSyncOutput", truncate_sync_output),
-    ("mirrorInfo.corruptionLogs", join_corruption_logs),
+CLONING_ERROR_EXTRA_COLUMNS: list[
+    tuple[str, Callable[[dict[str, Any]], Any], str, bool, str]
+] = [
+    (
+        "mirrorInfo.isCorrupted",
+        lambda r: get_path(r, "mirrorInfo.isCorrupted"),
+        "Whether Sourcegraph has detected the on-disk clone is corrupted.",
+        False,
+        "boolean",
+    ),
+    (
+        "mirrorInfo.lastError",
+        lambda r: get_path(r, "mirrorInfo.lastError"),
+        "Last error message returned by gitserver while fetching or "
+        "cloning this repo, if any.",
+        False,
+        "string",
+    ),
+    (
+        "mirrorInfo.lastSyncOutput",
+        truncate_sync_output,
+        "Output of the most recent sync attempt. The script truncates to "
+        "the first 5 + last 5 lines (with `... [N lines truncated] ...` "
+        "between them) when the output is more than 10 lines.",
+        False,
+        "string",
+    ),
+    (
+        "mirrorInfo.corruptionLogs",
+        join_corruption_logs,
+        "`timestamp: reason` entries for the most recent corruption events. "
+        "The server caps the log at 10 entries, ordered newest-first.",
+        False,
+        "string (semicolon-joined)",
+    ),
 ]
 CLONING_ERROR_CSV_COLUMNS = CSV_COLUMNS + [
-    name for name, _ in CLONING_ERROR_EXTRA_COLUMNS
+    name for name, _, _, _, _ in CLONING_ERROR_EXTRA_COLUMNS
 ]
 # The indexing-errors CSV reuses CSV_COLUMNS verbatim — Sourcegraph's GraphQL
 # does not expose any per-repo zoekt error fields beyond textSearchIndex.status.
@@ -469,14 +1181,185 @@ CLONING_ERROR_CSV_COLUMNS = CSV_COLUMNS + [
 # Sourcegraph search query produced by the API; running it lists each skipped
 # file along with its NOT-INDEXED reason (too-large / binary / too-many-trigrams
 # / too-small / blob-missing).
-SKIPPED_FILES_EXTRA_COLUMNS: list[tuple[str, Callable[[dict[str, Any]], Any]]] = [
-    ("skippedIndexed.totalCount", total_skipped_files),
-    ("skippedIndexed.refsWithSkips", refs_with_skips),
-    ("skippedIndexed.headQuery", head_skipped_query),
+SKIPPED_FILES_EXTRA_COLUMNS: list[
+    tuple[str, Callable[[dict[str, Any]], Any], str, bool, str]
+] = [
+    (
+        "skippedIndexed.totalCount",
+        total_skipped_files,
+        "Sum of `skippedIndexed.count` across every indexed ref of this "
+        "repo — i.e. how many files Zoekt excluded while indexing.",
+        False,
+        "integer",
+    ),
+    (
+        "skippedIndexed.refsWithSkips",
+        refs_with_skips,
+        "`<refName>=<count>` entries for every indexed ref which "
+        "has at least one excluded file.",
+        False,
+        "string (semicolon-joined)",
+    ),
+    (
+        "skippedIndexed.headQuery",
+        head_skipped_query,
+        "Sourcegraph search query that lists every excluded file on HEAD "
+        "(or the first ref with skips, when HEAD has none). This search "
+        "is run when the script is run with the --skipped-files-reason arg, and the"
+        "NOT-INDEXED reasons are recorded (too-large, binary, too-many-trigrams, "
+        "too-small, blob-missing).",
+        False,
+        "string",
+    ),
 ]
 SKIPPED_FILES_CSV_COLUMNS = CSV_COLUMNS + [
-    name for name, _ in SKIPPED_FILES_EXTRA_COLUMNS
+    name for name, _, _, _, _ in SKIPPED_FILES_EXTRA_COLUMNS
 ]
+
+
+# --- README generation --------------------------------------------------------
+
+# Column descriptions are colocated with each column tuple above (third
+# element of each tuple, except for the no-extractor COMMIT_COUNT_COLUMNS /
+# RUN_SEARCH_COLUMNS lists which use 2-tuples of (name, description)).
+# Pulling descriptions from the same tuple that defines the column NAME
+# eliminates the possibility of drift: a column added without a description
+# is a static type error / unpacking error rather than a "(no description)"
+# placeholder slipping into README.md.
+
+
+def format_columns_list(columns: list[tuple[str, str, bool, str]]) -> str:
+    """Render a `[(name, description, requires_admin, value_type), ...]` list
+    as a Markdown table with one row per column.
+
+    Columns: `Column` | `Type` | `Requires admin` | `Description`. The
+    `Requires admin` cell is `true` for site-admin-only columns and empty
+    otherwise, so a reader scanning the table can immediately spot the
+    columns that will be blank for non-admin tokens; the README header
+    explains the convention once at the top.
+
+    Markdown tables can't have line breaks within a row, so individual
+    rows will easily exceed Markdownlint's MD013 line-length limit. The
+    project's `.markdownlint.json` scopes MD013 to non-table content
+    (`tables: false`), which is the rule's documented way to handle
+    tables — MD013 still checks every prose line in every Markdown file.
+    """
+    rows = [
+        table_row("Column", "Type", "Requires admin", "Description"),
+        table_row("---", "---", "---", "---"),
+    ]
+    for name, desc, requires_admin, value_type in columns:
+        admin_cell = "true" if requires_admin else ""
+        # Defensive: escape pipes so a description never breaks the table.
+        desc_cell = desc.replace("|", "\\|")
+        rows.append(table_row(f"`{name}`", value_type, admin_cell, desc_cell))
+    return "\n".join(rows)
+
+
+def table_row(*cells: str) -> str:
+    """Format a Markdown table row, using `| |` for empty cells.
+
+    Markdownlint's MD060 'compact' style flags `|  |` (two spaces around an
+    empty cell) as having extra spacing, so empty cells need a single space
+    rather than the leading-and-trailing-space we use for non-empty cells.
+    """
+    return "|" + "|".join(f" {c} " if c else " " for c in cells) + "|"
+
+
+def name_desc(
+    columns: list[tuple[str, Callable[[dict[str, Any]], Any], str, bool, str]],
+) -> list[tuple[str, str, bool, str]]:
+    """Project an extractor-bearing column list to (name, description,
+    requires_admin, value_type) tuples.
+
+    Used to feed format_columns_list from the COLUMNS / CLONING_*EXTRA /
+    SKIPPED_*EXTRA / COMMIT_COUNT_OPTIMIZATION_COLUMNS lists, all of which
+    carry an extractor in the second slot.
+    """
+    return [
+        (name, desc, requires_admin, value_type)
+        for name, _, desc, requires_admin, value_type in columns
+    ]
+
+
+def write_readme(path: Path) -> None:
+    """Write a README.md describing every CSV file the script can produce.
+
+    Each list is built directly from the column tuples defined above, so
+    the (name, description) pairs in the README cannot drift from the
+    columns the script actually emits — both are projections of the same
+    source-of-truth tuples.
+    """
+    main_list = format_columns_list(name_desc(COLUMNS))
+    cloning_list = format_columns_list(name_desc(CLONING_ERROR_EXTRA_COLUMNS))
+    skipped_list = format_columns_list(name_desc(SKIPPED_FILES_EXTRA_COLUMNS))
+    commit_count_list = format_columns_list(COMMIT_COUNT_COLUMNS)
+    run_search_list = format_columns_list(RUN_SEARCH_COLUMNS)
+
+    content = f"""# `list-repos.py` CSV column reference
+
+This file is generated by `python3 list-repos.py` on every run. It
+documents every column the script can emit across each of its output
+CSV files. Column descriptions are derived from the Sourcegraph
+GraphQL schema (`schema.graphql`) but rewritten for human readers —
+units, admin-only fields, and locally-derived columns are called out
+explicitly.
+
+Columns where `Requires admin` is `true` are from GraphQL fields
+which require an access token from a site admin user on the
+instance. When you run the script with an access token from a
+non-admin user, these columns will be empty. Every other column is
+populated for any authenticated user with read access to the
+repository.
+
+## Output files
+
+The script prefixes output file names with the sanitized
+Sourcegraph endpoint (e.g. `sourcegraph.example.com-repos.csv`),
+so the script can run against multiple instances without overwriting files.
+
+| File | Written when | Columns |
+| --- | --- | --- |
+| `<prefix>-{DEFAULT_OUTPUT_FILE}` | always | main columns |
+| `<prefix>-{DEFAULT_CLONING_ERRORS_FILE}` | at least one repo has a cloning error | main columns + cloning-error extras |
+| `<prefix>-{DEFAULT_INDEXING_ERRORS_FILE}` | at least one repo is cloned but is missing a search index | main columns |
+| `<prefix>-{DEFAULT_SKIPPED_FILES_FILE}` | `--skipped-files` is set and the last index excluded some files | main columns + skipped-files extras |
+
+The optional `--count-commits` and `--run-search` flags append extra
+columns to *every* CSV listed above, in this order: main columns →
+per-CSV extras → commit-count columns → run-search columns.
+
+## Main columns
+
+These are written to every CSV file.
+
+{main_list}
+
+## Cloning-error extras
+
+Appended only to `<prefix>-{DEFAULT_CLONING_ERRORS_FILE}`.
+
+{cloning_list}
+
+## Skipped-files extras
+
+Appended only to `<prefix>-{DEFAULT_SKIPPED_FILES_FILE}`.
+
+{skipped_list}
+
+## `--count-commits` columns
+
+Appended to every CSV when `--count-commits` is passed.
+
+{commit_count_list}
+
+## `--run-search` columns
+
+Appended to every CSV when `--run-search PATTERN` is passed.
+
+{run_search_list}
+"""
+    path.write_text(content, encoding="utf-8")
 
 
 # --- HTTP / GraphQL plumbing --------------------------------------------------
@@ -506,7 +1389,10 @@ class HTTPRequestError(RuntimeError):
         self.body = body
 
 
-def open_connection(parsed: ParseResult) -> http.client.HTTPConnection:
+def open_connection(
+    parsed: ParseResult,
+    timeout: int = REQUEST_TIMEOUT_SECONDS,
+) -> http.client.HTTPConnection:
     """Open an HTTP(S) connection, rejecting any scheme other than http/https.
 
     We use http.client directly (rather than urllib.request) so that the set
@@ -520,13 +1406,13 @@ def open_connection(parsed: ParseResult) -> http.client.HTTPConnection:
         return http.client.HTTPSConnection(
             parsed.hostname,
             parsed.port,
-            timeout=REQUEST_TIMEOUT_SECONDS,
+            timeout=timeout,
         )
     if parsed.scheme == "http":
         return http.client.HTTPConnection(
             parsed.hostname,
             parsed.port,
-            timeout=REQUEST_TIMEOUT_SECONDS,
+            timeout=timeout,
         )
     msg = f"Unsupported URL scheme: {parsed.scheme!r} (expected http or https)"
     raise ValueError(msg)
@@ -536,13 +1422,14 @@ def send_once(
     url: str,
     body: bytes,
     headers: dict[str, str],
+    timeout: int = REQUEST_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     """Send one POST. Returns parsed JSON on 2xx, raises HTTPRequestError on 4xx/5xx."""
     parsed = urlparse(url)
     path = parsed.path or "/"
     if parsed.query:
         path = f"{path}?{parsed.query}"
-    conn = open_connection(parsed)
+    conn = open_connection(parsed, timeout=timeout)
     try:
         conn.request("POST", path, body=body, headers=headers)
         resp = conn.getresponse()
@@ -564,6 +1451,7 @@ def send_or_capture_oserror(
     url: str,
     body: bytes,
     headers: dict[str, str],
+    timeout: int = REQUEST_TIMEOUT_SECONDS,
 ) -> dict[str, Any] | OSError:
     """Send once. Re-raises HTTPRequestError; returns OSError instances for retry.
 
@@ -571,7 +1459,7 @@ def send_or_capture_oserror(
     avoids the per-iteration exception-handler setup cost.
     """
     try:
-        return send_once(url, body, headers)
+        return send_once(url, body, headers, timeout=timeout)
     except OSError as exc:
         return exc
 
@@ -580,6 +1468,7 @@ def send_with_retry(
     url: str,
     body: bytes,
     headers: dict[str, str],
+    timeout: int = REQUEST_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     """Execute an HTTP request, retrying transient network errors only.
 
@@ -588,7 +1477,7 @@ def send_with_retry(
     cases (DNS failure, connection refused, timeout, etc.) get retried.
     """
     for attempt in range(1, MAX_RETRIES + 1):
-        result = send_or_capture_oserror(url, body, headers)
+        result = send_or_capture_oserror(url, body, headers, timeout=timeout)
         if not isinstance(result, OSError):
             return result
         if attempt == MAX_RETRIES:
@@ -610,6 +1499,7 @@ def graphql_request(
     token: str,
     query: str,
     variables: dict[str, Any],
+    timeout: int = REQUEST_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     """Send a GraphQL query to the Sourcegraph API and return the data block."""
     url = endpoint.rstrip("/") + "/.api/graphql"
@@ -619,7 +1509,7 @@ def graphql_request(
         "Content-Type": "application/json",
         "User-Agent": "list-repos/0.0.1",
     }
-    data = send_with_retry(url, body, headers)
+    data = send_with_retry(url, body, headers, timeout=timeout)
     if data.get("errors"):
         # GraphQL can return both `errors` and partial `data`. If we have data,
         # log the errors and keep going; only abort if no data was returned.
@@ -635,15 +1525,54 @@ def graphql_request(
     return data["data"]
 
 
-def fetch_current_username(endpoint: str, token: str) -> str:
-    """Return the username of the authenticated user.
+def fetch_current_user(endpoint: str, token: str) -> tuple[str, bool]:
+    """Return (username, is_site_admin) for the authenticated user.
 
     All GraphQL queries used by this script require authentication, so an
     invalid/anonymous token is rejected by validate_token (or by the server
     via HTTPRequestError) before this is ever called.
+
+    `is_site_admin` is used to (a) drop the admin-only
+    Repository.externalServices selection from the listing/single-repo
+    queries via the $includeExternalServices @include directive, and
+    (b) refuse --reclone / --reindex up front rather than letting the
+    server return a "must be site admin" mutation error mid-run.
     """
     data = graphql_request(endpoint, token, CURRENT_USER_QUERY, {})
-    return str(data["currentUser"]["username"])
+    user: dict[str, Any] = data["currentUser"] or {}
+    return str(user["username"]), bool(user.get("siteAdmin"))
+
+
+def fetch_single_repo(
+    endpoint: str,
+    token: str,
+    repo_name: str,
+    *,
+    is_site_admin: bool,
+) -> dict[str, Any]:
+    """Return a single repo node in the same shape as the listing query.
+
+    Used by the scoped (`--count-commits REPO[@REV]`, `--reclone REPO[@REV]`,
+    `--reindex REPO[@REV]`) modes so the rest of the pipeline (build_row,
+    write_csv, has_cloning_error, etc.) can treat the result identically to
+    a node from the all-repos listing.
+
+    `is_site_admin` is passed through as the `$includeExternalServices`
+    GraphQL variable so non-admin tokens skip the admin-only externalServices
+    field instead of triggering a "must be site admin" error.
+
+    Exits via die() when the repository name is unknown to the instance.
+    """
+    data = graphql_request(
+        endpoint,
+        token,
+        SINGLE_REPO_QUERY,
+        {"name": repo_name, "includeExternalServices": is_site_admin},
+    )
+    repo = data.get("repository")
+    if repo is None:
+        die(f"repository {repo_name!r} not found on {endpoint}")
+    return cast("dict[str, Any]", repo)
 
 
 def trigger_reclone(endpoint: str, token: str, repo_id: str) -> bool:
@@ -820,21 +1749,26 @@ def fetch_skipped_file_matches(
 ) -> list[dict[str, Any]]:
     """Run the SkippedFileReasons search query and return non-empty FileMatch results.
 
-    The repo filter is built as `r:^<escaped-name>$@<rev>` so that:
+    The repo filter is built as `r:^<escaped-name>$` (no `@<rev>`) so that:
       - the regex is anchored on both ends (a bare prefix like
         "github.com/org/repo" no longer also matches
         "github.com/org/repo-fork" or "github.com/org/repository").
       - dots and other regex specials in the name are escaped (otherwise
         "github.com/foo/bar" would match "githubXcom/foo/bar").
-      - the resolved rev is sent explicitly so the search runs against the
-        same revision shown in the output filenames and file URLs (rather
-        than relying on the server's HEAD pointer, which could shift between
-        the verify_repo_rev call and this query).
+      - the rev is *not* pinned. Zoekt only surfaces the synthetic
+        `^NOT-INDEXED: <reason>` rows when the query targets its `@HEAD`
+        virtual ref. Pinning to the resolved branch name (e.g. `@main`)
+        silently returns zero results even when `main` is the indexed
+        default branch. `verify_repo_rev` already validated that the user's
+        rev resolves to the indexed default-ref commit, so omitting the
+        rev pin yields the same skipped-file set the user asked about.
     """
+    _ = rev  # kept for caller symmetry; see docstring for why it isn't used.
     repo_filter = f"^{re.escape(name)}$"
-    if rev and rev != "HEAD":
-        repo_filter += f"@{rev}"
-    search_query = f"r:{repo_filter} type:file index:only patternType:regexp count:all ^NOT-INDEXED:"
+    search_query = (
+        f"r:{repo_filter} type:file index:only "
+        f"patternType:regexp count:all ^NOT-INDEXED:"
+    )
     data = graphql_request(
         endpoint,
         token,
@@ -886,36 +1820,34 @@ def write_skipped_files_reason(
     # removing, or reordering a column here updates both at once.
     # Path.suffix returns ".ext" (or "" for no extension or for dotfiles like
     # ".env"); we strip the leading dot to display "go" rather than ".go".
+    def chunk_matches_content(m: dict[str, Any]) -> str:
+        chunks: list[dict[str, Any]] = m.get("chunkMatches") or []
+        return "\n".join(str(c.get("content") or "") for c in chunks)
+
+    def match_file_byte_size(m: dict[str, Any]) -> int | str:
+        file_obj: dict[str, Any] = m.get("file") or {}
+        bs = file_obj.get("byteSize")
+        return int(bs) if bs is not None else ""
+
+    def match_file_extension(m: dict[str, Any]) -> str:
+        file_obj: dict[str, Any] = m.get("file") or {}
+        return Path(str(file_obj.get("path") or "")).suffix.lstrip(".")
+
+    def match_file_url(m: dict[str, Any]) -> str:
+        repo_obj: dict[str, Any] = m.get("repository") or {}
+        file_obj: dict[str, Any] = m.get("file") or {}
+        return file_url(
+            endpoint,
+            str(repo_obj.get("name") or ""),
+            rev,
+            str(file_obj.get("path") or ""),
+        )
+
     file_columns: list[tuple[str, Callable[[dict[str, Any]], Any]]] = [
-        (
-            "chunkMatches.content",
-            lambda m: "\n".join(
-                str(c.get("content") or "") for c in (m.get("chunkMatches") or [])
-            ),
-        ),
-        (
-            "file.byteSize",
-            lambda m: (
-                int(bs)
-                if (bs := (m.get("file") or {}).get("byteSize")) is not None
-                else ""
-            ),
-        ),
-        (
-            "file.extension",
-            lambda m: Path(
-                str((m.get("file") or {}).get("path") or ""),
-            ).suffix.lstrip("."),
-        ),
-        (
-            "file_url",
-            lambda m: file_url(
-                endpoint,
-                str((m.get("repository") or {}).get("name") or ""),
-                rev,
-                str((m.get("file") or {}).get("path") or ""),
-            ),
-        ),
+        ("chunkMatches.content", chunk_matches_content),
+        ("file.byteSize", match_file_byte_size),
+        ("file.extension", match_file_extension),
+        ("file_url", match_file_url),
     ]
     stats_columns: list[tuple[str, Callable[[tuple[str, int]], Any]]] = [
         ("reason", lambda r: r[0]),
@@ -928,7 +1860,8 @@ def write_skipped_files_reason(
     rows: list[list[Any]] = []
     for match in matches:
         rows.append([extract(match) for _, extract in file_columns])
-        for chunk in match.get("chunkMatches") or []:
+        chunks: list[dict[str, Any]] = match.get("chunkMatches") or []
+        for chunk in chunks:
             reason_match = re.search(
                 r"NOT-INDEXED:\s*(.+)",
                 str(chunk.get("content") or ""),
@@ -1008,13 +1941,39 @@ def fetch_repos(
     endpoint: str,
     token: str,
     max_repos: int | None = None,
-) -> Iterator[dict[str, Any]]:
-    """Yield repository nodes by paginating through the GraphQL API.
+    *,
+    scope_repo: str | None = None,
+    is_site_admin: bool,
+) -> Iterator[tuple[int, int, dict[str, Any]]]:
+    """Yield (index, target, repo) tuples by paginating through the GraphQL API.
+
+    `index` is the 1-based position of `repo` in the run; `target` is the
+    total number of repos in scope (min(max_repos, totalCount) when --limit
+    is set, else totalCount). Both are surfaced so per-repo log lines (e.g.
+    the --count-commits commit-count messages) can show "[N/Total]" without
+    the caller having to re-derive the target.
 
     Logs "Fetching X of Y total repositories..." once, after the first page
     returns its totalCount, so the user sees the target before per-page
     progress lines start. Avoids a separate count-only round-trip.
+
+    When `scope_repo` is set (single-repo mode used by the scoped variants
+    of --count-commits / --reclone / --reindex), only that one repository is
+    fetched (via fetch_single_repo) and yielded as a one-element iterator.
+    `max_repos` is ignored in that case because the result is always one
+    repo.
     """
+    if scope_repo is not None:
+        repo = fetch_single_repo(
+            endpoint,
+            token,
+            scope_repo,
+            is_site_admin=is_site_admin,
+        )
+        logger.info("Scope: single repository %s", scope_repo)
+        yield 1, 1, repo
+        logger.info("Fetched 1/1 repositories...")
+        return
     cursor: str | None = None
     total_fetched = 0
     first_page = True
@@ -1026,7 +1985,11 @@ def fetch_repos(
             endpoint,
             token,
             GRAPHQL_QUERY,
-            {"first": page_size, "after": cursor},
+            {
+                "first": page_size,
+                "after": cursor,
+                "includeExternalServices": is_site_admin,
+            },
         )
         connection = data["repositories"]
         total_count = connection["totalCount"]
@@ -1039,9 +2002,10 @@ def fetch_repos(
             )
             first_page = False
 
-        yield from connection["nodes"]
+        for repo in connection["nodes"]:
+            total_fetched += 1
+            yield total_fetched, target, repo
 
-        total_fetched += len(connection["nodes"])
         logger.info("Fetched %d/%d repositories...", total_fetched, target)
 
         if not connection["pageInfo"]["hasNextPage"]:
@@ -1056,12 +2020,106 @@ def build_row(repo: dict[str, Any], endpoint: str) -> list[Any]:
 
     The 'url' column is stored relative in GraphQL (e.g. '/github.com/foo/bar');
     we rewrite it to an absolute URL here so the CSV is directly clickable.
+
+    The commit-count column is intentionally NOT added here — callers append
+    it after any per-CSV extra columns so it always lands in the rightmost
+    position, matching the header produced by csv_columns_for().
     """
     base = endpoint.rstrip("/")
-    row = [extract(repo) for _, extract in COLUMNS]
+    row = [extract(repo) for _, extract, _, _, _ in COLUMNS]
     if row[URL_COLUMN_INDEX]:
         row[URL_COLUMN_INDEX] = base + row[URL_COLUMN_INDEX]
     return row
+
+
+def append_commit_count(
+    row: list[Any],
+    commit_count: int | None,
+    all_refs_count: int | None,
+    elapsed_seconds: float | None,
+    optimization_values: list[Any] | None = None,
+    *,
+    count_commits: bool,
+) -> list[Any]:
+    """Append commit-count fields to row when count_commits is True.
+
+    Order matches COMMIT_COUNT_COLUMNS:
+      1. commit_count        (defaultBranch.target.commit.ancestors.totalCount)
+      2. all_refs_count      (allRefs.search.matchCount)
+      3. elapsed_seconds     (commitCount.queryTimeSeconds)
+      4. *optimization_values (mirrorInfo.* cleanup/repack metadata)
+
+    elapsed_seconds is rendered to 3 decimal places (millisecond resolution)
+    when present so spreadsheets sort it numerically; None becomes an empty
+    cell — matching csv.writer's default formatting for None.
+
+    optimization_values must be aligned with COMMIT_COUNT_OPTIMIZATION_COLUMNS.
+    Pass None when the per-repo query was skipped (e.g. for a row built
+    before fetch_commit_count was attempted) to fill the columns with empty
+    cells, keeping every row the same width.
+    """
+    if not count_commits:
+        return row
+    elapsed_cell: str | None = (
+        f"{elapsed_seconds:.3f}" if elapsed_seconds is not None else None
+    )
+    extras = (
+        optimization_values
+        if optimization_values is not None
+        else [None] * len(COMMIT_COUNT_OPTIMIZATION_COLUMNS)
+    )
+    return [*row, commit_count, all_refs_count, elapsed_cell, *extras]
+
+
+def append_run_search(
+    row: list[Any],
+    match_count: int | None,
+    elapsed_seconds: float | None,
+    limit_hit: bool,
+    alert_title: str | None,
+    *,
+    run_search: bool,
+) -> list[Any]:
+    """Append --run-search fields to row when run_search is True.
+
+    Order matches RUN_SEARCH_COLUMNS:
+      1. match_count        (runSearch.matchCount)
+      2. elapsed_seconds    (runSearch.queryTimeSeconds, 3-decimal seconds)
+      3. limit_hit          (runSearch.limitHit, written as the literal True/False)
+      4. alert_title        (runSearch.alertTitle, empty cell when no alert)
+
+    Like append_commit_count, this is a no-op when the flag is off so
+    every row stays the same width regardless of which optional flags
+    were used.
+    """
+    if not run_search:
+        return row
+    elapsed_cell: str | None = (
+        f"{elapsed_seconds:.3f}" if elapsed_seconds is not None else None
+    )
+    return [*row, match_count, elapsed_cell, limit_hit, alert_title]
+
+
+def csv_columns_for(
+    base_columns: list[str],
+    *,
+    count_commits: bool,
+    run_search: bool = False,
+) -> list[str]:
+    """Return the CSV header list with optional column blocks appended.
+
+    Column block order (when both flags are set, matches the order rows
+    are built by append_commit_count() then append_run_search()):
+      1. base_columns       (always)
+      2. COMMIT_COUNT_COLUMNS  (only when count_commits)
+      3. RUN_SEARCH_COLUMNS    (only when run_search)
+    """
+    cols = list(base_columns)
+    if count_commits:
+        cols.extend(name for name, _, _, _ in COMMIT_COUNT_COLUMNS)
+    if run_search:
+        cols.extend(name for name, _, _, _ in RUN_SEARCH_COLUMNS)
+    return cols
 
 
 def write_csv(
@@ -1075,6 +2133,11 @@ def write_csv(
     *,
     reclone: bool = False,
     reindex: bool = False,
+    count_commits: bool = False,
+    scope_repo: str | None = None,
+    count_commits_rev: str = "HEAD",
+    run_search_pattern: str | None = None,
+    is_site_admin: bool,
 ) -> tuple[int, int, int]:
     """Stream repos directly to CSV rather than collecting them first.
 
@@ -1097,31 +2160,176 @@ def write_csv(
 
     Memory stays constant regardless of how many repos are fetched.
 
+    When `scope_repo` is set (single-repo mode triggered by passing a
+    REPO[@REV] argument to --count-commits / --reclone / --reindex), only
+    that one repository is fetched. Reclone/reindex mutations are then
+    applied unconditionally (the user explicitly requested them for that
+    repo), bypassing the has_cloning_error / has_indexing_error guard used
+    in full-repo iteration mode.
+
+    `count_commits_rev` overrides the rev used for the default-branch
+    ancestors count when --count-commits was scoped with REPO@REV; it has
+    no effect on the all-refs search count (which always covers every ref).
+
     Returns (total, reclone_total, reindex_total).
     """
+    run_search_enabled = run_search_pattern is not None
     writer = csv.writer(out)
-    writer.writerow(CSV_COLUMNS)
+    writer.writerow(
+        csv_columns_for(
+            CSV_COLUMNS,
+            count_commits=count_commits,
+            run_search=run_search_enabled,
+        ),
+    )
 
     total = 0
     reclone_total = 0
     reindex_total = 0
-    for repo in fetch_repos(endpoint, token, max_repos):
+    for index, target, repo in fetch_repos(
+        endpoint,
+        token,
+        max_repos,
+        scope_repo=scope_repo,
+        is_site_admin=is_site_admin,
+    ):
         row = build_row(repo, endpoint)
-        writer.writerow(row)
-        total += 1
-        if has_cloning_error(repo):
-            cloning_writer.writerow(
-                row + [extract(repo) for _, extract in CLONING_ERROR_EXTRA_COLUMNS],
+        commit_count: int | None = None
+        all_refs_count: int | None = None
+        elapsed_seconds: float | None = None
+        optimization_values: list[Any] | None = None
+        search_match_count: int | None = None
+        search_elapsed_seconds: float | None = None
+        search_limit_hit = False
+        search_alert_title: str | None = None
+        position = f"[{index}/{target}]"
+        repo_label = repo.get("name") or repo.get("url") or repo.get("id")
+        if count_commits:
+            repo_name = str(repo.get("name") or "")
+            (
+                commit_count,
+                all_refs_count,
+                elapsed_seconds,
+                optimization_values,
+            ) = fetch_commit_count(endpoint, token, repo_name, count_commits_rev)
+            # The "[N/Total]" prefix lets users tail list-repos.log and see how
+            # far through the run we are without scrolling back to the
+            # per-page "Fetched N/Total" line.
+            # Render counts as "?" rather than "None" in the log so the line
+            # stays compact when one or both counts are missing.
+            default_str = "?" if commit_count is None else f"{commit_count}"
+            all_refs_str = "?" if all_refs_count is None else f"{all_refs_count}"
+            if commit_count is None:
+                # Common for empty / not-yet-cloned repos. Log so users
+                # grepping the log can spot which repos returned no count
+                # without it being a noisy WARNING.
+                logger.info(
+                    "%s No commit count for %s (default=%s, allRefs=%s) "
+                    "[query took %.3fs]",
+                    position,
+                    repo_label,
+                    default_str,
+                    all_refs_str,
+                    elapsed_seconds,
+                )
+            else:
+                logger.info(
+                    "%s Commit count for %s: default=%s, allRefs=%s [query took %.3fs]",
+                    position,
+                    repo_label,
+                    default_str,
+                    all_refs_str,
+                    elapsed_seconds,
+                )
+        if run_search_pattern is not None:
+            repo_name = str(repo.get("name") or "")
+            (
+                search_match_count,
+                search_elapsed_seconds,
+                search_limit_hit,
+                search_alert_title,
+            ) = fetch_run_search(endpoint, token, repo_name, run_search_pattern)
+            count_str = "?" if search_match_count is None else f"{search_match_count}"
+            limit_suffix = " (limit hit)" if search_limit_hit else ""
+            alert_suffix = (
+                f" alert={search_alert_title!r}" if search_alert_title else ""
             )
-            if reclone and trigger_reclone(endpoint, token, repo["id"]):
+            logger.info(
+                "%s Search %s in %s: matches=%s%s%s [query took %.3fs]",
+                position,
+                run_search_pattern,
+                repo_label,
+                count_str,
+                limit_suffix,
+                alert_suffix,
+                search_elapsed_seconds,
+            )
+
+        def _augmented(
+            base: list[Any],
+            *,
+            _commit_count: int | None = commit_count,
+            _all_refs_count: int | None = all_refs_count,
+            _elapsed_seconds: float | None = elapsed_seconds,
+            _optimization_values: list[Any] | None = optimization_values,
+            _search_match_count: int | None = search_match_count,
+            _search_elapsed_seconds: float | None = search_elapsed_seconds,
+            _search_limit_hit: bool = search_limit_hit,
+            _search_alert_title: str | None = search_alert_title,
+        ) -> list[Any]:
+            """Apply the optional commit-count and run-search columns in order."""
+            with_commit = append_commit_count(
+                base,
+                _commit_count,
+                _all_refs_count,
+                _elapsed_seconds,
+                _optimization_values,
+                count_commits=count_commits,
+            )
+            return append_run_search(
+                with_commit,
+                _search_match_count,
+                _search_elapsed_seconds,
+                _search_limit_hit,
+                _search_alert_title,
+                run_search=run_search_enabled,
+            )
+
+        writer.writerow(_augmented(row))
+        total += 1
+        repo_has_cloning_error = has_cloning_error(repo)
+        repo_has_indexing_error = has_indexing_error(repo)
+        if repo_has_cloning_error:
+            cloning_writer.writerow(
+                _augmented(
+                    row
+                    + [
+                        extract(repo)
+                        for _, extract, _, _, _ in CLONING_ERROR_EXTRA_COLUMNS
+                    ],
+                ),
+            )
+        # In single-repo (scope_repo) mode the user explicitly asked for
+        # this repo, so trigger the mutation regardless of error state. In
+        # full-repo mode keep the existing "only fix repos with errors"
+        # guard so a blanket --reclone doesn't reclone the whole instance.
+        if reclone and (scope_repo is not None or repo_has_cloning_error):
+            if trigger_reclone(endpoint, token, repo["id"]):
                 reclone_total += 1
-        if has_indexing_error(repo):
-            indexing_writer.writerow(row)
-            if reindex and trigger_reindex(endpoint, token, repo["id"]):
+        if repo_has_indexing_error:
+            indexing_writer.writerow(_augmented(row))
+        if reindex and (scope_repo is not None or repo_has_indexing_error):
+            if trigger_reindex(endpoint, token, repo["id"]):
                 reindex_total += 1
         if skipped_writer is not None and has_skipped_files(repo):
             skipped_writer.writerow(
-                row + [extract(repo) for _, extract in SKIPPED_FILES_EXTRA_COLUMNS],
+                _augmented(
+                    row
+                    + [
+                        extract(repo)
+                        for _, extract, _, _, _ in SKIPPED_FILES_EXTRA_COLUMNS
+                    ],
+                ),
             )
     return (total, reclone_total, reindex_total)
 
@@ -1302,7 +2510,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--skipped-files-reason",
-        metavar="REPO@REV",
+        metavar="REPO[@REV]",
         default=None,
         help=(
             "Write a CSV file listing the files which Zoekt has skipped, and the skip reason, for a specified repo\n"
@@ -1316,16 +2524,119 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--reclone",
-        action="store_true",
+        nargs="?",
+        const=True,
+        default=False,
+        metavar="REPO",
         help=(
-            "Force reclone all repos with a cloning error "
-            "(corrupted, errored, or not cloned)"
+            "Without an argument: force reclone every repo with a cloning error\n"
+            "(corrupted, errored, or not cloned).\n"
+            "\n"
+            "With a REPO argument:\n"
+            "scope the reclone to that single repository, regardless of whether\n"
+            "it is currently in an error state.\n"
+            "Example: --reclone github.com/org/repo"
         ),
     )
     parser.add_argument(
         "--reindex",
-        action="store_true",
-        help=("Force reindex all repos with an indexing error"),
+        nargs="?",
+        const=True,
+        default=False,
+        metavar="REPO",
+        help=(
+            "Without an argument: force reindex every repo with an indexing\n"
+            "error.\n"
+            "\n"
+            "With a REPO argument: scope the reindex to that single\n"
+            "repository, regardless of whether it is currently in an error\n"
+            "state.\n"
+            "Example: --reindex github.com/org/repo"
+        ),
+    )
+    parser.add_argument(
+        "--count-commits",
+        nargs="?",
+        const=True,
+        default=False,
+        metavar="REPO[@REV]",
+        help=(
+            "With a REPO[@REV] argument (same format as --skipped-files-reason):\n"
+            "scope the commit-count GraphQL queries to that single repository.\n"
+            "The optional @REV controls which revision the default-branch\n"
+            "ancestors count is computed from (defaults to HEAD); the all-refs\n"
+            "search count is unaffected by @REV because it always counts across\n"
+            "every branch and tag.\n"
+            "Example: --count-commits github.com/org/repo@develop\n"
+            "\n"
+            "Without an argument: append the following columns to all output\n"
+            "CSVs (one row per repo in the full listing):\n"
+            "  defaultBranch.target.commit.ancestors.totalCount\n"
+            "    Exact git rev-list count of commits reachable from HEAD on\n"
+            "    each repo's default branch (computed by gitserver).\n"
+            "  allRefs.search.matchCount\n"
+            "    Sourcegraph search-API count of commits reachable across all\n"
+            "    branches and tags (refs/heads/* + refs/tags/*). Useful for\n"
+            "    spotting repos whose work happens off the default branch.\n"
+            "    Note: NOT directly comparable to the column above —\n"
+            "    Sourcegraph has no GraphQL field exposing\n"
+            "    `git rev-list --all --count`, and this is the\n"
+            "    closest available proxy. It may differ in absolute value\n"
+            "    because it counts what Sourcegraph's commit search sees.\n"
+            "  commitCount.queryTimeSeconds\n"
+            "    The wall-clock time of the per-repo commit-count GraphQL\n"
+            "    query (which fetches both counts above plus the\n"
+            "    optimization metadata below in a single round-trip).\n"
+            "  mirrorInfo.lastCleanedAt\n"
+            "    When the repo was last successfully cleaned (optimized).\n"
+            "  mirrorInfo.cleanupSchedule.due\n"
+            "    When the repo is next due to be enqueued for cleanup.\n"
+            "  mirrorInfo.cleanupSchedule.intervalSeconds\n"
+            "    Scheduling interval (seconds) used for the next due time.\n"
+            "  mirrorInfo.cleanupQueue.index\n"
+            "    Position of the repo in the cleanup queue (if queued).\n"
+            "  mirrorInfo.cleanupQueue.optimizing\n"
+            "    True if the repo is being optimized right now.\n"
+            "  mirrorInfo.repositoryStatistics.packfiles.lastFullRepack\n"
+            "    Timestamp of the most recent full repack of the repo's\n"
+            "    packfiles (admin-only; empty for non-admin tokens or for\n"
+            "    repos that are not currently cloned).\n"
+            "Each repo gets its own GraphQL request to keep the per-repo timing\n"
+            "accurate; this can be slow on big monorepos, so only enable when\n"
+            "needed. The per-request HTTP timeout is bumped automatically when\n"
+            "this flag is set. The schema does NOT expose before/after stats\n"
+            "from a specific optimization run; only the current/last values\n"
+            "above are available."
+        ),
+    )
+    parser.add_argument(
+        "--run-search",
+        metavar="PATTERN",
+        default=None,
+        help=(
+            "Run an arbitrary Sourcegraph search PATTERN once per repository\n"
+            "and append per-repo result columns to all output CSVs:\n"
+            "  runSearch.matchCount\n"
+            "    Number of matches reported by the search API for the\n"
+            "    pattern, scoped to that repository (count:all).\n"
+            "  runSearch.queryTimeSeconds\n"
+            "    Wall-clock time of the per-repo GraphQL search request.\n"
+            "  runSearch.limitHit\n"
+            "    True when the SG search engine truncated results, meaning\n"
+            "    matchCount is a floor rather than the actual total.\n"
+            "  runSearch.alertTitle\n"
+            "    Non-empty when the server-side timeout: budget was exceeded\n"
+            "    or the query was malformed; the row is still written.\n"
+            "\n"
+            "PATTERN is concatenated verbatim into the search query, so any\n"
+            "Sourcegraph search syntax is the user's responsibility (e.g.\n"
+            "patternType:regexp, lang:go, file:^src/, etc.). The script\n"
+            "wraps it with `r:^REPO$ PATTERN count:all timeout:120s` so it\n"
+            "is scoped to one repo, returns the full match count, and is\n"
+            "bounded server-side so a pathological pattern can't block the\n"
+            "run on a monorepo.\n"
+            "Example: --run-search 'TODO patternType:literal'"
+        ),
     )
     parser.add_argument(
         "--src-endpoint",
@@ -1337,15 +2648,134 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--src-access-token",
         default=None,
         metavar="TOKEN",
-        help=("Sourcegraph access token (must start with 'sgp_')"),
+        help=(
+            "Sourcegraph access token (must start with 'sgp_')"
+            "NOTE: It is highly recommended to use the SRC_ACCESS_TOKEN "
+            "environment variable instead."
+        ),
     )
     return parser.parse_args(argv)
 
 
+def collect_scope(args: argparse.Namespace) -> tuple[str, str] | None:
+    """Determine the single-repo scope from --count-commits / --reclone / --reindex.
+
+    Each of those args is either:
+      - False (flag not given)
+      - True  (flag given without an argument — full-repo iteration)
+      - str   (flag given with REPO[@REV] — scoped to that one repository)
+
+    Returns:
+      None when no scoped value is set (full-repo iteration mode).
+      (repo_name, rev) tuple otherwise. `rev` defaults to "HEAD" when none of
+      the scoped args specified one. The rev only affects --count-commits;
+      --reclone and --reindex operate on the whole repo regardless.
+
+    Exits via die() if multiple scoped flags reference different repos —
+    we deliberately don't try to run two single-repo operations on
+    different repos in one invocation, so the user can re-run if needed.
+    """
+    scoped: list[tuple[str, str]] = [
+        (flag_name, value)
+        for flag_name, value in (
+            ("--count-commits", args.count_commits),
+            ("--reclone", args.reclone),
+            ("--reindex", args.reindex),
+        )
+        if isinstance(value, str)
+    ]
+    if not scoped:
+        return None
+    parsed = [
+        (flag_name, parse_repo_name(value), parse_repo_rev(value))
+        for flag_name, value in scoped
+    ]
+    repo_names = {name for _, name, _ in parsed}
+    if len(repo_names) > 1:
+        details = ", ".join(f"{flag}={name}" for flag, name, _ in parsed)
+        die(
+            "scoped flags reference different repositories ("
+            + details
+            + "); pass the same REPO[@REV] to each, or run them in separate "
+            "invocations.",
+        )
+    repo_name = next(iter(repo_names))
+    # The rev only matters for --count-commits; if it was scoped, take its
+    # rev. Otherwise default to "HEAD". For --reclone and --reindex the rev
+    # is ignored (the recloneRepository / reindexRepository mutations are
+    # repo-level), so we don't bother checking that scoped revs match.
+    rev = "HEAD"
+    for flag, _, candidate_rev in parsed:
+        if flag == "--count-commits":
+            rev = candidate_rev
+            break
+    return repo_name, rev
+
+
 def run(args: argparse.Namespace, endpoint: str, token: str) -> None:
     """Confirm the connection, then stream every repo to the CSV file."""
-    username = fetch_current_username(endpoint, token)
-    logger.info("Connected to: %s as: %s", endpoint, username)
+    if args.count_commits:
+        # The per-repo COMMIT_COUNT_QUERY call site passes its own longer
+        # timeout via graphql_request(timeout=); just announce it here so the
+        # log makes the slower behaviour visible.
+        logger.info(
+            "--count-commits enabled: per-repo commit-count query "
+            "(timeout=%ds per request)",
+            REQUEST_TIMEOUT_SECONDS_WITH_COMMIT_COUNT,
+        )
+    scope = collect_scope(args)
+    if scope is not None:
+        scope_repo, scope_rev = scope
+        logger.info(
+            "Scoped run: repository=%s, rev=%s "
+            "(reclone=%s, reindex=%s, count-commits=%s)",
+            scope_repo,
+            scope_rev,
+            bool(args.reclone),
+            bool(args.reindex),
+            bool(args.count_commits),
+        )
+    else:
+        scope_repo = None
+        scope_rev = "HEAD"
+    username, is_site_admin = fetch_current_user(endpoint, token)
+    logger.info(
+        "Connected to: %s as: %s (%s)",
+        endpoint,
+        username,
+        "site admin" if is_site_admin else "non-admin",
+    )
+
+    # --reclone / --reindex hit recloneRepository / reindexRepository GraphQL
+    # mutations that the server hard-blocks for non-admins (see
+    # admin-permissions.md). Refuse up front rather than letting the run get
+    # part-way through and then start emitting per-repo "must be site admin"
+    # warnings from trigger_reclone / trigger_reindex.
+    if not is_site_admin and (args.reclone or args.reindex):
+        flags = ", ".join(
+            flag
+            for flag, set_ in (
+                ("--reclone", bool(args.reclone)),
+                ("--reindex", bool(args.reindex)),
+            )
+            if set_
+        )
+        die(
+            f"site-admin token required for: {flags}. "
+            f"{username!r} is not a site admin on {endpoint}.",
+        )
+
+    if not is_site_admin:
+        # The listing/single-repo queries skip Repository.externalServices via
+        # the @include directive, but mirrorInfo.{remoteURL,shard} and
+        # mirrorInfo.repositoryStatistics still silently return null for
+        # non-admins. Surface that once so users aren't surprised by the
+        # blank CSV columns.
+        logger.warning(
+            "Non-admin token: skipping Repository.externalServices selection; "
+            "mirrorInfo.remoteURL, mirrorInfo.shard, and "
+            "mirrorInfo.repositoryStatistics will be empty in the CSV.",
+        )
 
     # When the user only wants the per-repo SkippedFileReasons report, skip the
     # full repo iteration — that query is targeted and doesn't need the listing.
@@ -1362,6 +2792,8 @@ def run(args: argparse.Namespace, endpoint: str, token: str) -> None:
                 ("--reindex", args.reindex),
                 ("--limit", args.limit is not None),
                 ("--skipped-files", args.skipped_files),
+                ("--count-commits", args.count_commits),
+                ("--run-search", args.run_search is not None),
             )
             if set_
         ]
@@ -1376,15 +2808,25 @@ def run(args: argparse.Namespace, endpoint: str, token: str) -> None:
 
     # Prefix per-instance outputs with the sanitized endpoint so a customer
     # comparing results across multiple Sourcegraph instances doesn't overwrite
-    # outputs from other runs.
+    # outputs from other runs. When scoped to a single repo, also include the
+    # sanitized repo name (and rev when --count-commits used REPO@REV) in the
+    # prefix so a single-repo run doesn't clobber the full-listing CSVs.
     endpoint_sanitized = sanitize_endpoint_for_filename(endpoint)
-    output_path = Path(f"{endpoint_sanitized}-{DEFAULT_OUTPUT_FILE}")
-    cloning_errors_path = Path(f"{endpoint_sanitized}-{DEFAULT_CLONING_ERRORS_FILE}")
-    indexing_errors_path = Path(f"{endpoint_sanitized}-{DEFAULT_INDEXING_ERRORS_FILE}")
+    if scope_repo is not None:
+        scope_suffix = sanitize_for_filename(scope_repo)
+        # Only embed the rev in the filename when --count-commits actually
+        # specified one (rev != "HEAD"); --reclone/--reindex ignore rev so
+        # adding it would just clutter the filename for those modes.
+        if args.count_commits and scope_rev != "HEAD":
+            scope_suffix = f"{scope_suffix}-{sanitize_for_filename(scope_rev)}"
+        prefix = f"{endpoint_sanitized}-{scope_suffix}"
+    else:
+        prefix = endpoint_sanitized
+    output_path = Path(f"{prefix}-{DEFAULT_OUTPUT_FILE}")
+    cloning_errors_path = Path(f"{prefix}-{DEFAULT_CLONING_ERRORS_FILE}")
+    indexing_errors_path = Path(f"{prefix}-{DEFAULT_INDEXING_ERRORS_FILE}")
     skipped_files_path = (
-        Path(f"{endpoint_sanitized}-{DEFAULT_SKIPPED_FILES_FILE}")
-        if args.skipped_files
-        else None
+        Path(f"{prefix}-{DEFAULT_SKIPPED_FILES_FILE}") if args.skipped_files else None
     )
     # Clear any stale outputs from a previous run; LazyCSVWriter will only
     # recreate these files if matching rows are encountered this time.
@@ -1393,10 +2835,34 @@ def run(args: argparse.Namespace, endpoint: str, token: str) -> None:
     if skipped_files_path is not None:
         skipped_files_path.unlink(missing_ok=True)
 
-    cloning_writer = LazyCSVWriter(cloning_errors_path, CLONING_ERROR_CSV_COLUMNS)
-    indexing_writer = LazyCSVWriter(indexing_errors_path, CSV_COLUMNS)
+    count_commits_enabled = bool(args.count_commits)
+    run_search_pattern: str | None = args.run_search
+    run_search_enabled = run_search_pattern is not None
+    cloning_writer = LazyCSVWriter(
+        cloning_errors_path,
+        csv_columns_for(
+            CLONING_ERROR_CSV_COLUMNS,
+            count_commits=count_commits_enabled,
+            run_search=run_search_enabled,
+        ),
+    )
+    indexing_writer = LazyCSVWriter(
+        indexing_errors_path,
+        csv_columns_for(
+            CSV_COLUMNS,
+            count_commits=count_commits_enabled,
+            run_search=run_search_enabled,
+        ),
+    )
     skipped_writer = (
-        LazyCSVWriter(skipped_files_path, SKIPPED_FILES_CSV_COLUMNS)
+        LazyCSVWriter(
+            skipped_files_path,
+            csv_columns_for(
+                SKIPPED_FILES_CSV_COLUMNS,
+                count_commits=count_commits_enabled,
+                run_search=run_search_enabled,
+            ),
+        )
         if skipped_files_path is not None
         else None
     )
@@ -1420,8 +2886,13 @@ def run(args: argparse.Namespace, endpoint: str, token: str) -> None:
             endpoint,
             token,
             args.limit,
-            reclone=args.reclone,
-            reindex=args.reindex,
+            reclone=bool(args.reclone),
+            reindex=bool(args.reindex),
+            count_commits=bool(args.count_commits),
+            scope_repo=scope_repo,
+            count_commits_rev=scope_rev,
+            run_search_pattern=run_search_pattern,
+            is_site_admin=is_site_admin,
         )
 
     logger.info("Wrote %d repos to %s", total, output_path.name)
@@ -1447,6 +2918,30 @@ def run(args: argparse.Namespace, endpoint: str, token: str) -> None:
         logger.info("Triggered recloneRepository for %d repo(s)", reclone_total)
     if args.reindex:
         logger.info("Triggered reindexRepository for %d repo(s)", reindex_total)
+
+
+def redact_argv_for_log(argv: list[str]) -> str:
+    """Render argv as a shell-safe string with --src-access-token values redacted.
+
+    Handles both `--src-access-token VALUE` and `--src-access-token=VALUE`. Any
+    other arguments (including --src-endpoint) are passed through unchanged so
+    the log line still records exactly how the script was invoked.
+    """
+    redacted: list[str] = []
+    skip_next = False
+    for arg in argv:
+        if skip_next:
+            redacted.append("REDACTED")
+            skip_next = False
+            continue
+        if arg == "--src-access-token":
+            redacted.append(arg)
+            skip_next = True
+        elif arg.startswith("--src-access-token="):
+            redacted.append("--src-access-token=REDACTED")
+        else:
+            redacted.append(arg)
+    return " ".join(shlex.quote(a) for a in redacted)
 
 
 def configure_logging(log_path: Path) -> None:
@@ -1476,8 +2971,8 @@ def _log_uncaught_exception(
     """sys.excepthook that routes uncaught exceptions through the logger.
 
     Without this, Python's default hook writes the traceback to stderr only,
-    so repos.log would miss it. Logging via logger.error(exc_info=...) sends
-    the full traceback to both handlers (stderr + repos.log).
+    so list-repos.log would miss it. Logging via logger.error(exc_info=...) sends
+    the full traceback to both handlers (stderr + list-repos.log).
 
     KeyboardInterrupt (Ctrl-C) is treated as a user-initiated graceful exit:
     a one-line message is logged with no traceback, since a stack dump for an
@@ -1496,13 +2991,23 @@ def main() -> None:
     """Entry point: configure logging, load env, parse args, run, handle errors."""
     configure_logging(Path(DEFAULT_LOG_FILE))
     # Anything that escapes the try/except below (or is raised before it, e.g.
-    # in parse_args / load_dotenv / require_credentials) lands in repos.log
+    # in parse_args / load_dotenv / require_credentials) lands in list-repos.log
     # with a full traceback via this hook.
     sys.excepthook = _log_uncaught_exception
 
     args = parse_args(sys.argv[1:])
+    # Always (re)generate README.md from the in-script column tables so it
+    # can never drift from the actual CSV layout. Done before
+    # require_credentials() / load_dotenv() since it needs neither
+    # credentials nor network access.
+    write_readme(Path(DEFAULT_README_FILE))
     load_dotenv()
     endpoint, token = require_credentials(args)
+    logger.info(
+        "Running: %s (SRC_ENDPOINT=%s)",
+        redact_argv_for_log(sys.argv),
+        endpoint,
+    )
 
     try:
         run(args, endpoint, token)
@@ -1516,8 +3021,14 @@ def main() -> None:
         sys.exit(1)
     except ValueError as exc:
         die(str(exc))
-    except GraphQLError:
-        logger.exception("GraphQL request failed")
+    except GraphQLError as exc:
+        if ":53: no such host" in str(exc):
+            logger.error(
+                "There's a problem with your Sourcegraph instance "
+                "(DNS lookup failure for an internal service). Please try again."
+            )
+        else:
+            logger.exception("GraphQL request failed")
         sys.exit(1)
 
 
