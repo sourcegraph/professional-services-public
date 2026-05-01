@@ -35,3 +35,4 @@ These instructions apply to any work under this directory.
   packages
 - Keep the minimum required versions of Python and Sourcegraph up to date in
   the README.md file
+- Use `uv` when needed, ex. to run pyright
