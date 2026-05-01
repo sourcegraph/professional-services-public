@@ -633,7 +633,8 @@ def fetch_commit_count(
     default_count: int | None = (
         default_count_raw if isinstance(default_count_raw, int) else None
     )
-    search_results: dict[str, Any] = (data.get("search") or {}).get("results") or {}
+    search_block: dict[str, Any] = data.get("search") or {}
+    search_results: dict[str, Any] = search_block.get("results") or {}
     all_refs_count_raw = search_results.get("matchCount")
     all_refs_count: int | None = (
         all_refs_count_raw if isinstance(all_refs_count_raw, int) else None
@@ -681,12 +682,16 @@ def fetch_run_search(
         logger.warning("run-search network error for %s: %s", repo_name, exc)
         return None, elapsed, False, None
     elapsed = time.monotonic() - start
-    results: dict[str, Any] = (data.get("search") or {}).get("results") or {}
+    search_block: dict[str, Any] = data.get("search") or {}
+    results: dict[str, Any] = search_block.get("results") or {}
     raw_count = results.get("matchCount")
     match_count: int | None = raw_count if isinstance(raw_count, int) else None
     limit_hit = bool(results.get("limitHit"))
     alert: dict[str, Any] = results.get("alert") or {}
-    alert_title = alert.get("title") if isinstance(alert, dict) else None
+    alert_title_raw = alert.get("title")
+    alert_title: str | None = (
+        alert_title_raw if isinstance(alert_title_raw, str) else None
+    )
     return match_count, elapsed, limit_hit, alert_title
 
 
@@ -1227,9 +1232,8 @@ GraphQL schema (`schema.graphql`) but rewritten for human readers —
 units, admin-only fields, and locally-derived columns are called out
 explicitly.
 
-Columns whose `Requires admin` cell is `true` come from GraphQL fields
-that the Sourcegraph server only exposes to site admins. When you run
-the script with an access token from a non-admin user, the script
+Columns where `Requires admin` is `true` are from GraphQL fields
+which require an access token from a site admin user on the instance. When you the script with an access token from a non-admin user, the script
 either omits the underlying selection (for `externalServices`) or the
 server silently returns null (for the `mirrorInfo.*` fields), so those
 columns appear in the CSV with empty cells. Every other column is
@@ -1464,7 +1468,7 @@ def fetch_current_user(endpoint: str, token: str) -> tuple[str, bool]:
     server return a "must be site admin" mutation error mid-run.
     """
     data = graphql_request(endpoint, token, CURRENT_USER_QUERY, {})
-    user = data["currentUser"] or {}
+    user: dict[str, Any] = data["currentUser"] or {}
     return str(user["username"]), bool(user.get("siteAdmin"))
 
 
@@ -1740,36 +1744,34 @@ def write_skipped_files_reason(
     # removing, or reordering a column here updates both at once.
     # Path.suffix returns ".ext" (or "" for no extension or for dotfiles like
     # ".env"); we strip the leading dot to display "go" rather than ".go".
+    def chunk_matches_content(m: dict[str, Any]) -> str:
+        chunks: list[dict[str, Any]] = m.get("chunkMatches") or []
+        return "\n".join(str(c.get("content") or "") for c in chunks)
+
+    def match_file_byte_size(m: dict[str, Any]) -> int | str:
+        file_obj: dict[str, Any] = m.get("file") or {}
+        bs = file_obj.get("byteSize")
+        return int(bs) if bs is not None else ""
+
+    def match_file_extension(m: dict[str, Any]) -> str:
+        file_obj: dict[str, Any] = m.get("file") or {}
+        return Path(str(file_obj.get("path") or "")).suffix.lstrip(".")
+
+    def match_file_url(m: dict[str, Any]) -> str:
+        repo_obj: dict[str, Any] = m.get("repository") or {}
+        file_obj: dict[str, Any] = m.get("file") or {}
+        return file_url(
+            endpoint,
+            str(repo_obj.get("name") or ""),
+            rev,
+            str(file_obj.get("path") or ""),
+        )
+
     file_columns: list[tuple[str, Callable[[dict[str, Any]], Any]]] = [
-        (
-            "chunkMatches.content",
-            lambda m: "\n".join(
-                str(c.get("content") or "") for c in (m.get("chunkMatches") or [])
-            ),
-        ),
-        (
-            "file.byteSize",
-            lambda m: (
-                int(bs)
-                if (bs := (m.get("file") or {}).get("byteSize")) is not None
-                else ""
-            ),
-        ),
-        (
-            "file.extension",
-            lambda m: Path(
-                str((m.get("file") or {}).get("path") or ""),
-            ).suffix.lstrip("."),
-        ),
-        (
-            "file_url",
-            lambda m: file_url(
-                endpoint,
-                str((m.get("repository") or {}).get("name") or ""),
-                rev,
-                str((m.get("file") or {}).get("path") or ""),
-            ),
-        ),
+        ("chunkMatches.content", chunk_matches_content),
+        ("file.byteSize", match_file_byte_size),
+        ("file.extension", match_file_extension),
+        ("file_url", match_file_url),
     ]
     stats_columns: list[tuple[str, Callable[[tuple[str, int]], Any]]] = [
         ("reason", lambda r: r[0]),
@@ -1782,7 +1784,8 @@ def write_skipped_files_reason(
     rows: list[list[Any]] = []
     for match in matches:
         rows.append([extract(match) for _, extract in file_columns])
-        for chunk in match.get("chunkMatches") or []:
+        chunks: list[dict[str, Any]] = match.get("chunkMatches") or []
+        for chunk in chunks:
             reason_match = re.search(
                 r"NOT-INDEXED:\s*(.+)",
                 str(chunk.get("content") or ""),
@@ -2162,7 +2165,7 @@ def write_csv(
                     all_refs_str,
                     elapsed_seconds,
                 )
-        if run_search_enabled and run_search_pattern is not None:
+        if run_search_pattern is not None:
             repo_name = str(repo.get("name") or "")
             (
                 search_match_count,
