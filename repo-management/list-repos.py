@@ -760,8 +760,8 @@ COLUMNS: list[tuple[str, Callable[[dict[str, Any]], Any], str, bool, str]] = [
     (
         "externalServices",
         join_external_services,
-        "Semicolon-joined display names of every external service "
-        "(code-host connection) that yields this repository.",
+        "Display names of the external service(s) "
+        "(code-host connection(s)) which yields this repository.",
         True,
         "string (semicolon-joined)",
     ),
@@ -769,91 +769,84 @@ COLUMNS: list[tuple[str, Callable[[dict[str, Any]], Any], str, bool, str]] = [
         "mirrorInfo.status",
         derive_mirror_status,
         "Single-word summary of the repo's mirror state, derived locally "
-        "from `mirrorInfo`. One of `corrupted`, `errored`, `cloning`, "
-        "`cloned`, `not_cloned`, in priority order (so `corrupted` wins "
-        "over `errored`, etc.).",
+        "from `mirrorInfo`.",
         False,
         "enum (corrupted, errored, cloning, cloned, not_cloned)",
     ),
     (
         "isFork",
         lambda r: r.get("isFork"),
-        "Whether this repository is a fork (`True`/`False`).",
+        "Whether this repository is a fork.",
         False,
         "boolean",
     ),
     (
         "isArchived",
         lambda r: r.get("isArchived"),
-        "Whether this repository has been archived on the code host (`True`/`False`).",
+        "Whether this repository has been archived on the code host.",
         False,
         "boolean",
     ),
     (
         "isPrivate",
         lambda r: r.get("isPrivate"),
-        "Whether this repository is private (`True`/`False`).",
+        "Whether this repository is private.",
         False,
         "boolean",
     ),
     (
         "mirrorInfo.byteSize(MB)",
         lambda r: get_path_mb(r, "mirrorInfo.byteSize"),
-        "On-disk size of the cloned repository in megabytes "
-        "(1 MB = 1024×1024 bytes), converted locally from "
-        "`mirrorInfo.byteSize`.",
+        "On-disk size of the bare-cloned repository, in megabytes.",
         False,
         "float",
     ),
     (
         "createdAt",
         lambda r: r.get("createdAt"),
-        "Timestamp the repo was first added to your Sourcegraph instance.",
+        "Timestamp the repo was first cloned to your Sourcegraph instance.",
         False,
         "timestamp",
     ),
     (
         "mirrorInfo.lastChanged",
         lambda r: get_path(r, "mirrorInfo.lastChanged"),
-        "Timestamp of the last time the mirror's content actually changed "
-        "(i.e. when commits were last added). May be empty.",
+        "Timestamp of the most recent commit in the repo.",
         False,
         "timestamp",
     ),
     (
         "mirrorInfo.updatedAt",
         lambda r: get_path(r, "mirrorInfo.updatedAt"),
-        "Timestamp of the most recent successful sync from the upstream "
-        "remote. May be empty.",
+        "Timestamp of the most recent successful sync of the repo from the code host.",
         False,
         "timestamp",
     ),
     (
         "mirrorInfo.nextSyncAt",
         lambda r: get_path(r, "mirrorInfo.nextSyncAt"),
-        "Timestamp the repo is next scheduled to be synced from upstream. "
-        "May be empty.",
+        "Timestamp the repo is next scheduled to be synced from upstream.",
         False,
         "timestamp",
     ),
     (
         "mirrorInfo.updateSchedule.intervalSeconds",
         lambda r: get_path(r, "mirrorInfo.updateSchedule.intervalSeconds"),
-        "Interval, in seconds, between scheduled mirror updates.",
+        "Interval, in seconds, between scheduled mirror updates. Default max is 28800 seconds (8 hours), but is shortened for busy / popular repos.",
         False,
         "integer",
     ),
     (
         "mirrorInfo.shard",
         lambda r: get_path(r, "mirrorInfo.shard"),
-        "Hostname of the gitserver shard that holds this repo's clone.",
+        "Pod name of the gitserver shard which holds this repo's clone.",
         True,
         "string",
     ),
     (
         "textSearchIndex.status",
         derive_index_status,
-        "Single-word summary of the search-index state, derived locally: "
+        "Search-index state, derived locally: "
         "`indexed` if Zoekt has built an index for this repo, "
         "`not_indexed` otherwise.",
         False,
@@ -862,28 +855,28 @@ COLUMNS: list[tuple[str, Callable[[dict[str, Any]], Any], str, bool, str]] = [
     (
         "textSearchIndex.status.updatedAt",
         lambda r: get_path(r, "textSearchIndex.status.updatedAt"),
-        "Timestamp the Zoekt index was last refreshed.",
+        "Timestamp the repo was last indexed for fast search. It should be shortly after mirrorInfo.lastChanged, as indexing jobs are scheduled after new commits are fetched.",
         False,
         "timestamp",
     ),
     (
-        "textSearchIndex.status.contentByteSize(MB)",
-        lambda r: get_path_mb(r, "textSearchIndex.status.contentByteSize"),
-        "Size, in megabytes, of the source content that was indexed.",
-        False,
-        "float",
-    ),
-    (
         "textSearchIndex.status.contentFilesCount",
         lambda r: get_path(r, "textSearchIndex.status.contentFilesCount"),
-        "Number of files included in the index.",
+        "Number of files included in the index. Note that some files are excluded from indexing, ex. binary files.",
         False,
         "integer",
     ),
     (
+        "textSearchIndex.status.contentByteSize(MB)",
+        lambda r: get_path_mb(r, "textSearchIndex.status.contentByteSize"),
+        "Size, in megabytes, of the source content that was indexed. Note that some files are excluded from indexing, ex. binary files.",
+        False,
+        "float",
+    ),
+    (
         "textSearchIndex.status.indexByteSize(MB)",
         lambda r: get_path_mb(r, "textSearchIndex.status.indexByteSize"),
-        "Size, in megabytes, of the on-disk Zoekt index for this repo.",
+        "Size of the Zoekt search index for this repo, in megabytes.",
         False,
         "float",
     ),
@@ -897,28 +890,28 @@ COLUMNS: list[tuple[str, Callable[[dict[str, Any]], Any], str, bool, str]] = [
     (
         "textSearchIndex.status.newLinesCount",
         lambda r: get_path(r, "textSearchIndex.status.newLinesCount"),
-        "Total number of newlines across every indexed branch (experimental field).",
+        "Total number of lines across every indexed branch.",
         False,
         "integer",
     ),
     (
         "textSearchIndex.status.defaultBranchNewLinesCount",
         lambda r: get_path(r, "textSearchIndex.status.defaultBranchNewLinesCount"),
-        "Number of newlines indexed on the repo's default branch (experimental field).",
+        "Number of lines indexed on the repo's default branch.",
         False,
         "integer",
     ),
     (
         "textSearchIndex.status.otherBranchesNewLinesCount",
         lambda r: get_path(r, "textSearchIndex.status.otherBranchesNewLinesCount"),
-        "Number of newlines indexed across non-default branches (experimental field).",
+        "Number of lines indexed across non-default branches.",
         False,
         "integer",
     ),
     (
         "textSearchIndex.host.name",
         lambda r: get_path(r, "textSearchIndex.host.name"),
-        "Hostname of the indexserver responsible for this repo's index.",
+        "Pod name of the indexserver shard which holds this repo's index.",
         False,
         "string",
     ),
@@ -950,8 +943,7 @@ COMMIT_COUNT_OPTIMIZATION_COLUMNS: list[
     (
         "mirrorInfo.lastCleanedAt",
         lambda r: get_path(r, "mirrorInfo.lastCleanedAt"),
-        "Timestamp of the last successful gitserver cleanup ('gc') of "
-        "this repo. May be empty.",
+        "Timestamp of the last successful gitserver cleanup ('gc') of this repo.",
         False,
         "timestamp",
     ),
@@ -982,8 +974,7 @@ COMMIT_COUNT_OPTIMIZATION_COLUMNS: list[
     (
         "mirrorInfo.cleanupQueue.optimizing",
         lambda r: get_path(r, "mirrorInfo.cleanupQueue.optimizing"),
-        "Whether gitserver is currently running optimization on this "
-        "repo (`True`/`False`).",
+        "Whether gitserver is currently running optimization on this repo.",
         False,
         "boolean",
     ),
@@ -993,8 +984,7 @@ COMMIT_COUNT_OPTIMIZATION_COLUMNS: list[
             r,
             "mirrorInfo.repositoryStatistics.packfiles.lastFullRepack",
         ),
-        "Timestamp of the most recent full repack of this repo's "
-        "packfiles. Empty when the repo is not yet cloned.",
+        "Timestamp of the most recent full repack of this repo's packfiles.",
         True,
         "timestamp",
     ),
@@ -1098,8 +1088,7 @@ CLONING_ERROR_EXTRA_COLUMNS: list[
     (
         "mirrorInfo.isCorrupted",
         lambda r: get_path(r, "mirrorInfo.isCorrupted"),
-        "Whether Sourcegraph has detected the on-disk clone is corrupted "
-        "(`True`/`False`).",
+        "Whether Sourcegraph has detected the on-disk clone is corrupted.",
         False,
         "boolean",
     ),
@@ -1123,9 +1112,8 @@ CLONING_ERROR_EXTRA_COLUMNS: list[
     (
         "mirrorInfo.corruptionLogs",
         join_corruption_logs,
-        "Semicolon-joined `timestamp: reason` entries for the most recent "
-        "corruption events. The server caps the log at 10 entries, "
-        "ordered newest-first.",
+        "`timestamp: reason` entries for the most recent corruption events. "
+        "The server caps the log at 10 entries, ordered newest-first.",
         False,
         "string (semicolon-joined)",
     ),
@@ -1147,25 +1135,25 @@ SKIPPED_FILES_EXTRA_COLUMNS: list[
         "skippedIndexed.totalCount",
         total_skipped_files,
         "Sum of `skippedIndexed.count` across every indexed ref of this "
-        "repo — i.e. how many files Zoekt skipped while indexing.",
+        "repo — i.e. how many files Zoekt excluded while indexing.",
         False,
         "integer",
     ),
     (
         "skippedIndexed.refsWithSkips",
         refs_with_skips,
-        "Semicolon-joined `<refName>=<count>` entries for every ref that "
-        "has at least one skipped file.",
+        "`<refName>=<count>` entries for every indexed ref which "
+        "has at least one excluded file.",
         False,
         "string (semicolon-joined)",
     ),
     (
         "skippedIndexed.headQuery",
         head_skipped_query,
-        "Sourcegraph search query that lists every skipped file on HEAD "
-        "(or the first ref with skips, when HEAD has none). Paste it into "
-        "the search bar to enumerate the skipped files and their "
-        "NOT-INDEXED reasons (too-large, binary, too-many-trigrams, "
+        "Sourcegraph search query that lists every excluded file on HEAD "
+        "(or the first ref with skips, when HEAD has none). This search "
+        "is run when the script is run with the --skipped-files-reason arg, and the"
+        "NOT-INDEXED reasons are recorded (too-large, binary, too-many-trigrams, "
         "too-small, blob-missing).",
         False,
         "string",
@@ -1282,7 +1270,7 @@ so the script can run against multiple instances without overwriting files.
 | `<prefix>-{DEFAULT_OUTPUT_FILE}` | always | main columns |
 | `<prefix>-{DEFAULT_CLONING_ERRORS_FILE}` | at least one repo has a cloning error | main columns + cloning-error extras |
 | `<prefix>-{DEFAULT_INDEXING_ERRORS_FILE}` | at least one repo is cloned but is missing a search index | main columns |
-| `<prefix>-{DEFAULT_SKIPPED_FILES_FILE}` | `--skipped-files` is set and at least one repo had Zoekt skip files | main columns + skipped-files extras |
+| `<prefix>-{DEFAULT_SKIPPED_FILES_FILE}` | `--skipped-files` is set and the last index excluded some files | main columns + skipped-files extras |
 
 The optional `--count-commits` and `--run-search` flags append extra
 columns to *every* CSV listed above, in this order: main columns →
@@ -2465,7 +2453,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--skipped-files-reason",
-        metavar="REPO@REV",
+        metavar="REPO[@REV]",
         default=None,
         help=(
             "Write a CSV file listing the files which Zoekt has skipped, and the skip reason, for a specified repo\n"
@@ -2482,16 +2470,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         nargs="?",
         const=True,
         default=False,
-        metavar="REPO[@REV]",
+        metavar="REPO",
         help=(
             "Without an argument: force reclone every repo with a cloning error\n"
             "(corrupted, errored, or not cloned).\n"
             "\n"
-            "With a REPO[@REV] argument (same format as --skipped-files-reason):\n"
+            "With a REPO argument:\n"
             "scope the reclone to that single repository, regardless of whether\n"
-            "it is currently in an error state. The @REV portion is accepted\n"
-            "for symmetry with --count-commits but is ignored — recloneRepository\n"
-            "operates on the whole repository.\n"
+            "it is currently in an error state.\n"
             "Example: --reclone github.com/org/repo"
         ),
     )
@@ -2500,15 +2486,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         nargs="?",
         const=True,
         default=False,
-        metavar="REPO[@REV]",
+        metavar="REPO",
         help=(
             "Without an argument: force reindex every repo with an indexing\n"
             "error.\n"
             "\n"
-            "With a REPO[@REV] argument: scope the reindex to that single\n"
+            "With a REPO argument: scope the reindex to that single\n"
             "repository, regardless of whether it is currently in an error\n"
-            "state. The @REV portion is accepted but ignored —\n"
-            "reindexRepository operates on the whole repository.\n"
+            "state.\n"
             "Example: --reindex github.com/org/repo"
         ),
     )
@@ -2606,7 +2591,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--src-access-token",
         default=None,
         metavar="TOKEN",
-        help=("Sourcegraph access token (must start with 'sgp_')"),
+        help=(
+            "Sourcegraph access token (must start with 'sgp_')"
+            "NOTE: It is highly recommended to use the SRC_ACCESS_TOKEN "
+            "environment variable instead."
+        ),
     )
     return parser.parse_args(argv)
 
