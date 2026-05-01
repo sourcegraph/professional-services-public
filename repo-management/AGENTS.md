@@ -9,11 +9,25 @@ These instructions apply to any work under this directory.
 
 ## After completing a task
 
-- Lint the script(s) you touched (this directory uses
-  [`ruff`](https://docs.astral.sh/ruff/); run `ruff check` and
-  `ruff format --check` as appropriate).
+- Lint the files you touched, using:
+  - Ruff
+  - Pylance
+  - Markdownlint
 - Fix every lint issue in the code itself.
   **Never** disable, suppress, ignore, or `# noqa`-out a lint check
   to make it pass.
 - Only after the lint checks pass cleanly: `git commit` and
   `git push` the changes.
+
+## Other
+
+- Whenever changing / adding / removing / moving any columns in any of the CSV files,
+  ensure the columns are updated in README.md printer function to match
+- Keep this AGENTS.md file up to date as more instructions are provided
+- Consult the Deep Search MCP and the Oracle as much as needed when
+  you aren't sure about something
+- Multiple editors may be working on the same files at the same time,
+  humans and agents
+  - Do not rely on your cached copy of the files, always read them
+- This script runs standalone, do not worry about a calling parent Python module
+  - Do not bother with prepending function names wih `_`

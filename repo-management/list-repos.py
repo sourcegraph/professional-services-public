@@ -639,7 +639,7 @@ def fetch_commit_count(
         all_refs_count_raw if isinstance(all_refs_count_raw, int) else None
     )
     optimization_values = [
-        extract(repo) for _, extract in COMMIT_COUNT_OPTIMIZATION_COLUMNS
+        extract(repo) for _, extract, _ in COMMIT_COUNT_OPTIMIZATION_COLUMNS
     ]
     return default_count, all_refs_count, elapsed, optimization_values
 
@@ -694,62 +694,154 @@ def fetch_run_search(
 # Each entry is (csv_column_name, extractor_function). Keeping the column name
 # next to the function that produces its value eliminates the risk of the
 # header drifting out of sync with the row data.
-COLUMNS: list[tuple[str, Callable[[dict[str, Any]], Any]]] = [
-    ("id", lambda r: decode_repo_id(r["id"])),
-    ("url", lambda r: r.get("url")),
-    ("mirrorInfo.remoteURL", lambda r: get_path(r, "mirrorInfo.remoteURL")),
-    ("externalServices", join_external_services),
-    ("mirrorInfo.status", derive_mirror_status),
-    ("isFork", lambda r: r.get("isFork")),
-    ("isArchived", lambda r: r.get("isArchived")),
-    ("isPrivate", lambda r: r.get("isPrivate")),
-    ("mirrorInfo.byteSize(MB)", lambda r: get_path_mb(r, "mirrorInfo.byteSize")),
-    ("createdAt", lambda r: r.get("createdAt")),
-    ("mirrorInfo.lastChanged", lambda r: get_path(r, "mirrorInfo.lastChanged")),
-    ("mirrorInfo.updatedAt", lambda r: get_path(r, "mirrorInfo.updatedAt")),
-    ("mirrorInfo.nextSyncAt", lambda r: get_path(r, "mirrorInfo.nextSyncAt")),
+COLUMNS: list[tuple[str, Callable[[dict[str, Any]], Any], str]] = [
+    (
+        "id",
+        lambda r: decode_repo_id(r["id"]),
+        "Numeric Sourcegraph database ID for the repository, decoded "
+        "locally from the base64 GraphQL global ID. Useful when correlating "
+        "with the `repo` table or admin URLs.",
+    ),
+    (
+        "url",
+        lambda r: r.get("url"),
+        "Full URL to the repository on this Sourcegraph instance "
+        "(the `<endpoint>` joined with `Repository.url`).",
+    ),
+    (
+        "mirrorInfo.remoteURL",
+        lambda r: get_path(r, "mirrorInfo.remoteURL"),
+        "Clone URL of the upstream repository on the code host (may include "
+        "embedded credentials). **Site-admin only — empty cell for "
+        "non-admin tokens.**",
+    ),
+    (
+        "externalServices",
+        join_external_services,
+        "Semicolon-joined display names of every external service "
+        "(code-host connection) that yields this repository. **Site-admin "
+        "only — empty cell for non-admin tokens; the script omits the "
+        "underlying GraphQL selection in that case.**",
+    ),
+    (
+        "mirrorInfo.status",
+        derive_mirror_status,
+        "Single-word summary of the repo's mirror state, derived locally "
+        "from `mirrorInfo`. One of `corrupted`, `errored`, `cloning`, "
+        "`cloned`, `not_cloned`, in priority order (so `corrupted` wins "
+        "over `errored`, etc.).",
+    ),
+    (
+        "isFork",
+        lambda r: r.get("isFork"),
+        "Whether this repository is a fork (`True`/`False`).",
+    ),
+    (
+        "isArchived",
+        lambda r: r.get("isArchived"),
+        "Whether this repository has been archived on the code host (`True`/`False`).",
+    ),
+    (
+        "isPrivate",
+        lambda r: r.get("isPrivate"),
+        "Whether this repository is private (`True`/`False`).",
+    ),
+    (
+        "mirrorInfo.byteSize(MB)",
+        lambda r: get_path_mb(r, "mirrorInfo.byteSize"),
+        "On-disk size of the cloned repository in megabytes "
+        "(1 MB = 1024×1024 bytes), converted locally from "
+        "`mirrorInfo.byteSize`.",
+    ),
+    (
+        "createdAt",
+        lambda r: r.get("createdAt"),
+        "Timestamp the repo was first added to Sourcegraph (RFC 3339).",
+    ),
+    (
+        "mirrorInfo.lastChanged",
+        lambda r: get_path(r, "mirrorInfo.lastChanged"),
+        "Timestamp of the last time the mirror's content actually changed "
+        "(i.e. when commits were last added). May be empty.",
+    ),
+    (
+        "mirrorInfo.updatedAt",
+        lambda r: get_path(r, "mirrorInfo.updatedAt"),
+        "Timestamp of the most recent successful sync from the upstream "
+        "remote. May be empty.",
+    ),
+    (
+        "mirrorInfo.nextSyncAt",
+        lambda r: get_path(r, "mirrorInfo.nextSyncAt"),
+        "Timestamp the repo is next scheduled to be synced from upstream. "
+        "May be empty.",
+    ),
     (
         "mirrorInfo.updateSchedule.intervalSeconds",
         lambda r: get_path(r, "mirrorInfo.updateSchedule.intervalSeconds"),
+        "Interval, in seconds, between scheduled mirror updates.",
     ),
-    ("mirrorInfo.shard", lambda r: get_path(r, "mirrorInfo.shard")),
-    ("textSearchIndex.status", derive_index_status),
+    (
+        "mirrorInfo.shard",
+        lambda r: get_path(r, "mirrorInfo.shard"),
+        "Hostname of the gitserver shard that holds this repo's clone. "
+        "**Site-admin only — empty cell for non-admin tokens.**",
+    ),
+    (
+        "textSearchIndex.status",
+        derive_index_status,
+        "Single-word summary of the search-index state, derived locally: "
+        "`indexed` if Zoekt has built an index for this repo, "
+        "`not_indexed` otherwise.",
+    ),
     (
         "textSearchIndex.status.updatedAt",
         lambda r: get_path(r, "textSearchIndex.status.updatedAt"),
+        "Timestamp the Zoekt index was last refreshed.",
     ),
     (
         "textSearchIndex.status.contentByteSize(MB)",
         lambda r: get_path_mb(r, "textSearchIndex.status.contentByteSize"),
+        "Size, in megabytes, of the source content that was indexed.",
     ),
     (
         "textSearchIndex.status.contentFilesCount",
         lambda r: get_path(r, "textSearchIndex.status.contentFilesCount"),
+        "Number of files included in the index.",
     ),
     (
         "textSearchIndex.status.indexByteSize(MB)",
         lambda r: get_path_mb(r, "textSearchIndex.status.indexByteSize"),
+        "Size, in megabytes, of the on-disk Zoekt index for this repo.",
     ),
     (
         "textSearchIndex.status.indexShardsCount",
         lambda r: get_path(r, "textSearchIndex.status.indexShardsCount"),
+        "Number of Zoekt shards that make up this repo's index.",
     ),
     (
         "textSearchIndex.status.newLinesCount",
         lambda r: get_path(r, "textSearchIndex.status.newLinesCount"),
+        "Total number of newlines across every indexed branch (experimental field).",
     ),
     (
         "textSearchIndex.status.defaultBranchNewLinesCount",
         lambda r: get_path(r, "textSearchIndex.status.defaultBranchNewLinesCount"),
+        "Number of newlines indexed on the repo's default branch (experimental field).",
     ),
     (
         "textSearchIndex.status.otherBranchesNewLinesCount",
         lambda r: get_path(r, "textSearchIndex.status.otherBranchesNewLinesCount"),
+        "Number of newlines indexed across non-default branches (experimental field).",
     ),
-    ("textSearchIndex.host.name", lambda r: get_path(r, "textSearchIndex.host.name")),
+    (
+        "textSearchIndex.host.name",
+        lambda r: get_path(r, "textSearchIndex.host.name"),
+        "Hostname of the indexserver responsible for this repo's index.",
+    ),
 ]
 
-CSV_COLUMNS = [name for name, _ in COLUMNS]
+CSV_COLUMNS = [name for name, _, _ in COLUMNS]
 URL_COLUMN_INDEX = CSV_COLUMNS.index("url")
 
 # Repo-cleanup ("optimization") columns piggybacked on the same per-repo
@@ -769,23 +861,38 @@ URL_COLUMN_INDEX = CSV_COLUMNS.index("url")
 # repositoryStatistics is admin-only and returns null for non-cloned repos
 # or non-admin tokens — get_path() returns None in that case, which writes
 # an empty cell.
-COMMIT_COUNT_OPTIMIZATION_COLUMNS: list[tuple[str, Callable[[dict[str, Any]], Any]]] = [
-    ("mirrorInfo.lastCleanedAt", lambda r: get_path(r, "mirrorInfo.lastCleanedAt")),
+COMMIT_COUNT_OPTIMIZATION_COLUMNS: list[
+    tuple[str, Callable[[dict[str, Any]], Any], str]
+] = [
+    (
+        "mirrorInfo.lastCleanedAt",
+        lambda r: get_path(r, "mirrorInfo.lastCleanedAt"),
+        "Timestamp of the last successful gitserver cleanup ('gc') of "
+        "this repo. May be empty.",
+    ),
     (
         "mirrorInfo.cleanupSchedule.due",
         lambda r: get_path(r, "mirrorInfo.cleanupSchedule.due"),
+        "Timestamp the repo is next scheduled to be cleaned up by gitserver.",
     ),
     (
         "mirrorInfo.cleanupSchedule.intervalSeconds",
         lambda r: get_path(r, "mirrorInfo.cleanupSchedule.intervalSeconds"),
+        "Interval, in seconds, between scheduled cleanup runs.",
     ),
     (
         "mirrorInfo.cleanupQueue.index",
         lambda r: get_path(r, "mirrorInfo.cleanupQueue.index"),
+        "Position of the repo in the gitserver cleanup queue. "
+        "Currently-optimizing repos are pushed to the end of the queue, "
+        "so prefer reading this column together with `cleanupQueue."
+        "optimizing`.",
     ),
     (
         "mirrorInfo.cleanupQueue.optimizing",
         lambda r: get_path(r, "mirrorInfo.cleanupQueue.optimizing"),
+        "Whether gitserver is currently running optimization on this "
+        "repo (`True`/`False`).",
     ),
     (
         "mirrorInfo.repositoryStatistics.packfiles.lastFullRepack",
@@ -793,6 +900,9 @@ COMMIT_COUNT_OPTIMIZATION_COLUMNS: list[tuple[str, Callable[[dict[str, Any]], An
             r,
             "mirrorInfo.repositoryStatistics.packfiles.lastFullRepack",
         ),
+        "Timestamp of the most recent full repack of this repo's "
+        "packfiles. **Site-admin only — empty cell for non-admin tokens, "
+        "and also empty when the repo is not yet cloned.**",
     ),
 ]
 
@@ -804,13 +914,33 @@ COMMIT_COUNT_OPTIMIZATION_COLUMNS: list[tuple[str, Callable[[dict[str, Any]], An
 # per-repo COMMIT_COUNT_QUERY GraphQL request, so users can spot which repos
 # are expensive to count on the Sourcegraph instance. Subsequent columns are
 # the optimization metadata fetched in the same request.
-COMMIT_COUNT_COLUMNS: list[str] = [
-    "defaultBranch.target.commit.ancestors.totalCount",
+#
+# Each entry is (csv_column_name, description). No extractor is needed because
+# these values are appended in append_commit_count() from already-fetched
+# scalars rather than re-derived from a repo dict.
+COMMIT_COUNT_COLUMNS: list[tuple[str, str]] = [
+    (
+        "defaultBranch.target.commit.ancestors.totalCount",
+        "Number of commits reachable from HEAD on the default branch — "
+        "equivalent to `git rev-list --count HEAD`. Computed by gitserver, "
+        "so the value is exact.",
+    ),
     # Side-by-side with the default-branch count for easy visual comparison.
     # See ALL_REFS_COMMIT_SEARCH_TEMPLATE for the methodology and caveats.
-    "allRefs.search.matchCount",
-    "commitCount.queryTimeSeconds",
-    *(name for name, _ in COMMIT_COUNT_OPTIMIZATION_COLUMNS),
+    (
+        "allRefs.search.matchCount",
+        "Approximate number of commits across every branch and tag, "
+        "computed via Sourcegraph's commit-search API. **Not directly "
+        "comparable** to the default-branch count above — see "
+        "`--count-commits --help` for the methodology and caveats "
+        "(server-side `timeout:` may truncate the result).",
+    ),
+    (
+        "commitCount.queryTimeSeconds",
+        "Wall-clock seconds the per-repo commit-count GraphQL request "
+        "took. Useful for spotting which repos are expensive to count.",
+    ),
+    *((name, desc) for name, _, desc in COMMIT_COUNT_OPTIMIZATION_COLUMNS),
 ]
 
 # Optional columns appended to every CSV (main, cloning-errors, indexing-errors,
@@ -822,22 +952,65 @@ COMMIT_COUNT_COLUMNS: list[str] = [
 # whether the SG search engine truncated results (so the matchCount is a floor
 # rather than a true total); `runSearch.alertTitle` is non-empty when the
 # server-side `timeout:` budget was exceeded or the query was malformed.
-RUN_SEARCH_COLUMNS: list[str] = [
-    "runSearch.matchCount",
-    "runSearch.queryTimeSeconds",
-    "runSearch.limitHit",
-    "runSearch.alertTitle",
+#
+# Each entry is (csv_column_name, description); see COMMIT_COUNT_COLUMNS for
+# why no extractor is bundled.
+RUN_SEARCH_COLUMNS: list[tuple[str, str]] = [
+    (
+        "runSearch.matchCount",
+        "Number of search matches the Sourcegraph search API reported "
+        "for the user-supplied `--run-search` pattern, scoped to this "
+        "single repo.",
+    ),
+    (
+        "runSearch.queryTimeSeconds",
+        "Wall-clock seconds the per-repo `--run-search` GraphQL request took.",
+    ),
+    (
+        "runSearch.limitHit",
+        "`True` when the search engine truncated results before reaching "
+        "the natural end (so `runSearch.matchCount` is a floor, not the "
+        "actual total).",
+    ),
+    (
+        "runSearch.alertTitle",
+        "Title of the search-API alert when the server's `timeout:` "
+        "budget was exceeded or the query was malformed; empty cell "
+        "otherwise.",
+    ),
 ]
 
 # Extra columns appended only to the cloning-errors CSV.
-CLONING_ERROR_EXTRA_COLUMNS: list[tuple[str, Callable[[dict[str, Any]], Any]]] = [
-    ("mirrorInfo.isCorrupted", lambda r: get_path(r, "mirrorInfo.isCorrupted")),
-    ("mirrorInfo.lastError", lambda r: get_path(r, "mirrorInfo.lastError")),
-    ("mirrorInfo.lastSyncOutput", truncate_sync_output),
-    ("mirrorInfo.corruptionLogs", join_corruption_logs),
+CLONING_ERROR_EXTRA_COLUMNS: list[tuple[str, Callable[[dict[str, Any]], Any], str]] = [
+    (
+        "mirrorInfo.isCorrupted",
+        lambda r: get_path(r, "mirrorInfo.isCorrupted"),
+        "Whether Sourcegraph has detected the on-disk clone is corrupted "
+        "(`True`/`False`).",
+    ),
+    (
+        "mirrorInfo.lastError",
+        lambda r: get_path(r, "mirrorInfo.lastError"),
+        "Last error message returned by gitserver while fetching or "
+        "cloning this repo, if any.",
+    ),
+    (
+        "mirrorInfo.lastSyncOutput",
+        truncate_sync_output,
+        "Output of the most recent sync attempt. The script truncates to "
+        "the first 5 + last 5 lines (with `... [N lines truncated] ...` "
+        "between them) when the output is more than 10 lines.",
+    ),
+    (
+        "mirrorInfo.corruptionLogs",
+        join_corruption_logs,
+        "Semicolon-joined `timestamp: reason` entries for the most recent "
+        "corruption events. The server caps the log at 10 entries, "
+        "ordered newest-first.",
+    ),
 ]
 CLONING_ERROR_CSV_COLUMNS = CSV_COLUMNS + [
-    name for name, _ in CLONING_ERROR_EXTRA_COLUMNS
+    name for name, _, _ in CLONING_ERROR_EXTRA_COLUMNS
 ]
 # The indexing-errors CSV reuses CSV_COLUMNS verbatim — Sourcegraph's GraphQL
 # does not expose any per-repo zoekt error fields beyond textSearchIndex.status.
@@ -846,248 +1019,102 @@ CLONING_ERROR_CSV_COLUMNS = CSV_COLUMNS + [
 # Sourcegraph search query produced by the API; running it lists each skipped
 # file along with its NOT-INDEXED reason (too-large / binary / too-many-trigrams
 # / too-small / blob-missing).
-SKIPPED_FILES_EXTRA_COLUMNS: list[tuple[str, Callable[[dict[str, Any]], Any]]] = [
-    ("skippedIndexed.totalCount", total_skipped_files),
-    ("skippedIndexed.refsWithSkips", refs_with_skips),
-    ("skippedIndexed.headQuery", head_skipped_query),
+SKIPPED_FILES_EXTRA_COLUMNS: list[tuple[str, Callable[[dict[str, Any]], Any], str]] = [
+    (
+        "skippedIndexed.totalCount",
+        total_skipped_files,
+        "Sum of `skippedIndexed.count` across every indexed ref of this "
+        "repo — i.e. how many files Zoekt skipped while indexing.",
+    ),
+    (
+        "skippedIndexed.refsWithSkips",
+        refs_with_skips,
+        "Semicolon-joined `<refName>=<count>` entries for every ref that "
+        "has at least one skipped file.",
+    ),
+    (
+        "skippedIndexed.headQuery",
+        head_skipped_query,
+        "Sourcegraph search query that lists every skipped file on HEAD "
+        "(or the first ref with skips, when HEAD has none). Paste it into "
+        "the search bar to enumerate the skipped files and their "
+        "NOT-INDEXED reasons (too-large, binary, too-many-trigrams, "
+        "too-small, blob-missing).",
+    ),
 ]
 SKIPPED_FILES_CSV_COLUMNS = CSV_COLUMNS + [
-    name for name, _ in SKIPPED_FILES_EXTRA_COLUMNS
+    name for name, _, _ in SKIPPED_FILES_EXTRA_COLUMNS
 ]
 
 
 # --- README generation --------------------------------------------------------
 
-# Per-column human-readable descriptions, used by --write-readme to generate
-# a README.md alongside the CSV outputs. Wording is derived from the
-# Sourcegraph GraphQL schema docstrings (schema.graphql) but expanded to
-# clarify units, admin-only fields, and the script's local derivations.
-# Keep entries one-per-line and keep prose short; the README is meant to be
-# scanned, not read top-to-bottom.
-COLUMN_DESCRIPTIONS: dict[str, str] = {
-    # --- Main CSV columns -----------------------------------------------------
-    "id": (
-        "Numeric Sourcegraph database ID for the repository, decoded "
-        "locally from the base64 GraphQL global ID. Useful when correlating "
-        "with the `repo` table or admin URLs."
-    ),
-    "url": (
-        "Full URL to the repository on this Sourcegraph instance "
-        "(`<endpoint>` + `Repository.url`)."
-    ),
-    "mirrorInfo.remoteURL": (
-        "Clone URL of the upstream repository on the code host (may include "
-        "embedded credentials). **Site-admin only — empty cell for "
-        "non-admin tokens.**"
-    ),
-    "externalServices": (
-        "Semicolon-joined display names of every external service "
-        "(code-host connection) that yields this repository. **Site-admin "
-        "only — empty cell for non-admin tokens; the script omits the "
-        "underlying GraphQL selection in that case.**"
-    ),
-    "mirrorInfo.status": (
-        "Single-word summary of the repo's mirror state, derived locally "
-        "from `mirrorInfo`. One of `corrupted`, `errored`, `cloning`, "
-        "`cloned`, `not_cloned`, in priority order (so `corrupted` wins "
-        "over `errored`, etc.)."
-    ),
-    "isFork": "Whether this repository is a fork (`True`/`False`).",
-    "isArchived": (
-        "Whether this repository has been archived on the code host (`True`/`False`)."
-    ),
-    "isPrivate": "Whether this repository is private (`True`/`False`).",
-    "mirrorInfo.byteSize(MB)": (
-        "On-disk size of the cloned repository in megabytes "
-        "(1 MB = 1024×1024 bytes), converted locally from "
-        "`mirrorInfo.byteSize`."
-    ),
-    "createdAt": ("Timestamp the repo was first added to Sourcegraph (RFC 3339)."),
-    "mirrorInfo.lastChanged": (
-        "Timestamp of the last time the mirror's content actually changed "
-        "(i.e. when commits were last added). May be empty."
-    ),
-    "mirrorInfo.updatedAt": (
-        "Timestamp of the most recent successful sync from the upstream "
-        "remote. May be empty."
-    ),
-    "mirrorInfo.nextSyncAt": (
-        "Timestamp the repo is next scheduled to be synced from upstream. May be empty."
-    ),
-    "mirrorInfo.updateSchedule.intervalSeconds": (
-        "Interval, in seconds, between scheduled mirror updates."
-    ),
-    "mirrorInfo.shard": (
-        "Hostname of the gitserver shard that holds this repo's clone. "
-        "**Site-admin only — empty cell for non-admin tokens.**"
-    ),
-    "textSearchIndex.status": (
-        "Single-word summary of the search-index state, derived locally: "
-        "`indexed` if Zoekt has built an index for this repo, "
-        "`not_indexed` otherwise."
-    ),
-    "textSearchIndex.status.updatedAt": (
-        "Timestamp the Zoekt index was last refreshed."
-    ),
-    "textSearchIndex.status.contentByteSize(MB)": (
-        "Size, in megabytes, of the source content that was indexed."
-    ),
-    "textSearchIndex.status.contentFilesCount": (
-        "Number of files included in the index."
-    ),
-    "textSearchIndex.status.indexByteSize(MB)": (
-        "Size, in megabytes, of the on-disk Zoekt index for this repo."
-    ),
-    "textSearchIndex.status.indexShardsCount": (
-        "Number of Zoekt shards that make up this repo's index."
-    ),
-    "textSearchIndex.status.newLinesCount": (
-        "Total number of newlines across every indexed branch (experimental field)."
-    ),
-    "textSearchIndex.status.defaultBranchNewLinesCount": (
-        "Number of newlines indexed on the repo's default branch (experimental field)."
-    ),
-    "textSearchIndex.status.otherBranchesNewLinesCount": (
-        "Number of newlines indexed across non-default branches (experimental field)."
-    ),
-    "textSearchIndex.host.name": (
-        "Hostname of the indexserver responsible for this repo's index."
-    ),
-    # --- Cloning-error CSV extras --------------------------------------------
-    "mirrorInfo.isCorrupted": (
-        "Whether Sourcegraph has detected the on-disk clone is corrupted "
-        "(`True`/`False`)."
-    ),
-    "mirrorInfo.lastError": (
-        "Last error message returned by gitserver while fetching or "
-        "cloning this repo, if any."
-    ),
-    "mirrorInfo.lastSyncOutput": (
-        "Output of the most recent sync attempt. The script truncates to "
-        "the first 5 + last 5 lines (with `... [N lines truncated] ...` "
-        "between them) when the output is more than 10 lines."
-    ),
-    "mirrorInfo.corruptionLogs": (
-        "Semicolon-joined `timestamp: reason` entries for the most recent "
-        "corruption events. The server caps the log at 10 entries, "
-        "ordered newest-first."
-    ),
-    # --- Skipped-files CSV extras --------------------------------------------
-    "skippedIndexed.totalCount": (
-        "Sum of `skippedIndexed.count` across every indexed ref of this "
-        "repo — i.e. how many files Zoekt skipped while indexing."
-    ),
-    "skippedIndexed.refsWithSkips": (
-        "Semicolon-joined `<refName>=<count>` entries for every ref that "
-        "has at least one skipped file."
-    ),
-    "skippedIndexed.headQuery": (
-        "Sourcegraph search query that lists every skipped file on HEAD "
-        "(or the first ref with skips, when HEAD has none). Paste it into "
-        "the search bar to enumerate the skipped files and their "
-        "NOT-INDEXED reasons (too-large, binary, too-many-trigrams, "
-        "too-small, blob-missing)."
-    ),
-    # --- --count-commits columns ---------------------------------------------
-    "defaultBranch.target.commit.ancestors.totalCount": (
-        "Number of commits reachable from HEAD on the default branch — "
-        "equivalent to `git rev-list --count HEAD`. Computed by gitserver, "
-        "so the value is exact."
-    ),
-    "allRefs.search.matchCount": (
-        "Approximate number of commits across every branch and tag, "
-        "computed via Sourcegraph's commit-search API. **Not directly "
-        "comparable** to the default-branch count above — see "
-        "`--count-commits --help` for the methodology and caveats "
-        "(server-side `timeout:` may truncate the result)."
-    ),
-    "commitCount.queryTimeSeconds": (
-        "Wall-clock seconds the per-repo commit-count GraphQL request "
-        "took. Useful for spotting which repos are expensive to count."
-    ),
-    "mirrorInfo.lastCleanedAt": (
-        "Timestamp of the last successful gitserver cleanup ('gc') of "
-        "this repo. May be empty."
-    ),
-    "mirrorInfo.cleanupSchedule.due": (
-        "Timestamp the repo is next scheduled to be cleaned up by gitserver."
-    ),
-    "mirrorInfo.cleanupSchedule.intervalSeconds": (
-        "Interval, in seconds, between scheduled cleanup runs."
-    ),
-    "mirrorInfo.cleanupQueue.index": (
-        "Position of the repo in the gitserver cleanup queue. "
-        "Currently-optimizing repos are pushed to the end of the queue, "
-        "so prefer reading this column together with `cleanupQueue."
-        "optimizing`."
-    ),
-    "mirrorInfo.cleanupQueue.optimizing": (
-        "Whether gitserver is currently running optimization on this "
-        "repo (`True`/`False`)."
-    ),
-    "mirrorInfo.repositoryStatistics.packfiles.lastFullRepack": (
-        "Timestamp of the most recent full repack of this repo's "
-        "packfiles. **Site-admin only — empty cell for non-admin tokens, "
-        "and also empty when the repo is not yet cloned.**"
-    ),
-    # --- --run-search columns ------------------------------------------------
-    "runSearch.matchCount": (
-        "Number of search matches the Sourcegraph search API reported "
-        "for the user-supplied `--run-search` pattern, scoped to this "
-        "single repo."
-    ),
-    "runSearch.queryTimeSeconds": (
-        "Wall-clock seconds the per-repo `--run-search` GraphQL request took."
-    ),
-    "runSearch.limitHit": (
-        "`True` when the search engine truncated results before reaching "
-        "the natural end (so `runSearch.matchCount` is a floor, not the "
-        "actual total)."
-    ),
-    "runSearch.alertTitle": (
-        "Title of the search-API alert when the server's `timeout:` "
-        "budget was exceeded or the query was malformed; empty cell "
-        "otherwise."
-    ),
-}
+# Column descriptions are colocated with each column tuple above (third
+# element of each tuple, except for the no-extractor COMMIT_COUNT_COLUMNS /
+# RUN_SEARCH_COLUMNS lists which use 2-tuples of (name, description)).
+# Pulling descriptions from the same tuple that defines the column NAME
+# eliminates the possibility of drift: a column added without a description
+# is a static type error / unpacking error rather than a "(no description)"
+# placeholder slipping into README.md.
 
 
-def _format_columns_table(columns: list[str]) -> str:
-    """Render a column → description Markdown table for `columns`.
+README_LINE_WIDTH = 79
 
-    Falls back to a `(no description)` cell when a column is missing
-    from COLUMN_DESCRIPTIONS — that should never happen in production,
-    but it keeps the README generator honest if a new column is added
-    without updating the dict.
+
+def format_columns_list(columns: list[tuple[str, str]]) -> str:
+    """Render a `[(name, description), ...]` list as a wrapped bullet list.
+
+    Markdown tables can't have line breaks within a row, so a description
+    column on a tabular layout will easily exceed Markdownlint's MD013
+    line-length limit. A bullet list with `textwrap`-wrapped descriptions
+    avoids both MD013 (each wrapped line stays under the limit) and
+    MD060 (no table pipes), without needing to suppress either rule.
     """
-    lines = ["| Column | Description |", "|---|---|"]
-    for name in columns:
-        desc = COLUMN_DESCRIPTIONS.get(name, "(no description)")
-        # Escape any pipe characters so they don't break the table.
-        safe_desc = desc.replace("|", "\\|")
-        lines.append(f"| `{name}` | {safe_desc} |")
-    return "\n".join(lines)
+    paragraphs: list[str] = []
+    for name, desc in columns:
+        first = f"- `{name}`: "
+        wrapped = textwrap.fill(
+            desc,
+            width=README_LINE_WIDTH,
+            initial_indent=first,
+            # Two-space hanging indent matches the bullet's text column.
+            subsequent_indent="  ",
+            break_long_words=False,
+            break_on_hyphens=False,
+        )
+        paragraphs.append(wrapped)
+    return "\n".join(paragraphs)
+
+
+def name_desc(
+    columns: list[tuple[str, Callable[[dict[str, Any]], Any], str]],
+) -> list[tuple[str, str]]:
+    """Project an extractor-bearing column list to (name, description) tuples.
+
+    Used to feed format_columns_list from the COLUMNS / CLONING_*EXTRA /
+    SKIPPED_*EXTRA / COMMIT_COUNT_OPTIMIZATION_COLUMNS lists, all of which
+    carry an extractor in the middle slot.
+    """
+    return [(name, desc) for name, _, desc in columns]
 
 
 def write_readme(path: Path) -> None:
     """Write a README.md describing every CSV file the script can produce.
 
-    Generated from CSV_COLUMNS / CLONING_ERROR_CSV_COLUMNS / etc. and
-    COLUMN_DESCRIPTIONS, so this never drifts from the actual CSV layout.
+    Each list is built directly from the column tuples defined above, so
+    the (name, description) pairs in the README cannot drift from the
+    columns the script actually emits — both are projections of the same
+    source-of-truth tuples.
     """
-    main_table = _format_columns_table(CSV_COLUMNS)
-    cloning_table = _format_columns_table(
-        [name for name, _ in CLONING_ERROR_EXTRA_COLUMNS],
-    )
-    skipped_table = _format_columns_table(
-        [name for name, _ in SKIPPED_FILES_EXTRA_COLUMNS],
-    )
-    commit_count_table = _format_columns_table(COMMIT_COUNT_COLUMNS)
-    run_search_table = _format_columns_table(RUN_SEARCH_COLUMNS)
+    main_list = format_columns_list(name_desc(COLUMNS))
+    cloning_list = format_columns_list(name_desc(CLONING_ERROR_EXTRA_COLUMNS))
+    skipped_list = format_columns_list(name_desc(SKIPPED_FILES_EXTRA_COLUMNS))
+    commit_count_list = format_columns_list(COMMIT_COUNT_COLUMNS)
+    run_search_list = format_columns_list(RUN_SEARCH_COLUMNS)
 
     content = f"""# `list-repos.py` CSV column reference
 
-This file is generated by `python3 list-repos.py --write-readme`. It
+This file is generated by `python3 list-repos.py` on every run. It
 documents every column the script can emit across each of its output
 CSV files. Column descriptions are derived from the Sourcegraph
 GraphQL schema (`schema.graphql`) but rewritten for human readers —
@@ -1099,12 +1126,14 @@ explicitly.
 The script always writes its outputs prefixed with the sanitized
 Sourcegraph endpoint (e.g. `sourcegraph.example.com-repos.csv`):
 
-| File | Written when | Columns |
-|---|---|---|
-| `<prefix>-{DEFAULT_OUTPUT_FILE}` | Always | Main columns (below) |
-| `<prefix>-{DEFAULT_CLONING_ERRORS_FILE}` | At least one repo has a cloning error | Main columns + cloning-error extras |
-| `<prefix>-{DEFAULT_INDEXING_ERRORS_FILE}` | At least one repo is cloned but missing a search index | Main columns |
-| `<prefix>-{DEFAULT_SKIPPED_FILES_FILE}` | `--skipped-files` is set and at least one repo had Zoekt skip files | Main columns + skipped-files extras |
+- `<prefix>-{DEFAULT_OUTPUT_FILE}` — always written. Main columns.
+- `<prefix>-{DEFAULT_CLONING_ERRORS_FILE}` — written when at least one
+  repo has a cloning error. Main columns + cloning-error extras.
+- `<prefix>-{DEFAULT_INDEXING_ERRORS_FILE}` — written when at least one
+  repo is cloned but missing a search index. Main columns.
+- `<prefix>-{DEFAULT_SKIPPED_FILES_FILE}` — written when `--skipped-files`
+  is set and at least one repo had Zoekt skip files. Main columns +
+  skipped-files extras.
 
 The optional `--count-commits` and `--run-search` flags append extra
 columns to *every* CSV listed above, in this order: main columns →
@@ -1114,31 +1143,31 @@ per-CSV extras → commit-count columns → run-search columns.
 
 These are written to every CSV file.
 
-{main_table}
+{main_list}
 
 ## Cloning-error extras
 
 Appended only to `<prefix>-{DEFAULT_CLONING_ERRORS_FILE}`.
 
-{cloning_table}
+{cloning_list}
 
 ## Skipped-files extras
 
 Appended only to `<prefix>-{DEFAULT_SKIPPED_FILES_FILE}`.
 
-{skipped_table}
+{skipped_list}
 
 ## `--count-commits` columns
 
 Appended to every CSV when `--count-commits` is passed.
 
-{commit_count_table}
+{commit_count_list}
 
 ## `--run-search` columns
 
 Appended to every CSV when `--run-search PATTERN` is passed.
 
-{run_search_table}
+{run_search_list}
 """
     path.write_text(content, encoding="utf-8")
     logger.info("Wrote %s", path)
@@ -1804,7 +1833,7 @@ def build_row(repo: dict[str, Any], endpoint: str) -> list[Any]:
     position, matching the header produced by csv_columns_for().
     """
     base = endpoint.rstrip("/")
-    row = [extract(repo) for _, extract in COLUMNS]
+    row = [extract(repo) for _, extract, _ in COLUMNS]
     if row[URL_COLUMN_INDEX]:
         row[URL_COLUMN_INDEX] = base + row[URL_COLUMN_INDEX]
     return row
@@ -1894,9 +1923,9 @@ def csv_columns_for(
     """
     cols = list(base_columns)
     if count_commits:
-        cols.extend(COMMIT_COUNT_COLUMNS)
+        cols.extend(name for name, _ in COMMIT_COUNT_COLUMNS)
     if run_search:
-        cols.extend(RUN_SEARCH_COLUMNS)
+        cols.extend(name for name, _ in RUN_SEARCH_COLUMNS)
     return cols
 
 
@@ -2080,7 +2109,8 @@ def write_csv(
         if repo_has_cloning_error:
             cloning_writer.writerow(
                 _augmented(
-                    row + [extract(repo) for _, extract in CLONING_ERROR_EXTRA_COLUMNS],
+                    row
+                    + [extract(repo) for _, extract, _ in CLONING_ERROR_EXTRA_COLUMNS],
                 ),
             )
         # In single-repo (scope_repo) mode the user explicitly asked for
@@ -2098,7 +2128,8 @@ def write_csv(
         if skipped_writer is not None and has_skipped_files(repo):
             skipped_writer.writerow(
                 _augmented(
-                    row + [extract(repo) for _, extract in SKIPPED_FILES_EXTRA_COLUMNS],
+                    row
+                    + [extract(repo) for _, extract, _ in SKIPPED_FILES_EXTRA_COLUMNS],
                 ),
             )
     return (total, reclone_total, reindex_total)
@@ -2409,17 +2440,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             "bounded server-side so a pathological pattern can't block the\n"
             "run on a monorepo.\n"
             "Example: --run-search 'TODO patternType:literal'"
-        ),
-    )
-    parser.add_argument(
-        "--write-readme",
-        action="store_true",
-        help=(
-            "Write a README.md documenting every CSV column this script can\n"
-            "emit (main, cloning-errors, indexing-errors, skipped-files, plus\n"
-            "the optional --count-commits / --run-search columns), then exit\n"
-            "without contacting the Sourcegraph instance.\n"
-            f"Output file: {DEFAULT_README_FILE}"
         ),
     )
     parser.add_argument(
@@ -2776,12 +2796,11 @@ def main() -> None:
     sys.excepthook = _log_uncaught_exception
 
     args = parse_args(sys.argv[1:])
-    # --write-readme generates README.md from the in-script column tables;
-    # it does NOT need credentials or any network access, so handle it before
-    # require_credentials() so users can generate the doc on a fresh checkout.
-    if args.write_readme:
-        write_readme(Path(DEFAULT_README_FILE))
-        return
+    # Always (re)generate README.md from the in-script column tables so it
+    # can never drift from the actual CSV layout. Done before
+    # require_credentials() / load_dotenv() since it needs neither
+    # credentials nor network access.
+    write_readme(Path(DEFAULT_README_FILE))
     load_dotenv()
     endpoint, token = require_credentials(args)
     logger.info(
