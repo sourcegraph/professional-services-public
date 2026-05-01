@@ -48,54 +48,79 @@ These are written to every CSV file.
 - `id`: Numeric Sourcegraph database ID for the repository, decoded locally
   from the base64 GraphQL global ID. Useful when correlating with the `repo`
   table or admin URLs.
+  - Type: integer
 - `url`: Full URL to the repository on this Sourcegraph instance (the
   `<endpoint>` joined with `Repository.url`).
+  - Type: string
 - [Site admin] `mirrorInfo.remoteURL`: Clone URL of the upstream repository on
   the code host (may include embedded credentials).
+  - Type: string
 - [Site admin] `externalServices`: Semicolon-joined display names of every
   external service (code-host connection) that yields this repository.
+  - Type: string (semicolon-joined)
 - `mirrorInfo.status`: Single-word summary of the repo's mirror state, derived
   locally from `mirrorInfo`. One of `corrupted`, `errored`, `cloning`,
   `cloned`, `not_cloned`, in priority order (so `corrupted` wins over
   `errored`, etc.).
+  - Type: enum (corrupted, errored, cloning, cloned, not_cloned)
 - `isFork`: Whether this repository is a fork (`True`/`False`).
+  - Type: boolean
 - `isArchived`: Whether this repository has been archived on the code host
   (`True`/`False`).
+  - Type: boolean
 - `isPrivate`: Whether this repository is private (`True`/`False`).
+  - Type: boolean
 - `mirrorInfo.byteSize(MB)`: On-disk size of the cloned repository in megabytes
   (1 MB = 1024×1024 bytes), converted locally from `mirrorInfo.byteSize`.
-- `createdAt`: Timestamp the repo was first added to Sourcegraph (RFC 3339).
+  - Type: float
+- `createdAt`: Timestamp the repo was first added to your Sourcegraph instance.
+  - Type: timestamp
 - `mirrorInfo.lastChanged`: Timestamp of the last time the mirror's content
   actually changed (i.e. when commits were last added). May be empty.
+  - Type: timestamp
 - `mirrorInfo.updatedAt`: Timestamp of the most recent successful sync from the
   upstream remote. May be empty.
+  - Type: timestamp
 - `mirrorInfo.nextSyncAt`: Timestamp the repo is next scheduled to be synced
   from upstream. May be empty.
+  - Type: timestamp
 - `mirrorInfo.updateSchedule.intervalSeconds`: Interval, in seconds, between
   scheduled mirror updates.
+  - Type: integer
 - [Site admin] `mirrorInfo.shard`: Hostname of the gitserver shard that holds
   this repo's clone.
+  - Type: string
 - `textSearchIndex.status`: Single-word summary of the search-index state,
   derived locally: `indexed` if Zoekt has built an index for this repo,
   `not_indexed` otherwise.
+  - Type: enum (indexed, not_indexed)
 - `textSearchIndex.status.updatedAt`: Timestamp the Zoekt index was last
   refreshed.
+  - Type: timestamp
 - `textSearchIndex.status.contentByteSize(MB)`: Size, in megabytes, of the
   source content that was indexed.
+  - Type: float
 - `textSearchIndex.status.contentFilesCount`: Number of files included in the
   index.
+  - Type: integer
 - `textSearchIndex.status.indexByteSize(MB)`: Size, in megabytes, of the
   on-disk Zoekt index for this repo.
+  - Type: float
 - `textSearchIndex.status.indexShardsCount`: Number of Zoekt shards that make
   up this repo's index.
+  - Type: integer
 - `textSearchIndex.status.newLinesCount`: Total number of newlines across every
   indexed branch (experimental field).
+  - Type: integer
 - `textSearchIndex.status.defaultBranchNewLinesCount`: Number of newlines
   indexed on the repo's default branch (experimental field).
+  - Type: integer
 - `textSearchIndex.status.otherBranchesNewLinesCount`: Number of newlines
   indexed across non-default branches (experimental field).
+  - Type: integer
 - `textSearchIndex.host.name`: Hostname of the indexserver responsible for this
   repo's index.
+  - Type: string
 
 ## Cloning-error extras
 
@@ -103,14 +128,18 @@ Appended only to `<prefix>-repos-with-cloning-errors.csv`.
 
 - `mirrorInfo.isCorrupted`: Whether Sourcegraph has detected the on-disk clone
   is corrupted (`True`/`False`).
+  - Type: boolean
 - `mirrorInfo.lastError`: Last error message returned by gitserver while
   fetching or cloning this repo, if any.
+  - Type: string
 - `mirrorInfo.lastSyncOutput`: Output of the most recent sync attempt. The
   script truncates to the first 5 + last 5 lines (with `... [N lines truncated]
   ...` between them) when the output is more than 10 lines.
+  - Type: string
 - `mirrorInfo.corruptionLogs`: Semicolon-joined `timestamp: reason` entries for
   the most recent corruption events. The server caps the log at 10 entries,
   ordered newest-first.
+  - Type: string (semicolon-joined)
 
 ## Skipped-files extras
 
@@ -118,12 +147,15 @@ Appended only to `<prefix>-repos-with-skipped-files.csv`.
 
 - `skippedIndexed.totalCount`: Sum of `skippedIndexed.count` across every
   indexed ref of this repo — i.e. how many files Zoekt skipped while indexing.
+  - Type: integer
 - `skippedIndexed.refsWithSkips`: Semicolon-joined `<refName>=<count>` entries
   for every ref that has at least one skipped file.
+  - Type: string (semicolon-joined)
 - `skippedIndexed.headQuery`: Sourcegraph search query that lists every skipped
   file on HEAD (or the first ref with skips, when HEAD has none). Paste it into
   the search bar to enumerate the skipped files and their NOT-INDEXED reasons
   (too-large, binary, too-many-trigrams, too-small, blob-missing).
+  - Type: string
 
 ## `--count-commits` columns
 
@@ -132,27 +164,36 @@ Appended to every CSV when `--count-commits` is passed.
 - `defaultBranch.target.commit.ancestors.totalCount`: Number of commits
   reachable from HEAD on the default branch — equivalent to `git rev-list
   --count HEAD`. Computed by gitserver, so the value is exact.
+  - Type: integer
 - `allRefs.search.matchCount`: Approximate number of commits across every
   branch and tag, computed via Sourcegraph's commit-search API. **Not directly
   comparable** to the default-branch count above — see `--count-commits --help`
   for the methodology and caveats (server-side `timeout:` may truncate the
   result).
+  - Type: integer
 - `commitCount.queryTimeSeconds`: Wall-clock seconds the per-repo commit-count
   GraphQL request took. Useful for spotting which repos are expensive to count.
+  - Type: float
 - `mirrorInfo.lastCleanedAt`: Timestamp of the last successful gitserver
   cleanup ('gc') of this repo. May be empty.
+  - Type: timestamp
 - `mirrorInfo.cleanupSchedule.due`: Timestamp the repo is next scheduled to be
   cleaned up by gitserver.
+  - Type: timestamp
 - `mirrorInfo.cleanupSchedule.intervalSeconds`: Interval, in seconds, between
   scheduled cleanup runs.
+  - Type: integer
 - `mirrorInfo.cleanupQueue.index`: Position of the repo in the gitserver
   cleanup queue. Currently-optimizing repos are pushed to the end of the queue,
   so prefer reading this column together with `cleanupQueue.optimizing`.
+  - Type: integer
 - `mirrorInfo.cleanupQueue.optimizing`: Whether gitserver is currently running
   optimization on this repo (`True`/`False`).
+  - Type: boolean
 - [Site admin] `mirrorInfo.repositoryStatistics.packfiles.lastFullRepack`: Timestamp
   of the most recent full repack of this repo's packfiles. Empty when the repo
   is not yet cloned.
+  - Type: timestamp
 
 ## `--run-search` columns
 
@@ -161,11 +202,15 @@ Appended to every CSV when `--run-search PATTERN` is passed.
 - `runSearch.matchCount`: Number of search matches the Sourcegraph search API
   reported for the user-supplied `--run-search` pattern, scoped to this single
   repo.
+  - Type: integer
 - `runSearch.queryTimeSeconds`: Wall-clock seconds the per-repo `--run-search`
   GraphQL request took.
+  - Type: float
 - `runSearch.limitHit`: `True` when the search engine truncated results before
   reaching the natural end (so `runSearch.matchCount` is a floor, not the
   actual total).
+  - Type: boolean
 - `runSearch.alertTitle`: Title of the search-API alert when the server's
   `timeout:` budget was exceeded or the query was malformed; empty cell
   otherwise.
+  - Type: string

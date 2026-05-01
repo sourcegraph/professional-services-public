@@ -639,7 +639,7 @@ def fetch_commit_count(
         all_refs_count_raw if isinstance(all_refs_count_raw, int) else None
     )
     optimization_values = [
-        extract(repo) for _, extract, _, _ in COMMIT_COUNT_OPTIMIZATION_COLUMNS
+        extract(repo) for _, extract, _, _, _ in COMMIT_COUNT_OPTIMIZATION_COLUMNS
     ]
     return default_count, all_refs_count, elapsed, optimization_values
 
@@ -694,7 +694,7 @@ def fetch_run_search(
 # Each entry is (csv_column_name, extractor_function). Keeping the column name
 # next to the function that produces its value eliminates the risk of the
 # header drifting out of sync with the row data.
-COLUMNS: list[tuple[str, Callable[[dict[str, Any]], Any], str, bool]] = [
+COLUMNS: list[tuple[str, Callable[[dict[str, Any]], Any], str, bool, str]] = [
     (
         "id",
         lambda r: decode_repo_id(r["id"]),
@@ -702,6 +702,7 @@ COLUMNS: list[tuple[str, Callable[[dict[str, Any]], Any], str, bool]] = [
         "locally from the base64 GraphQL global ID. Useful when correlating "
         "with the `repo` table or admin URLs.",
         False,
+        "integer",
     ),
     (
         "url",
@@ -709,6 +710,7 @@ COLUMNS: list[tuple[str, Callable[[dict[str, Any]], Any], str, bool]] = [
         "Full URL to the repository on this Sourcegraph instance "
         "(the `<endpoint>` joined with `Repository.url`).",
         False,
+        "string",
     ),
     (
         "mirrorInfo.remoteURL",
@@ -716,6 +718,7 @@ COLUMNS: list[tuple[str, Callable[[dict[str, Any]], Any], str, bool]] = [
         "Clone URL of the upstream repository on the code host (may include "
         "embedded credentials).",
         True,
+        "string",
     ),
     (
         "externalServices",
@@ -723,6 +726,7 @@ COLUMNS: list[tuple[str, Callable[[dict[str, Any]], Any], str, bool]] = [
         "Semicolon-joined display names of every external service "
         "(code-host connection) that yields this repository.",
         True,
+        "string (semicolon-joined)",
     ),
     (
         "mirrorInfo.status",
@@ -732,24 +736,28 @@ COLUMNS: list[tuple[str, Callable[[dict[str, Any]], Any], str, bool]] = [
         "`cloned`, `not_cloned`, in priority order (so `corrupted` wins "
         "over `errored`, etc.).",
         False,
+        "enum (corrupted, errored, cloning, cloned, not_cloned)",
     ),
     (
         "isFork",
         lambda r: r.get("isFork"),
         "Whether this repository is a fork (`True`/`False`).",
         False,
+        "boolean",
     ),
     (
         "isArchived",
         lambda r: r.get("isArchived"),
         "Whether this repository has been archived on the code host (`True`/`False`).",
         False,
+        "boolean",
     ),
     (
         "isPrivate",
         lambda r: r.get("isPrivate"),
         "Whether this repository is private (`True`/`False`).",
         False,
+        "boolean",
     ),
     (
         "mirrorInfo.byteSize(MB)",
@@ -758,12 +766,14 @@ COLUMNS: list[tuple[str, Callable[[dict[str, Any]], Any], str, bool]] = [
         "(1 MB = 1024×1024 bytes), converted locally from "
         "`mirrorInfo.byteSize`.",
         False,
+        "float",
     ),
     (
         "createdAt",
         lambda r: r.get("createdAt"),
-        "Timestamp the repo was first added to Sourcegraph (RFC 3339).",
+        "Timestamp the repo was first added to your Sourcegraph instance.",
         False,
+        "timestamp",
     ),
     (
         "mirrorInfo.lastChanged",
@@ -771,6 +781,7 @@ COLUMNS: list[tuple[str, Callable[[dict[str, Any]], Any], str, bool]] = [
         "Timestamp of the last time the mirror's content actually changed "
         "(i.e. when commits were last added). May be empty.",
         False,
+        "timestamp",
     ),
     (
         "mirrorInfo.updatedAt",
@@ -778,6 +789,7 @@ COLUMNS: list[tuple[str, Callable[[dict[str, Any]], Any], str, bool]] = [
         "Timestamp of the most recent successful sync from the upstream "
         "remote. May be empty.",
         False,
+        "timestamp",
     ),
     (
         "mirrorInfo.nextSyncAt",
@@ -785,18 +797,21 @@ COLUMNS: list[tuple[str, Callable[[dict[str, Any]], Any], str, bool]] = [
         "Timestamp the repo is next scheduled to be synced from upstream. "
         "May be empty.",
         False,
+        "timestamp",
     ),
     (
         "mirrorInfo.updateSchedule.intervalSeconds",
         lambda r: get_path(r, "mirrorInfo.updateSchedule.intervalSeconds"),
         "Interval, in seconds, between scheduled mirror updates.",
         False,
+        "integer",
     ),
     (
         "mirrorInfo.shard",
         lambda r: get_path(r, "mirrorInfo.shard"),
         "Hostname of the gitserver shard that holds this repo's clone.",
         True,
+        "string",
     ),
     (
         "textSearchIndex.status",
@@ -805,64 +820,74 @@ COLUMNS: list[tuple[str, Callable[[dict[str, Any]], Any], str, bool]] = [
         "`indexed` if Zoekt has built an index for this repo, "
         "`not_indexed` otherwise.",
         False,
+        "enum (indexed, not_indexed)",
     ),
     (
         "textSearchIndex.status.updatedAt",
         lambda r: get_path(r, "textSearchIndex.status.updatedAt"),
         "Timestamp the Zoekt index was last refreshed.",
         False,
+        "timestamp",
     ),
     (
         "textSearchIndex.status.contentByteSize(MB)",
         lambda r: get_path_mb(r, "textSearchIndex.status.contentByteSize"),
         "Size, in megabytes, of the source content that was indexed.",
         False,
+        "float",
     ),
     (
         "textSearchIndex.status.contentFilesCount",
         lambda r: get_path(r, "textSearchIndex.status.contentFilesCount"),
         "Number of files included in the index.",
         False,
+        "integer",
     ),
     (
         "textSearchIndex.status.indexByteSize(MB)",
         lambda r: get_path_mb(r, "textSearchIndex.status.indexByteSize"),
         "Size, in megabytes, of the on-disk Zoekt index for this repo.",
         False,
+        "float",
     ),
     (
         "textSearchIndex.status.indexShardsCount",
         lambda r: get_path(r, "textSearchIndex.status.indexShardsCount"),
         "Number of Zoekt shards that make up this repo's index.",
         False,
+        "integer",
     ),
     (
         "textSearchIndex.status.newLinesCount",
         lambda r: get_path(r, "textSearchIndex.status.newLinesCount"),
         "Total number of newlines across every indexed branch (experimental field).",
         False,
+        "integer",
     ),
     (
         "textSearchIndex.status.defaultBranchNewLinesCount",
         lambda r: get_path(r, "textSearchIndex.status.defaultBranchNewLinesCount"),
         "Number of newlines indexed on the repo's default branch (experimental field).",
         False,
+        "integer",
     ),
     (
         "textSearchIndex.status.otherBranchesNewLinesCount",
         lambda r: get_path(r, "textSearchIndex.status.otherBranchesNewLinesCount"),
         "Number of newlines indexed across non-default branches (experimental field).",
         False,
+        "integer",
     ),
     (
         "textSearchIndex.host.name",
         lambda r: get_path(r, "textSearchIndex.host.name"),
         "Hostname of the indexserver responsible for this repo's index.",
         False,
+        "string",
     ),
 ]
 
-CSV_COLUMNS = [name for name, _, _, _ in COLUMNS]
+CSV_COLUMNS = [name for name, _, _, _, _ in COLUMNS]
 URL_COLUMN_INDEX = CSV_COLUMNS.index("url")
 
 # Repo-cleanup ("optimization") columns piggybacked on the same per-repo
@@ -883,7 +908,7 @@ URL_COLUMN_INDEX = CSV_COLUMNS.index("url")
 # or non-admin tokens — get_path() returns None in that case, which writes
 # an empty cell.
 COMMIT_COUNT_OPTIMIZATION_COLUMNS: list[
-    tuple[str, Callable[[dict[str, Any]], Any], str, bool]
+    tuple[str, Callable[[dict[str, Any]], Any], str, bool, str]
 ] = [
     (
         "mirrorInfo.lastCleanedAt",
@@ -891,18 +916,21 @@ COMMIT_COUNT_OPTIMIZATION_COLUMNS: list[
         "Timestamp of the last successful gitserver cleanup ('gc') of "
         "this repo. May be empty.",
         False,
+        "timestamp",
     ),
     (
         "mirrorInfo.cleanupSchedule.due",
         lambda r: get_path(r, "mirrorInfo.cleanupSchedule.due"),
         "Timestamp the repo is next scheduled to be cleaned up by gitserver.",
         False,
+        "timestamp",
     ),
     (
         "mirrorInfo.cleanupSchedule.intervalSeconds",
         lambda r: get_path(r, "mirrorInfo.cleanupSchedule.intervalSeconds"),
         "Interval, in seconds, between scheduled cleanup runs.",
         False,
+        "integer",
     ),
     (
         "mirrorInfo.cleanupQueue.index",
@@ -912,6 +940,7 @@ COMMIT_COUNT_OPTIMIZATION_COLUMNS: list[
         "so prefer reading this column together with `cleanupQueue."
         "optimizing`.",
         False,
+        "integer",
     ),
     (
         "mirrorInfo.cleanupQueue.optimizing",
@@ -919,6 +948,7 @@ COMMIT_COUNT_OPTIMIZATION_COLUMNS: list[
         "Whether gitserver is currently running optimization on this "
         "repo (`True`/`False`).",
         False,
+        "boolean",
     ),
     (
         "mirrorInfo.repositoryStatistics.packfiles.lastFullRepack",
@@ -929,6 +959,7 @@ COMMIT_COUNT_OPTIMIZATION_COLUMNS: list[
         "Timestamp of the most recent full repack of this repo's "
         "packfiles. Empty when the repo is not yet cloned.",
         True,
+        "timestamp",
     ),
 ]
 
@@ -944,13 +975,14 @@ COMMIT_COUNT_OPTIMIZATION_COLUMNS: list[
 # Each entry is (csv_column_name, description). No extractor is needed because
 # these values are appended in append_commit_count() from already-fetched
 # scalars rather than re-derived from a repo dict.
-COMMIT_COUNT_COLUMNS: list[tuple[str, str, bool]] = [
+COMMIT_COUNT_COLUMNS: list[tuple[str, str, bool, str]] = [
     (
         "defaultBranch.target.commit.ancestors.totalCount",
         "Number of commits reachable from HEAD on the default branch — "
         "equivalent to `git rev-list --count HEAD`. Computed by gitserver, "
         "so the value is exact.",
         False,
+        "integer",
     ),
     # Side-by-side with the default-branch count for easy visual comparison.
     # See ALL_REFS_COMMIT_SEARCH_TEMPLATE for the methodology and caveats.
@@ -962,16 +994,18 @@ COMMIT_COUNT_COLUMNS: list[tuple[str, str, bool]] = [
         "`--count-commits --help` for the methodology and caveats "
         "(server-side `timeout:` may truncate the result).",
         False,
+        "integer",
     ),
     (
         "commitCount.queryTimeSeconds",
         "Wall-clock seconds the per-repo commit-count GraphQL request "
         "took. Useful for spotting which repos are expensive to count.",
         False,
+        "float",
     ),
     *(
-        (name, desc, admin)
-        for name, _, desc, admin in COMMIT_COUNT_OPTIMIZATION_COLUMNS
+        (name, desc, admin, vtype)
+        for name, _, desc, admin, vtype in COMMIT_COUNT_OPTIMIZATION_COLUMNS
     ),
 ]
 
@@ -987,18 +1021,20 @@ COMMIT_COUNT_COLUMNS: list[tuple[str, str, bool]] = [
 #
 # Each entry is (csv_column_name, description); see COMMIT_COUNT_COLUMNS for
 # why no extractor is bundled.
-RUN_SEARCH_COLUMNS: list[tuple[str, str, bool]] = [
+RUN_SEARCH_COLUMNS: list[tuple[str, str, bool, str]] = [
     (
         "runSearch.matchCount",
         "Number of search matches the Sourcegraph search API reported "
         "for the user-supplied `--run-search` pattern, scoped to this "
         "single repo.",
         False,
+        "integer",
     ),
     (
         "runSearch.queryTimeSeconds",
         "Wall-clock seconds the per-repo `--run-search` GraphQL request took.",
         False,
+        "float",
     ),
     (
         "runSearch.limitHit",
@@ -1006,6 +1042,7 @@ RUN_SEARCH_COLUMNS: list[tuple[str, str, bool]] = [
         "the natural end (so `runSearch.matchCount` is a floor, not the "
         "actual total).",
         False,
+        "boolean",
     ),
     (
         "runSearch.alertTitle",
@@ -1013,12 +1050,13 @@ RUN_SEARCH_COLUMNS: list[tuple[str, str, bool]] = [
         "budget was exceeded or the query was malformed; empty cell "
         "otherwise.",
         False,
+        "string",
     ),
 ]
 
 # Extra columns appended only to the cloning-errors CSV.
 CLONING_ERROR_EXTRA_COLUMNS: list[
-    tuple[str, Callable[[dict[str, Any]], Any], str, bool]
+    tuple[str, Callable[[dict[str, Any]], Any], str, bool, str]
 ] = [
     (
         "mirrorInfo.isCorrupted",
@@ -1026,6 +1064,7 @@ CLONING_ERROR_EXTRA_COLUMNS: list[
         "Whether Sourcegraph has detected the on-disk clone is corrupted "
         "(`True`/`False`).",
         False,
+        "boolean",
     ),
     (
         "mirrorInfo.lastError",
@@ -1033,6 +1072,7 @@ CLONING_ERROR_EXTRA_COLUMNS: list[
         "Last error message returned by gitserver while fetching or "
         "cloning this repo, if any.",
         False,
+        "string",
     ),
     (
         "mirrorInfo.lastSyncOutput",
@@ -1041,6 +1081,7 @@ CLONING_ERROR_EXTRA_COLUMNS: list[
         "the first 5 + last 5 lines (with `... [N lines truncated] ...` "
         "between them) when the output is more than 10 lines.",
         False,
+        "string",
     ),
     (
         "mirrorInfo.corruptionLogs",
@@ -1049,10 +1090,11 @@ CLONING_ERROR_EXTRA_COLUMNS: list[
         "corruption events. The server caps the log at 10 entries, "
         "ordered newest-first.",
         False,
+        "string (semicolon-joined)",
     ),
 ]
 CLONING_ERROR_CSV_COLUMNS = CSV_COLUMNS + [
-    name for name, _, _, _ in CLONING_ERROR_EXTRA_COLUMNS
+    name for name, _, _, _, _ in CLONING_ERROR_EXTRA_COLUMNS
 ]
 # The indexing-errors CSV reuses CSV_COLUMNS verbatim — Sourcegraph's GraphQL
 # does not expose any per-repo zoekt error fields beyond textSearchIndex.status.
@@ -1062,7 +1104,7 @@ CLONING_ERROR_CSV_COLUMNS = CSV_COLUMNS + [
 # file along with its NOT-INDEXED reason (too-large / binary / too-many-trigrams
 # / too-small / blob-missing).
 SKIPPED_FILES_EXTRA_COLUMNS: list[
-    tuple[str, Callable[[dict[str, Any]], Any], str, bool]
+    tuple[str, Callable[[dict[str, Any]], Any], str, bool, str]
 ] = [
     (
         "skippedIndexed.totalCount",
@@ -1070,6 +1112,7 @@ SKIPPED_FILES_EXTRA_COLUMNS: list[
         "Sum of `skippedIndexed.count` across every indexed ref of this "
         "repo — i.e. how many files Zoekt skipped while indexing.",
         False,
+        "integer",
     ),
     (
         "skippedIndexed.refsWithSkips",
@@ -1077,6 +1120,7 @@ SKIPPED_FILES_EXTRA_COLUMNS: list[
         "Semicolon-joined `<refName>=<count>` entries for every ref that "
         "has at least one skipped file.",
         False,
+        "string (semicolon-joined)",
     ),
     (
         "skippedIndexed.headQuery",
@@ -1087,10 +1131,11 @@ SKIPPED_FILES_EXTRA_COLUMNS: list[
         "NOT-INDEXED reasons (too-large, binary, too-many-trigrams, "
         "too-small, blob-missing).",
         False,
+        "string",
     ),
 ]
 SKIPPED_FILES_CSV_COLUMNS = CSV_COLUMNS + [
-    name for name, _, _, _ in SKIPPED_FILES_EXTRA_COLUMNS
+    name for name, _, _, _, _ in SKIPPED_FILES_EXTRA_COLUMNS
 ]
 
 
@@ -1108,9 +1153,9 @@ SKIPPED_FILES_CSV_COLUMNS = CSV_COLUMNS + [
 README_LINE_WIDTH = 79
 
 
-def format_columns_list(columns: list[tuple[str, str, bool]]) -> str:
-    """Render a `[(name, description, requires_admin), ...]` list as a wrapped
-    bullet list.
+def format_columns_list(columns: list[tuple[str, str, bool, str]]) -> str:
+    """Render a `[(name, description, requires_admin, value_type), ...]` list
+    as a wrapped bullet list with a `Type:` sub-bullet per entry.
 
     Markdown tables can't have line breaks within a row, so a description
     column on a tabular layout will easily exceed Markdownlint's MD013
@@ -1122,9 +1167,13 @@ def format_columns_list(columns: list[tuple[str, str, bool]]) -> str:
     `[Site admin]` so a reader scanning the list can immediately spot the
     columns that will be empty for non-admin tokens. The README header
     explains the convention once at the top.
+
+    The value type (e.g. `integer`, `boolean`, `timestamp`, `enum (...)`)
+    is rendered as a `- Type:` sub-bullet so callers can quickly tell how
+    to parse each CSV cell without re-reading the description.
     """
     paragraphs: list[str] = []
-    for name, desc, requires_admin in columns:
+    for name, desc, requires_admin, value_type in columns:
         prefix = "[Site admin] " if requires_admin else ""
         first = f"- {prefix}`{name}`: "
         wrapped = textwrap.fill(
@@ -1136,21 +1185,24 @@ def format_columns_list(columns: list[tuple[str, str, bool]]) -> str:
             break_long_words=False,
             break_on_hyphens=False,
         )
-        paragraphs.append(wrapped)
+        paragraphs.append(wrapped + f"\n  - Type: {value_type}")
     return "\n".join(paragraphs)
 
 
 def name_desc(
-    columns: list[tuple[str, Callable[[dict[str, Any]], Any], str, bool]],
-) -> list[tuple[str, str, bool]]:
+    columns: list[tuple[str, Callable[[dict[str, Any]], Any], str, bool, str]],
+) -> list[tuple[str, str, bool, str]]:
     """Project an extractor-bearing column list to (name, description,
-    requires_admin) triples.
+    requires_admin, value_type) tuples.
 
     Used to feed format_columns_list from the COLUMNS / CLONING_*EXTRA /
     SKIPPED_*EXTRA / COMMIT_COUNT_OPTIMIZATION_COLUMNS lists, all of which
     carry an extractor in the second slot.
     """
-    return [(name, desc, requires_admin) for name, _, desc, requires_admin in columns]
+    return [
+        (name, desc, requires_admin, value_type)
+        for name, _, desc, requires_admin, value_type in columns
+    ]
 
 
 def write_readme(path: Path) -> None:
@@ -1904,7 +1956,7 @@ def build_row(repo: dict[str, Any], endpoint: str) -> list[Any]:
     position, matching the header produced by csv_columns_for().
     """
     base = endpoint.rstrip("/")
-    row = [extract(repo) for _, extract, _, _ in COLUMNS]
+    row = [extract(repo) for _, extract, _, _, _ in COLUMNS]
     if row[URL_COLUMN_INDEX]:
         row[URL_COLUMN_INDEX] = base + row[URL_COLUMN_INDEX]
     return row
@@ -1994,9 +2046,9 @@ def csv_columns_for(
     """
     cols = list(base_columns)
     if count_commits:
-        cols.extend(name for name, _, _ in COMMIT_COUNT_COLUMNS)
+        cols.extend(name for name, _, _, _ in COMMIT_COUNT_COLUMNS)
     if run_search:
-        cols.extend(name for name, _, _ in RUN_SEARCH_COLUMNS)
+        cols.extend(name for name, _, _, _ in RUN_SEARCH_COLUMNS)
     return cols
 
 
@@ -2183,7 +2235,7 @@ def write_csv(
                     row
                     + [
                         extract(repo)
-                        for _, extract, _, _ in CLONING_ERROR_EXTRA_COLUMNS
+                        for _, extract, _, _, _ in CLONING_ERROR_EXTRA_COLUMNS
                     ],
                 ),
             )
@@ -2205,7 +2257,7 @@ def write_csv(
                     row
                     + [
                         extract(repo)
-                        for _, extract, _, _ in SKIPPED_FILES_EXTRA_COLUMNS
+                        for _, extract, _, _, _ in SKIPPED_FILES_EXTRA_COLUMNS
                     ],
                 ),
             )
