@@ -49,7 +49,9 @@ These are written to every CSV file.
 | `createdAt` | timestamp | | Timestamp the repo was first cloned to your Sourcegraph instance. |
 | `mirrorInfo.lastChanged` | timestamp | | Timestamp of the most recent commit in the repo. |
 | `mirrorInfo.updatedAt` | timestamp | | Timestamp of the most recent successful sync of the repo from the code host. |
+| `mirrorInfo.secondsSinceUpdatedAt` | integer | | Integer seconds elapsed between `mirrorInfo.updatedAt` and the moment the script extracted this row (UTC). Computed locally. Negative when the upstream timestamp is in the future relative to this machine's clock; empty when `mirrorInfo.updatedAt` is empty or unparseable. |
 | `mirrorInfo.nextSyncAt` | timestamp | | Timestamp the repo is next scheduled to be synced from upstream. |
+| `mirrorInfo.secondsUntilNextSyncAt` | integer | | Integer seconds remaining until `mirrorInfo.nextSyncAt`, computed locally against the script's wall clock (UTC). Negative when the scheduled sync time has already passed (gitserver is overdue or the repo is mid-sync); empty when `mirrorInfo.nextSyncAt` is empty or unparseable. |
 | `mirrorInfo.updateSchedule.intervalSeconds` | integer | | Interval, in seconds, between scheduled mirror updates. Default max is 28800 seconds (8 hours), but is shortened for busy / popular repos. |
 | `mirrorInfo.shard` | string | true | Pod name of the gitserver shard which holds this repo's clone. |
 | `textSearchIndex.status` | enum (indexed, not_indexed) | | Search-index state, derived locally: `indexed` if Zoekt has built an index for this repo, `not_indexed` otherwise. |

@@ -48,6 +48,7 @@ import shlex
 import sys
 import textwrap
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn, TextIO, cast
 from urllib.parse import ParseResult, urlparse, urlsplit, urlunsplit
@@ -429,6 +430,30 @@ def derive_mirror_status(repo: dict[str, Any]) -> str:
     if mirror.get("cloned"):
         return "cloned"
     return "not_cloned"
+
+
+def seconds_relative_to_now(timestamp: object, *, future: bool) -> int | None:
+    """Return the integer second-delta between `timestamp` and now (UTC).
+
+    `future=False` returns now - timestamp (seconds since the past event).
+    `future=True`  returns timestamp - now (seconds until the future event).
+    Either side can be negative when the actual ordering is reversed
+    (e.g. a `nextSyncAt` whose schedule slot already elapsed). Returns
+    `None` if the timestamp is missing or unparseable.
+
+    Sourcegraph emits timestamps as RFC 3339 strings with `Z` suffix;
+    `datetime.fromisoformat` accepts the `Z` form starting with Python
+    3.11, but we normalize defensively for older interpreters.
+    """
+    if not isinstance(timestamp, str) or not timestamp:
+        return None
+    try:
+        ts = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    now = datetime.now(timezone.utc)
+    delta = (ts - now) if future else (now - ts)
+    return int(delta.total_seconds())
 
 
 def derive_index_status(repo: dict[str, Any]) -> str:
@@ -823,11 +848,39 @@ COLUMNS: list[tuple[str, Callable[[dict[str, Any]], Any], str, bool, str]] = [
         "timestamp",
     ),
     (
+        "mirrorInfo.secondsSinceUpdatedAt",
+        lambda r: seconds_relative_to_now(
+            get_path(r, "mirrorInfo.updatedAt"),
+            future=False,
+        ),
+        "Integer seconds elapsed between `mirrorInfo.updatedAt` and the "
+        "moment the script extracted this row (UTC). Computed locally. "
+        "Negative when the upstream timestamp is in the future relative "
+        "to this machine's clock; empty when `mirrorInfo.updatedAt` is "
+        "empty or unparseable.",
+        False,
+        "integer",
+    ),
+    (
         "mirrorInfo.nextSyncAt",
         lambda r: get_path(r, "mirrorInfo.nextSyncAt"),
         "Timestamp the repo is next scheduled to be synced from upstream.",
         False,
         "timestamp",
+    ),
+    (
+        "mirrorInfo.secondsUntilNextSyncAt",
+        lambda r: seconds_relative_to_now(
+            get_path(r, "mirrorInfo.nextSyncAt"),
+            future=True,
+        ),
+        "Integer seconds remaining until `mirrorInfo.nextSyncAt`, computed "
+        "locally against the script's wall clock (UTC). Negative when the "
+        "scheduled sync time has already passed (gitserver is overdue or "
+        "the repo is mid-sync); empty when `mirrorInfo.nextSyncAt` is "
+        "empty or unparseable.",
+        False,
+        "integer",
     ),
     (
         "mirrorInfo.updateSchedule.intervalSeconds",
