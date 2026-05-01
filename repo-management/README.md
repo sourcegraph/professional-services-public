@@ -9,26 +9,33 @@ explicitly.
 
 Columns prefixed with `[Site admin]` in the lists below come from
 GraphQL fields that the Sourcegraph server only exposes to site
-admins. When you run the script with a non-admin token, the script
-either omits the underlying selection (for `externalServices`) or
-the server silently returns null (for the `mirrorInfo.*` fields), so
-those columns appear in the CSV with empty cells. Every other column
-is populated for any authenticated user with read access to the
-repository.
+admins. When you run the script with an access token from a
+non-admin user, the script either omits the underlying selection
+(for `externalServices`) or the server silently returns null (for
+the `mirrorInfo.*` fields), so those columns appear in the CSV with
+empty cells. Every other column is populated for any authenticated
+user with read access to the repository.
 
 ## Output files
 
 The script always writes its outputs prefixed with the sanitized
-Sourcegraph endpoint (e.g. `sourcegraph.example.com-repos.csv`):
+Sourcegraph endpoint (e.g. `sourcegraph.example.com-repos.csv`),
+so the script can run against multiple instances without overwriting files.
 
-- `<prefix>-repos.csv` — always written. Main columns.
-- `<prefix>-repos-with-cloning-errors.csv` — written when at least one
-  repo has a cloning error. Main columns + cloning-error extras.
-- `<prefix>-repos-with-indexing-errors.csv` — written when at least one
-  repo is cloned but missing a search index. Main columns.
-- `<prefix>-repos-with-skipped-files.csv` — written when `--skipped-files`
-  is set and at least one repo had Zoekt skip files. Main columns +
-  skipped-files extras.
+- `<prefix>-repos.csv`
+  - Written when: always.
+  - Columns: main columns.
+- `<prefix>-repos-with-cloning-errors.csv`
+  - Written when: at least one repo has a cloning error.
+  - Columns: main columns + cloning-error extras.
+- `<prefix>-repos-with-indexing-errors.csv`
+  - Written when: at least one repo is cloned but missing a search
+    index.
+  - Columns: main columns.
+- `<prefix>-repos-with-skipped-files.csv`
+  - Written when: `--skipped-files` is set and at least one repo had
+    Zoekt skip files.
+  - Columns: main columns + skipped-files extras.
 
 The optional `--count-commits` and `--run-search` flags append extra
 columns to *every* CSV listed above, in this order: main columns →
