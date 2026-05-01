@@ -51,12 +51,9 @@ These are written to every CSV file.
 - `url`: Full URL to the repository on this Sourcegraph instance (the
   `<endpoint>` joined with `Repository.url`).
 - [Site admin] `mirrorInfo.remoteURL`: Clone URL of the upstream repository on
-  the code host (may include embedded credentials). **Site-admin only — empty
-  cell for non-admin tokens.**
+  the code host (may include embedded credentials).
 - [Site admin] `externalServices`: Semicolon-joined display names of every
   external service (code-host connection) that yields this repository.
-  **Site-admin only — empty cell for non-admin tokens; the script omits the
-  underlying GraphQL selection in that case.**
 - `mirrorInfo.status`: Single-word summary of the repo's mirror state, derived
   locally from `mirrorInfo`. One of `corrupted`, `errored`, `cloning`,
   `cloned`, `not_cloned`, in priority order (so `corrupted` wins over
@@ -77,7 +74,7 @@ These are written to every CSV file.
 - `mirrorInfo.updateSchedule.intervalSeconds`: Interval, in seconds, between
   scheduled mirror updates.
 - [Site admin] `mirrorInfo.shard`: Hostname of the gitserver shard that holds
-  this repo's clone. **Site-admin only — empty cell for non-admin tokens.**
+  this repo's clone.
 - `textSearchIndex.status`: Single-word summary of the search-index state,
   derived locally: `indexed` if Zoekt has built an index for this repo,
   `not_indexed` otherwise.
@@ -154,9 +151,8 @@ Appended to every CSV when `--count-commits` is passed.
 - `mirrorInfo.cleanupQueue.optimizing`: Whether gitserver is currently running
   optimization on this repo (`True`/`False`).
 - [Site admin] `mirrorInfo.repositoryStatistics.packfiles.lastFullRepack`: Timestamp
-  of the most recent full repack of this repo's packfiles. **Site-admin only —
-  empty cell for non-admin tokens, and also empty when the repo is not yet
-  cloned.**
+  of the most recent full repack of this repo's packfiles. Empty when the repo
+  is not yet cloned.
 
 ## `--run-search` columns
 

@@ -714,17 +714,14 @@ COLUMNS: list[tuple[str, Callable[[dict[str, Any]], Any], str, bool]] = [
         "mirrorInfo.remoteURL",
         lambda r: get_path(r, "mirrorInfo.remoteURL"),
         "Clone URL of the upstream repository on the code host (may include "
-        "embedded credentials). **Site-admin only — empty cell for "
-        "non-admin tokens.**",
+        "embedded credentials).",
         True,
     ),
     (
         "externalServices",
         join_external_services,
         "Semicolon-joined display names of every external service "
-        "(code-host connection) that yields this repository. **Site-admin "
-        "only — empty cell for non-admin tokens; the script omits the "
-        "underlying GraphQL selection in that case.**",
+        "(code-host connection) that yields this repository.",
         True,
     ),
     (
@@ -798,8 +795,7 @@ COLUMNS: list[tuple[str, Callable[[dict[str, Any]], Any], str, bool]] = [
     (
         "mirrorInfo.shard",
         lambda r: get_path(r, "mirrorInfo.shard"),
-        "Hostname of the gitserver shard that holds this repo's clone. "
-        "**Site-admin only — empty cell for non-admin tokens.**",
+        "Hostname of the gitserver shard that holds this repo's clone.",
         True,
     ),
     (
@@ -931,8 +927,7 @@ COMMIT_COUNT_OPTIMIZATION_COLUMNS: list[
             "mirrorInfo.repositoryStatistics.packfiles.lastFullRepack",
         ),
         "Timestamp of the most recent full repack of this repo's "
-        "packfiles. **Site-admin only — empty cell for non-admin tokens, "
-        "and also empty when the repo is not yet cloned.**",
+        "packfiles. Empty when the repo is not yet cloned.",
         True,
     ),
 ]
