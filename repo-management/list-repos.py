@@ -72,6 +72,7 @@ DEFAULT_OUTPUT_FILE = "repos.csv"
 DEFAULT_CLONING_ERRORS_FILE = "repos-with-cloning-errors.csv"
 DEFAULT_INDEXING_ERRORS_FILE = "repos-with-indexing-errors.csv"
 DEFAULT_SKIPPED_FILES_FILE = "repos-with-skipped-files.csv"
+DEFAULT_STATS_FILE_PREFIX = "stats"
 DEFAULT_LOG_FILE = "list-repos.log"
 DEFAULT_README_FILE = "README.md"
 
@@ -1217,6 +1218,216 @@ SKIPPED_FILES_CSV_COLUMNS = CSV_COLUMNS + [
 ]
 
 
+# --- Statistics ---------------------------------------------------------------
+#
+# When --statistics is passed, every repo seen during the listing pass is fed
+# through StatsCollector, which buckets each repo by repo / content / index
+# size (in MB) and by the content/mirror and index/content ratios. At the end
+# of the run, write_stats() emits one CSV file per bucket dimension, named
+# `<prefix>-stats-<dimension>.csv`. All sizes use the same MB conversion as
+# the main CSV (`get_path_mb`), so a "0-1 MB" bucket means the floor-divided
+# MB value is 0 (i.e. the underlying byteSize is < 1 MiB).
+
+# (label, lo_inclusive_mb, hi_exclusive_mb_or_None) — used for the repo and
+# indexed-content size distributions, which span many orders of magnitude.
+SIZE_BUCKETS_MB: list[tuple[str, int, int | None]] = [
+    ("0-1 MB", 0, 1),
+    ("1 MB - 1 GB", 1, 1024),
+    ("1-10 GB", 1024, 10 * 1024),
+    ("10-100 GB", 10 * 1024, 100 * 1024),
+    (">100 GB", 100 * 1024, None),
+]
+
+# Search indexes are typically much smaller than the source they index, so a
+# narrower set of buckets is more useful here than reusing SIZE_BUCKETS_MB.
+INDEX_SIZE_BUCKETS_MB: list[tuple[str, int, int | None]] = [
+    ("0-1 MB", 0, 1),
+    ("1-10 MB", 1, 10),
+    ("10-100 MB", 10, 100),
+    (">100 MB", 100, None),
+]
+
+# Used for both content/mirror and index/content ratio distributions. The
+# >100% bucket isn't a logic bug — content can exceed the bare clone size
+# when the bare clone is heavily packed, and the index can briefly exceed
+# the content size on small repos due to per-shard overhead.
+PERCENT_BUCKETS: list[tuple[str, float, float | None]] = [
+    ("0-10%", 0, 10),
+    ("10-25%", 10, 25),
+    ("25-50%", 25, 50),
+    ("50-75%", 50, 75),
+    ("75-100%", 75, 100),
+    ("100-150%", 100, 150),
+    (">150%", 150, None),
+]
+
+
+def bucket_label(
+    value: float,
+    buckets: list[tuple[str, float, float | None]] | list[tuple[str, int, int | None]],
+) -> str | None:
+    """Return the label of the first bucket that contains `value`, or None."""
+    for label, lo, hi in buckets:
+        if value >= lo and (hi is None or value < hi):
+            return label
+    return None
+
+
+class StatsCollector:
+    """Accumulates per-repo size / ratio counts for the --statistics CSVs.
+
+    `add(repo)` is called once per repo as the listing is streamed; bucket
+    counters and running totals are updated in place. `write(prefix)` emits
+    one CSV per dimension at the end of the run. Memory cost is bounded by
+    the (small, fixed) number of buckets, so this is safe to enable on
+    instances of any size.
+    """
+
+    def __init__(self) -> None:
+        self.mirror_buckets: collections.Counter[str] = collections.Counter()
+        self.content_buckets: collections.Counter[str] = collections.Counter()
+        self.index_buckets: collections.Counter[str] = collections.Counter()
+        self.content_vs_mirror_buckets: collections.Counter[str] = collections.Counter()
+        self.index_vs_content_buckets: collections.Counter[str] = collections.Counter()
+        self.cloned_count = 0
+        self.cloned_total_mb = 0
+        self.content_count = 0
+        self.content_total_mb = 0
+        self.indexed_count = 0
+        self.indexed_total_mb = 0
+
+    def add(self, repo: dict[str, Any]) -> None:
+        """Update every counter from a single repo's size fields."""
+        mirror_mb = get_path_mb(repo, "mirrorInfo.byteSize")
+        content_mb = get_path_mb(repo, "textSearchIndex.status.contentByteSize")
+        index_mb = get_path_mb(repo, "textSearchIndex.status.indexByteSize")
+
+        # Restrict the mirror size distribution to repos which actually have
+        # a clone on disk; reporting `not_cloned` repos under "0-1 MB" would
+        # blur "tiny repo" with "missing clone" in the same bucket.
+        if mirror_mb is not None and derive_mirror_status(repo) == "cloned":
+            self.cloned_count += 1
+            self.cloned_total_mb += mirror_mb
+            label = bucket_label(mirror_mb, SIZE_BUCKETS_MB)
+            if label is not None:
+                self.mirror_buckets[label] += 1
+
+        # Both content and index sizes only exist on repos that have a search
+        # index, so presence of the underlying field is the right gate.
+        if content_mb is not None:
+            self.content_count += 1
+            self.content_total_mb += content_mb
+            label = bucket_label(content_mb, SIZE_BUCKETS_MB)
+            if label is not None:
+                self.content_buckets[label] += 1
+
+        if index_mb is not None:
+            self.indexed_count += 1
+            self.indexed_total_mb += index_mb
+            label = bucket_label(index_mb, INDEX_SIZE_BUCKETS_MB)
+            if label is not None:
+                self.index_buckets[label] += 1
+
+        # Skip the ratio buckets when either operand is missing or the
+        # denominator floored to 0 MB (the result would be undefined / inf).
+        if content_mb is not None and mirror_mb is not None and mirror_mb > 0:
+            pct = (content_mb / mirror_mb) * 100
+            label = bucket_label(pct, PERCENT_BUCKETS)
+            if label is not None:
+                self.content_vs_mirror_buckets[label] += 1
+
+        if index_mb is not None and content_mb is not None and content_mb > 0:
+            pct = (index_mb / content_mb) * 100
+            label = bucket_label(pct, PERCENT_BUCKETS)
+            if label is not None:
+                self.index_vs_content_buckets[label] += 1
+
+
+# Per-stat metadata used by write_stats() and the README generator. Each
+# entry is (filename_suffix, description, bucket_definition,
+# counter_attr_name, summary_rows_builder). The summary builder receives the
+# StatsCollector and returns a list of (metric, value) rows appended after
+# the bucket rows so each CSV is self-contained (totals plus distribution
+# in one file).
+STATS_FILES: list[
+    tuple[
+        str,
+        str,
+        list[tuple[str, int, int | None]] | list[tuple[str, float, float | None]],
+        str,
+        Callable[[StatsCollector], list[tuple[str, Any]]],
+    ]
+] = [
+    (
+        "mirror-byte-size",
+        "Distribution of cloned repos by `mirrorInfo.byteSize` (MB).",
+        SIZE_BUCKETS_MB,
+        "mirror_buckets",
+        lambda s: [
+            ("TOTAL_CLONED_REPOS", s.cloned_count),
+            ("TOTAL_CLONED_SIZE_MB", s.cloned_total_mb),
+        ],
+    ),
+    (
+        "content-byte-size",
+        "Distribution of indexed repos by `textSearchIndex.status.contentByteSize` (MB).",
+        SIZE_BUCKETS_MB,
+        "content_buckets",
+        lambda s: [
+            ("TOTAL_INDEXED_REPOS", s.content_count),
+            ("TOTAL_CONTENT_SIZE_MB", s.content_total_mb),
+        ],
+    ),
+    (
+        "index-byte-size",
+        "Distribution of indexed repos by `textSearchIndex.status.indexByteSize` (MB).",
+        INDEX_SIZE_BUCKETS_MB,
+        "index_buckets",
+        lambda s: [
+            ("TOTAL_INDEXED_REPOS", s.indexed_count),
+            ("TOTAL_INDEX_SIZE_MB", s.indexed_total_mb),
+        ],
+    ),
+    (
+        "content-vs-mirror-pct",
+        "Distribution of `contentByteSize / mirrorInfo.byteSize` (as a percentage).",
+        PERCENT_BUCKETS,
+        "content_vs_mirror_buckets",
+        lambda s: [("TOTAL_REPOS", sum(s.content_vs_mirror_buckets.values()))],
+    ),
+    (
+        "index-vs-content-pct",
+        "Distribution of `indexByteSize / contentByteSize` (as a percentage).",
+        PERCENT_BUCKETS,
+        "index_vs_content_buckets",
+        lambda s: [("TOTAL_REPOS", sum(s.index_vs_content_buckets.values()))],
+    ),
+]
+
+
+def write_stats(prefix: str, stats: StatsCollector) -> list[Path]:
+    """Emit one CSV per entry in STATS_FILES; return the paths actually written.
+
+    Each CSV has two columns (`bucket,count`) listing every bucket in
+    declaration order (zero-count buckets are still written so a chart of
+    the file shows the full distribution), followed by per-stat summary
+    rows (totals) appended below the bucket rows.
+    """
+    written: list[Path] = []
+    for suffix, _desc, buckets, attr, summary_builder in STATS_FILES:
+        path = Path(f"{prefix}-{DEFAULT_STATS_FILE_PREFIX}-{suffix}.csv")
+        counter: collections.Counter[str] = getattr(stats, attr)
+        with path.open("w", newline="") as out:
+            writer = csv.writer(out)
+            writer.writerow(["bucket", "count"])
+            for label, _lo, _hi in buckets:
+                writer.writerow([label, counter.get(label, 0)])
+            for metric, value in summary_builder(stats):
+                writer.writerow([metric, value])
+        written.append(path)
+    return written
+
+
 # --- README generation --------------------------------------------------------
 
 # Column descriptions are colocated with each column tuple above (third
@@ -1282,6 +1493,30 @@ def name_desc(
     ]
 
 
+def format_stats_files_list() -> str:
+    """Render STATS_FILES as a Markdown table for the README.
+
+    Columns: `File suffix` | `Buckets` | `Description`. The `Buckets` cell
+    lists every bucket label (in declaration order) so a reader can see
+    the exact distribution boundaries the script will write.
+    """
+    rows = [
+        table_row("File suffix", "Buckets", "Description"),
+        table_row("---", "---", "---"),
+    ]
+    for suffix, desc, buckets, _attr, _summary in STATS_FILES:
+        bucket_cell = ", ".join(label for label, _, _ in buckets)
+        # Defensive: escape pipes so a description never breaks the table.
+        rows.append(
+            table_row(
+                f"`{DEFAULT_STATS_FILE_PREFIX}-{suffix}.csv`",
+                bucket_cell,
+                desc.replace("|", "\\|"),
+            ),
+        )
+    return "\n".join(rows)
+
+
 def write_readme(path: Path) -> None:
     """Write a README.md describing every CSV file the script can produce.
 
@@ -1295,6 +1530,7 @@ def write_readme(path: Path) -> None:
     skipped_list = format_columns_list(name_desc(SKIPPED_FILES_EXTRA_COLUMNS))
     commit_count_list = format_columns_list(COMMIT_COUNT_COLUMNS)
     run_search_list = format_columns_list(RUN_SEARCH_COLUMNS)
+    stats_files_list = format_stats_files_list()
 
     content = f"""# `list-repos.py` CSV column reference
 
@@ -1324,10 +1560,12 @@ so the script can run against multiple instances without overwriting files.
 | `<prefix>-{DEFAULT_CLONING_ERRORS_FILE}` | at least one repo has a cloning error | main columns + cloning-error extras |
 | `<prefix>-{DEFAULT_INDEXING_ERRORS_FILE}` | at least one repo is cloned but is missing a search index | main columns |
 | `<prefix>-{DEFAULT_SKIPPED_FILES_FILE}` | `--skipped-files` is set and the last index excluded some files | main columns + skipped-files extras |
+| `<prefix>-{DEFAULT_STATS_FILE_PREFIX}-*.csv` | `--statistics` is set | `bucket,count` (see Statistics section) |
 
 The optional `--count-commits` and `--run-search` flags append extra
-columns to *every* CSV listed above, in this order: main columns →
-per-CSV extras → commit-count columns → run-search columns.
+columns to *every* CSV listed above (except the `--statistics` files,
+which are summaries rather than per-repo rows), in this order: main
+columns → per-CSV extras → commit-count columns → run-search columns.
 
 ## Main columns
 
@@ -1358,6 +1596,16 @@ Appended to every CSV when `--count-commits` is passed.
 Appended to every CSV when `--run-search PATTERN` is passed.
 
 {run_search_list}
+
+## `--statistics` files
+
+Written when `--statistics` is passed. One CSV per dimension; each file
+has two columns (`bucket,count`) listing every bucket in declaration
+order, followed by per-stat summary rows (totals) appended below the
+bucket rows. Counts come from the same listing pass that produces the
+main CSV, so enabling `--statistics` adds no extra GraphQL requests.
+
+{stats_files_list}
 """
     path.write_text(content, encoding="utf-8")
 
@@ -2137,6 +2385,7 @@ def write_csv(
     scope_repo: str | None = None,
     count_commits_rev: str = "HEAD",
     run_search_pattern: str | None = None,
+    stats: StatsCollector | None = None,
     is_site_admin: bool,
 ) -> tuple[int, int, int]:
     """Stream repos directly to CSV rather than collecting them first.
@@ -2297,6 +2546,8 @@ def write_csv(
 
         writer.writerow(_augmented(row))
         total += 1
+        if stats is not None:
+            stats.add(repo)
         repo_has_cloning_error = has_cloning_error(repo)
         repo_has_indexing_error = has_indexing_error(repo)
         if repo_has_cloning_error:
@@ -2639,6 +2890,35 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--statistics",
+        action="store_true",
+        help=(
+            "Compute size / ratio distribution statistics across every repo\n"
+            "in the listing and write one CSV per dimension:\n"
+            f"  ENDPOINT-{DEFAULT_STATS_FILE_PREFIX}-mirror-byte-size.csv\n"
+            "    Bucket counts of cloned repos by `mirrorInfo.byteSize` (MB).\n"
+            "    Buckets: 0-1 MB, 1 MB - 1 GB, 1-10 GB, 10-100 GB, >100 GB.\n"
+            "    Includes TOTAL_CLONED_REPOS and TOTAL_CLONED_SIZE_MB rows.\n"
+            f"  ENDPOINT-{DEFAULT_STATS_FILE_PREFIX}-content-byte-size.csv\n"
+            "    Bucket counts of indexed repos by\n"
+            "    `textSearchIndex.status.contentByteSize` (MB).\n"
+            "    Same buckets as the mirror size file.\n"
+            "    Includes TOTAL_INDEXED_REPOS and TOTAL_CONTENT_SIZE_MB.\n"
+            f"  ENDPOINT-{DEFAULT_STATS_FILE_PREFIX}-index-byte-size.csv\n"
+            "    Bucket counts of indexed repos by\n"
+            "    `textSearchIndex.status.indexByteSize` (MB).\n"
+            "    Buckets: 0-1 MB, 1-10 MB, 10-100 MB, >100 MB.\n"
+            "    Includes TOTAL_INDEXED_REPOS and TOTAL_INDEX_SIZE_MB.\n"
+            f"  ENDPOINT-{DEFAULT_STATS_FILE_PREFIX}-content-vs-mirror-pct.csv\n"
+            "    Bucket counts of repos by `contentByteSize / mirrorInfo.byteSize`\n"
+            "    expressed as a percentage. Buckets: 0-10%%, 10-25%%, 25-50%%,\n"
+            "    50-75%%, 75-100%%, 100-150%%, >150%%.\n"
+            f"  ENDPOINT-{DEFAULT_STATS_FILE_PREFIX}-index-vs-content-pct.csv\n"
+            "    Bucket counts of repos by `indexByteSize / contentByteSize`\n"
+            "    expressed as a percentage. Same buckets as above."
+        ),
+    )
+    parser.add_argument(
         "--src-endpoint",
         default=None,
         metavar="URL",
@@ -2794,6 +3074,7 @@ def run(args: argparse.Namespace, endpoint: str, token: str) -> None:
                 ("--skipped-files", args.skipped_files),
                 ("--count-commits", args.count_commits),
                 ("--run-search", args.run_search is not None),
+                ("--statistics", args.statistics),
             )
             if set_
         ]
@@ -2834,7 +3115,15 @@ def run(args: argparse.Namespace, endpoint: str, token: str) -> None:
     indexing_errors_path.unlink(missing_ok=True)
     if skipped_files_path is not None:
         skipped_files_path.unlink(missing_ok=True)
+    # Same treatment for the --statistics CSVs: clear them up-front so a
+    # mid-run failure can't leave a stale stats file lying around even when
+    # the user disabled --statistics on this invocation.
+    for suffix, *_ in STATS_FILES:
+        Path(f"{prefix}-{DEFAULT_STATS_FILE_PREFIX}-{suffix}.csv").unlink(
+            missing_ok=True,
+        )
 
+    stats = StatsCollector() if args.statistics else None
     count_commits_enabled = bool(args.count_commits)
     run_search_pattern: str | None = args.run_search
     run_search_enabled = run_search_pattern is not None
@@ -2892,8 +3181,14 @@ def run(args: argparse.Namespace, endpoint: str, token: str) -> None:
             scope_repo=scope_repo,
             count_commits_rev=scope_rev,
             run_search_pattern=run_search_pattern,
+            stats=stats,
             is_site_admin=is_site_admin,
         )
+
+    if stats is not None:
+        stats_paths = write_stats(prefix, stats)
+        for stats_path in stats_paths:
+            logger.info("Wrote statistics to %s", stats_path.name)
 
     logger.info("Wrote %d repos to %s", total, output_path.name)
     if cloning_writer.count:

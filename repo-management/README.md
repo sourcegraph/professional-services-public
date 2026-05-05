@@ -26,10 +26,12 @@ so the script can run against multiple instances without overwriting files.
 | `<prefix>-repos-with-cloning-errors.csv` | at least one repo has a cloning error | main columns + cloning-error extras |
 | `<prefix>-repos-with-indexing-errors.csv` | at least one repo is cloned but is missing a search index | main columns |
 | `<prefix>-repos-with-skipped-files.csv` | `--skipped-files` is set and the last index excluded some files | main columns + skipped-files extras |
+| `<prefix>-stats-*.csv` | `--statistics` is set | `bucket,count` (see Statistics section) |
 
 The optional `--count-commits` and `--run-search` flags append extra
-columns to *every* CSV listed above, in this order: main columns →
-per-CSV extras → commit-count columns → run-search columns.
+columns to *every* CSV listed above (except the `--statistics` files,
+which are summaries rather than per-repo rows), in this order: main
+columns → per-CSV extras → commit-count columns → run-search columns.
 
 ## Main columns
 
@@ -112,3 +114,19 @@ Appended to every CSV when `--run-search PATTERN` is passed.
 | `runSearch.queryTimeSeconds` | float | | Wall-clock seconds the per-repo `--run-search` GraphQL request took. |
 | `runSearch.limitHit` | boolean | | `True` when the search engine truncated results before reaching the natural end (so `runSearch.matchCount` is a floor, not the actual total). |
 | `runSearch.alertTitle` | string | | Title of the search-API alert when the server's `timeout:` budget was exceeded or the query was malformed; empty cell otherwise. |
+
+## `--statistics` files
+
+Written when `--statistics` is passed. One CSV per dimension; each file
+has two columns (`bucket,count`) listing every bucket in declaration
+order, followed by per-stat summary rows (totals) appended below the
+bucket rows. Counts come from the same listing pass that produces the
+main CSV, so enabling `--statistics` adds no extra GraphQL requests.
+
+| File suffix | Buckets | Description |
+| --- | --- | --- |
+| `stats-mirror-byte-size.csv` | 0-1 MB, 1 MB - 1 GB, 1-10 GB, 10-100 GB, >100 GB | Distribution of cloned repos by `mirrorInfo.byteSize` (MB). |
+| `stats-content-byte-size.csv` | 0-1 MB, 1 MB - 1 GB, 1-10 GB, 10-100 GB, >100 GB | Distribution of indexed repos by `textSearchIndex.status.contentByteSize` (MB). |
+| `stats-index-byte-size.csv` | 0-1 MB, 1-10 MB, 10-100 MB, >100 MB | Distribution of indexed repos by `textSearchIndex.status.indexByteSize` (MB). |
+| `stats-content-vs-mirror-pct.csv` | 0-10%, 10-25%, 25-50%, 50-75%, 75-100%, 100-150%, >150% | Distribution of `contentByteSize / mirrorInfo.byteSize` (as a percentage). |
+| `stats-index-vs-content-pct.csv` | 0-10%, 10-25%, 25-50%, 50-75%, 75-100%, 100-150%, >150% | Distribution of `indexByteSize / contentByteSize` (as a percentage). |
