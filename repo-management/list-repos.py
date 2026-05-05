@@ -74,7 +74,7 @@ DEFAULT_INDEXING_ERRORS_FILE = "repos-with-indexing-errors.csv"
 DEFAULT_SKIPPED_FILES_FILE = "repos-with-skipped-files.csv"
 DEFAULT_STATS_FILE_PREFIX = "stats"
 DEFAULT_LOG_FILE = "list-repos.log"
-DEFAULT_README_FILE = "README.md"
+DEFAULT_CSV_SCHEMA_FILE = "CSV_SCHEMA.md"
 
 # --- GraphQL queries ----------------------------------------------------------
 
@@ -1343,7 +1343,7 @@ class StatsCollector:
                 self.index_vs_content_buckets[label] += 1
 
 
-# Per-stat metadata used by write_stats() and the README generator. Each
+# Per-stat metadata used by write_stats() and the CSV schema generator. Each
 # entry is (filename_suffix, description, bucket_definition,
 # counter_attr_name, summary_rows_builder). The summary builder receives the
 # StatsCollector and returns a list of (metric, value) rows appended after
@@ -1428,7 +1428,7 @@ def write_stats(prefix: str, stats: StatsCollector) -> list[Path]:
     return written
 
 
-# --- README generation --------------------------------------------------------
+# --- CSV schema generation ----------------------------------------------------
 
 # Column descriptions are colocated with each column tuple above (third
 # element of each tuple, except for the no-extractor COMMIT_COUNT_COLUMNS /
@@ -1436,7 +1436,7 @@ def write_stats(prefix: str, stats: StatsCollector) -> list[Path]:
 # Pulling descriptions from the same tuple that defines the column NAME
 # eliminates the possibility of drift: a column added without a description
 # is a static type error / unpacking error rather than a "(no description)"
-# placeholder slipping into README.md.
+# placeholder slipping into CSV_SCHEMA.md.
 
 
 def format_columns_list(columns: list[tuple[str, str, bool, str]]) -> str:
@@ -1446,8 +1446,8 @@ def format_columns_list(columns: list[tuple[str, str, bool, str]]) -> str:
     Columns: `Column` | `Type` | `Requires admin` | `Description`. The
     `Requires admin` cell is `true` for site-admin-only columns and empty
     otherwise, so a reader scanning the table can immediately spot the
-    columns that will be blank for non-admin tokens; the README header
-    explains the convention once at the top.
+    columns that will be blank for non-admin tokens; the CSV_SCHEMA.md
+    header explains the convention once at the top.
 
     Markdown tables can't have line breaks within a row, so individual
     rows will easily exceed Markdownlint's MD013 line-length limit. The
@@ -1494,7 +1494,7 @@ def name_desc(
 
 
 def format_stats_files_list() -> str:
-    """Render STATS_FILES as a Markdown table for the README.
+    """Render STATS_FILES as a Markdown table for CSV_SCHEMA.md.
 
     Columns: `File suffix` | `Buckets` | `Description`. The `Buckets` cell
     lists every bucket label (in declaration order) so a reader can see
@@ -1517,11 +1517,11 @@ def format_stats_files_list() -> str:
     return "\n".join(rows)
 
 
-def write_readme(path: Path) -> None:
-    """Write a README.md describing every CSV file the script can produce.
+def write_csv_schema(path: Path) -> None:
+    """Write a Markdown file describing every CSV file the script can produce.
 
     Each list is built directly from the column tuples defined above, so
-    the (name, description) pairs in the README cannot drift from the
+    the (name, description) pairs in the document cannot drift from the
     columns the script actually emits — both are projections of the same
     source-of-truth tuples.
     """
@@ -3291,11 +3291,11 @@ def main() -> None:
     sys.excepthook = _log_uncaught_exception
 
     args = parse_args(sys.argv[1:])
-    # Always (re)generate README.md from the in-script column tables so it
+    # Always (re)generate CSV_SCHEMA.md from the in-script column tables so it
     # can never drift from the actual CSV layout. Done before
     # require_credentials() / load_dotenv() since it needs neither
     # credentials nor network access.
-    write_readme(Path(DEFAULT_README_FILE))
+    write_csv_schema(Path(DEFAULT_CSV_SCHEMA_FILE))
     load_dotenv()
     endpoint, token = require_credentials(args)
     logger.info(
