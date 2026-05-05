@@ -2919,6 +2919,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--write-csv-schema",
+        action="store_true",
+        help=(
+            f"Regenerate {DEFAULT_CSV_SCHEMA_FILE} from the in-script column "
+            "tables and exit. Used by the pre-commit hook so the committed "
+            "schema doc cannot drift from the CSVs the script emits. Does "
+            "not require Sourcegraph credentials or network access."
+        ),
+    )
+    parser.add_argument(
         "--src-endpoint",
         default=None,
         metavar="URL",
@@ -3291,11 +3301,14 @@ def main() -> None:
     sys.excepthook = _log_uncaught_exception
 
     args = parse_args(sys.argv[1:])
-    # Always (re)generate CSV_SCHEMA.md from the in-script column tables so it
-    # can never drift from the actual CSV layout. Done before
-    # require_credentials() / load_dotenv() since it needs neither
-    # credentials nor network access.
-    write_csv_schema(Path(DEFAULT_CSV_SCHEMA_FILE))
+    # --write-csv-schema is a developer-only flag (driven by the pre-commit
+    # hook) that regenerates CSV_SCHEMA.md from the in-script column tables
+    # and exits. Doing this here — before require_credentials() / load_dotenv()
+    # / any network call — lets contributors run it without configuring a
+    # Sourcegraph endpoint or token.
+    if args.write_csv_schema:
+        write_csv_schema(Path(DEFAULT_CSV_SCHEMA_FILE))
+        return
     load_dotenv()
     endpoint, token = require_credentials(args)
     logger.info(
