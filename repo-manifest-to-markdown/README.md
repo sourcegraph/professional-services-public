@@ -25,21 +25,25 @@ python generate-markdown.py {XML manifest file} {default remote fetch URL} [opti
 ```
 
 ### Required Arguments
+
 - `file_path`: Path to the XML manifest file to parse
 - `remote_fetch`: Default remote fetch URL when not specified in manifest
 
 ### Optional Arguments
+
 - `--create-context`: Enable search context creation (opt-in, requires SRC_ENDPOINT and SRC_ACCESS_TOKEN environment variables)
 - `--context-name`: Name for the Search Context (alphanumeric and ._/- characters only). Defaults to manifest filename without extension when not specified
 
 ### Environment Variables
+
 - `SRC_ENDPOINT`: Sourcegraph instance URL (required for context creation)
-- `SRC_ACCESS_TOKEN`: Sourcegraph access token (required for context creation). A site admin access token is recommended to ensure the search context 
+- `SRC_ACCESS_TOKEN`: Sourcegraph access token (required for context creation). A site admin access token is recommended to ensure the search context
 includes all of the repositories in the Sourcegraph instance irrespective of user permissions.
 
 ## Examples
 
 ### Basic Usage (Markdown Generation Only)
+
 ```sh
 python generate-markdown.py asop-example/default.xml https://android.googlesource.com
 ```
@@ -47,6 +51,7 @@ python generate-markdown.py asop-example/default.xml https://android.googlesourc
 This will output a markdown file with the same base name as the input file (e.g., `default.md`), containing a structured representation of the repositories.
 
 ### Creating a Search Context
+
 ```sh
 # Set environment variables
 export SRC_ENDPOINT="https://sourcegraph.example.com"

@@ -8,7 +8,7 @@ The Sourcegraph Outbound Request Log is a feature that logs all HTTP/HTTPS reque
 
 ## Setup
 
-1.  Install the required dependencies:
+1. Install the required dependencies:
 
     ```bash
     pip install -r requirements.txt
@@ -16,15 +16,16 @@ The Sourcegraph Outbound Request Log is a feature that logs all HTTP/HTTPS reque
 
 ## Usage
 
-The `redis-cache` service will need to be made accessible to the execution context of the script. For example, the `redis-cache` service can be exposed by port-forwarding the Kubernetes service in order to make it accessible from the default `host` & `port` options ( `localhost:6379`). 
+The `redis-cache` service will need to be made accessible to the execution context of the script. For example, the `redis-cache` service can be exposed by port-forwarding the Kubernetes service in order to make it accessible from the default `host` & `port` options ( `localhost:6379`).
 
 ```bash
 kubectl port-forward svc/redis-cache 6379:6379
 ```
 
 The script has two modes:
-1.  **Snapshot Mode (Default):** Reads the current state of the queue and prints it to stdout.
-2.  **Logger Mode:** Continuously polls the queue and appends new unique items to a log file.
+
+1. **Snapshot Mode (Default):** Reads the current state of the queue and prints it to stdout.
+2. **Logger Mode:** Continuously polls the queue and appends new unique items to a log file.
 
 ### 1. Snapshot Mode
 
@@ -37,10 +38,11 @@ python read_redis_queue.py tnt_1:v2:outbound-requests
 This will pretty-print the JSON payloads of all items currently in the queue to stdout.
 
 **Options:**
-*   `--start <N>`: Start index (default: 0)
-*   `--end <N>`: End index (default: -1)
-*   `--host <HOST>`: Redis host (default: localhost)
-*   `--port <PORT>`: Redis port (default: 6379)
+
+* `--start <N>`: Start index (default: 0)
+* `--end <N>`: End index (default: -1)
+* `--host <HOST>`: Redis host (default: localhost)
+* `--port <PORT>`: Redis port (default: 6379)
 
 ### 2. Logger Mode
 
@@ -53,9 +55,10 @@ python read_redis_queue.py tnt_1:v2:outbound-requests --log-file outbound_log.js
 This acts as a "best-effort" observer. It polls the queue at a regular interval and appends any new items (determined by their `id` field) to the log file. It keeps a history of seen IDs to prevent duplicates, even across restarts of the script.
 
 **Options:**
-*   `--log-file <FILE>`: Path to the output log file (required for logger mode).
-*   `--interval <SECONDS>`: Polling interval in seconds (default: 5.0).
-*   `--dedup-field <FIELD>`: The JSON field to use for deduplication (default: `id`).
+
+* `--log-file <FILE>`: Path to the output log file (required for logger mode).
+* `--interval <SECONDS>`: Polling interval in seconds (default: 5.0).
+* `--dedup-field <FIELD>`: The JSON field to use for deduplication (default: `id`).
 
 **Example with custom interval:**
 
