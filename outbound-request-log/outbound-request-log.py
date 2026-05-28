@@ -1,9 +1,11 @@
-import redis
 import argparse
-import sys
 import json
-import time
 import os
+import sys
+import time
+
+import redis
+
 
 def read_queue(args):
     try:
@@ -11,7 +13,7 @@ def read_queue(args):
         r.ping()
         items = r.lrange(args.queue_name, args.start, args.end)
     except redis.exceptions.ConnectionError as e:
-        print(f"Error conecting to Redis: {e}", file=sys.stderr)
+        print(f"Error connecting to Redis: {e}", file=sys.stderr)
         sys.exit(1)
     except Exception as e:
         print(f"An error occurred: {e}", file=sys.stderr)
@@ -57,14 +59,14 @@ def run_logger(args):
             try:
                 # Optimization: Read last 500 items
                 items = r.lrange(args.queue_name, -500, -1)
-                
+
                 new_items_count = 0
                 with open(args.log_file, 'a') as f:
                     for item in items:
                         try:
                             data = json.loads(item)
                             item_id = data.get(args.dedup_field)
-                            
+
                             if item_id and item_id not in logged_ids:
                                 logged_ids.add(item_id)
                                 # Write raw item string as received from Redis
@@ -73,12 +75,12 @@ def run_logger(args):
                                 print(f"Logged new item: {item_id}")
                         except json.JSONDecodeError:
                             continue
-                    
+
             except redis.exceptions.ConnectionError as e:
                 print(f"Redis connection error: {e}", file=sys.stderr)
             except Exception as e:
                 print(f"Error during polling: {e}", file=sys.stderr)
-            
+
             time.sleep(args.interval)
 
     except KeyboardInterrupt:
@@ -95,7 +97,7 @@ def main():
     parser.add_argument('--port', type=int, default=6379, help='Redis port (default: 6379)')
     parser.add_argument('--start', type=int, default=0, help='Start index for LRANGE (default: 0)')
     parser.add_argument('--end', type=int, default=-1, help='End index for LRANGE (default: -1, read full queue)')
-    
+
     # Logging arguments
     parser.add_argument('--log-file', help='Path to log file. If specified, enables continuous logging mode.')
     parser.add_argument('--interval', type=float, default=5.0, help='Polling interval in seconds (only used with --log-file, default: 5.0)')

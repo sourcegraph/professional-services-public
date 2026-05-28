@@ -1,9 +1,9 @@
 import argparse
-import xml.etree.ElementTree as ET
-import requests
-from collections import defaultdict
 import os
 import re
+import xml.etree.ElementTree as ET
+
+import requests
 
 GRAPHQL_CONFIG = {
     "RepositoriesByNames": {

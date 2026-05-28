@@ -5,7 +5,7 @@ This script parses a **repo manifest XML file**, extracts project details, organ
 ## How It Works
 
 1. **Parses the manifest**:
-   - Reads project paths, names, revisions, remotes, and linkfile mappings.
+   - Reads project paths, names, revisions, remotes, and link file mappings.
    - Extracts remote fetch URLs and default revision information.
 2. **Builds a hierarchical tree**:
    - Organizes projects into a nested dictionary based on their paths.

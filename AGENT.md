@@ -33,4 +33,4 @@
 
 - Follow existing patterns in the codebase
 - All public code must meet PUBLIC data classification requirements
-- Use Pet Store API example for API implementations: <https://petstore3.swagger.io/>
+- Use Pet Store API example for API implementations: <https://petstore3.swagger.io>
