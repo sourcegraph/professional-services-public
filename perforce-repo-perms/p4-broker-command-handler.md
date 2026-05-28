@@ -1,4 +1,6 @@
-# Objective
+# P4 Broker Command Handler
+
+## Objective
 
 Sourcegraph has optimized our Perforce API client to require the least privileges possible, requiring `super` privileges only to sync permissions for other users using the `p4 protects -u <username> //depot/path/...` command. [Other commands](https://docs.sourcegraph.com/admin/repo/perforce#depot-syncing) do not require `super` privileges.
 
@@ -14,7 +16,7 @@ If you're already using a command handler, this support article demonstrates how
 
 ## Implementation
 
-### 1. Create the filter program script
+## 1. Create the filter program script
 
 The filter program script receives the command and its arguments from the command handler, and re-runs them as a privileged user. Here's an example written in Perl:
 
@@ -40,7 +42,7 @@ print "action: RESPOND\n";
 print "message: \"$output\"";
 ```
 
-### 2. Add the command handler to the Perforce Broker configuration
+## 2. Add the command handler to the Perforce Broker configuration
 
 Add the command handler for the `p4 protects -u <username>` command:
 
@@ -57,7 +59,7 @@ command: protects
 }
 ```
 
-### 3. Verify
+## 3. Verify
 
 Before this change is configured, the `p4 protects -u <username>` command should fail
 
@@ -83,4 +85,4 @@ $ p4 -p [p4 port] -u svc_sourcegraph protect -o
 You don't have permission for this operation.
 ```
 
-Source team's internal Notion doc: [p4 broker setup](https://www.notion.so/sourcegraph/Perforce-broker-setup-48b2ad6c4f3f44ba8f73d1a0b93bd789)
+[Source team's internal Notion doc](https://www.notion.so/sourcegraph/Perforce-broker-setup-48b2ad6c4f3f44ba8f73d1a0b93bd789)

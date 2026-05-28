@@ -1,7 +1,7 @@
 [project]
 name = "sourcegraph-bootstrap"
 version = "0.1.0"
-description = "Add your description here"
+description = "Initial setup of a new Sourcegraph instance"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [

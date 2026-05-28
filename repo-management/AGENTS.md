@@ -22,7 +22,12 @@ These instructions apply to any work under this directory.
 ## Other
 
 - Whenever changing / adding / removing / moving any columns in any of the CSV files,
-  ensure the columns are updated in README.md printer function to match
+  ensure the columns are updated in the `CSV_SCHEMA.md` printer function to match.
+  `CSV_SCHEMA.md` is generated from the in-script column tuples by
+  `python3 list-repos.py --write-csv-schema` (run automatically by the
+  `.pre-commit-config.yaml` hook when `list-repos.py` changes); never edit
+  it by hand.
+- `README.md` is hand-maintained — do not regenerate it from `list-repos.py`.
 - Keep this AGENTS.md file up to date as more instructions are provided
 - Consult the Deep Search MCP and the Oracle as much as needed when
   you aren't sure about something

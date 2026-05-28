@@ -2,11 +2,11 @@
 
 ## Usage
 
-The required `SRC_ENDPOINT` & `SRC_ACCESS_TOKEN` environment variables must be set similar to the [Sourcegraph CLI](https://github.com/sourcegraph/src-cli?tab=readme-ov-file#configuration-mac-os--linux).
+The required `SRC_ENDPOINT` & `SRC_ACCESS_TOKEN` environment variables must be set similar to the [Sourcegraph CLI](https://github.com/sourcegraph/src-cli?tab=readme-ov-file#configuration-mac-os--linux)
 
 ```shell
 python organization-management.py --help
-usage: 
+usage:
   organization-management.py <command> [options]
 
 Environment Variables:
@@ -32,7 +32,7 @@ Lists all organizations in the Sourcegraph instance using the [organizations](ht
 
 Allows for the automated creation of Sourcegraph organizations defined in an input csv file using the [createOrganization](https://sourcegraph.com/docs/api/graphql/api-docs#mutation-createOrganization) graphQL mutation. The input CSV file should include the name and display name for each organization to be created. Example:
 
-```
+```text
 name,displayName
 org-1,org-1-display-name
 org-2,org-2-display-name
@@ -44,7 +44,7 @@ org-3,org-3-display-name
 
 Assigns users to organizations via the [AddUserToOrganization](https://sourcegraph.com/docs/api/graphql/api-docs#mutation-addUserToOrganization) graphQL mutation. The input CSV file should include the name of the organization and the user that should be added to that organization. Example:
 
-```
+```text
 organization,user
 org-1,user1
 org-1,user2

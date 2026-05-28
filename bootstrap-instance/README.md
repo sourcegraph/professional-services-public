@@ -1,14 +1,7 @@
-Metadata-Version: 2.4
-Name: sourcegraph-bootstrap
-Version: 0.1.0
-Summary: Add your description here
-Requires-Python: >=3.13
-Description-Content-Type: text/markdown
-Requires-Dist: requests>=2.32.4
-
 # Sourcegraph Bootstrap Tool
 
-A Python script that automates the initial setup and configuration of a new Sourcegraph instance.
+A Python script that automates the initial setup and configuration of a new
+Sourcegraph instance.
 
 ## What It Does
 
@@ -39,18 +32,23 @@ uv sync
 
 ## Environment Variables
 
+The following environment variables can be used to configure the script for
+non-interactive use.
+
 | Variable | Required | Description |
-|----------|----------|-------------|
-| `SRC_ENDPOINT` | Optional* | Sourcegraph instance URL (e.g., `https://sourcegraph.example.com`) |
+| ---------- | ---------- | ------------- |
+| `SRC_ENDPOINT` | Optional* | Sourcegraph instance URL |
 | `SRC_ADMIN_USER` | Optional* | Admin username |
 | `SRC_ADMIN_EMAIL` | Optional* | Admin email address |
 | `SRC_ADMIN_PASS` | Optional* | Admin password |
 | `SRC_LICENSE_KEY` | Optional | Sourcegraph license key |
+
+Example endpoint: `https://sourcegraph.example.com`
 
 *If not provided, the script will prompt for these values.
 
 ## Usage
 
 ```bash
-python main.py
+python bootstrap-instance.py
 ```
