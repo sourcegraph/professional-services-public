@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import base64
 import collections
+import concurrent.futures
 import contextlib
 import csv
 import http.client
@@ -16,6 +17,7 @@ import shlex
 import sys
 import textwrap
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn, TextIO, cast
@@ -29,21 +31,36 @@ logger = logging.getLogger(__name__)
 
 # --- Tune-ables -----------------------------------------------------------------
 
-PAGE_SIZE = 500
-MAX_RETRIES = 3
-RETRY_DELAY_SECONDS = 5
-REQUEST_TIMEOUT_SECONDS = 60
-# Counting commits server-side can be slow on big monorepos. The COMMIT_COUNT
-# call site passes this longer timeout explicitly via graphql_request(timeout=)
-# so we don't fail on long-but-still-progressing requests
-REQUEST_TIMEOUT_SECONDS_WITH_COMMIT_COUNT = 600
-DEFAULT_OUTPUT_FILE = "repos.csv"
 DEFAULT_CLONING_ERRORS_FILE = "repos-with-cloning-errors.csv"
+DEFAULT_CONCURRENCY = 16
+DEFAULT_CSV_SCHEMA_FILE = "CSV_SCHEMA.md"
 DEFAULT_INDEXING_ERRORS_FILE = "repos-with-indexing-errors.csv"
+DEFAULT_LOG_FILE_STEM = "list-repos"
+DEFAULT_OUTPUT_FILE = "repos.csv"
 DEFAULT_SKIPPED_FILES_FILE = "repos-with-skipped-files.csv"
 DEFAULT_STATS_FILE_PREFIX = "stats"
-DEFAULT_LOG_FILE = "list-repos.log"
-DEFAULT_CSV_SCHEMA_FILE = "CSV_SCHEMA.md"
+DEFAULT_MAX_RETRIES = 5
+GRAPHQL_FIELD_COUNT_RETRY_HEADROOM_PERCENT = 95
+PAGE_SIZE = 500
+REQUEST_TIMEOUT_SECONDS = 60
+REQUEST_TIMEOUT_SECONDS_WITH_COMMIT_COUNT = (
+    600  # Counting commits server-side can be slow on big monorepos
+)
+RETRYABLE_HTTP_STATUSES = {408, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524}
+RETRYABLE_GRAPHQL_ERROR_TERMS = (
+    "bad gateway",
+    "code = unavailable",
+    "connection reset",
+    "context deadline exceeded",
+    "deadline exceeded",
+    "dial tcp",
+    "eof",
+    "gateway timeout",
+    "no such host",
+    "temporarily unavailable",
+    "timeout",
+    "transport:",
+)
 
 
 # --- GraphQL queries ----------------------------------------------------------
@@ -487,6 +504,7 @@ def fetch_commit_count(
     token: str,
     repo_name: str,
     rev: str = "HEAD",
+    max_retries: int = DEFAULT_MAX_RETRIES,
 ) -> tuple[int | None, int | None, float, list[Any]]:
     """Return exact rev count, approximate all-refs count, elapsed time, extras"""
     empty_extras: list[Any] = [None] * len(COMMIT_COUNT_OPTIMIZATION_COLUMNS)
@@ -502,6 +520,7 @@ def fetch_commit_count(
                 "allRefsSearch": build_all_refs_search(repo_name),
             },
             timeout=REQUEST_TIMEOUT_SECONDS_WITH_COMMIT_COUNT,
+            max_retries=max_retries,
         )
     except (GraphQLError, HTTPRequestError) as exc:
         elapsed = time.monotonic() - start
@@ -540,12 +559,19 @@ def fetch_run_search(
     token: str,
     repo_name: str,
     pattern: str,
+    max_retries: int = DEFAULT_MAX_RETRIES,
 ) -> tuple[int | None, float, bool, str | None]:
     """Return --run-search match count, elapsed time, limit flag, and alert"""
     start = time.monotonic()
     query = build_run_search_query(repo_name, pattern)
     try:
-        data = graphql_request(endpoint, token, RUN_SEARCH_GRAPHQL, {"query": query})
+        data = graphql_request(
+            endpoint,
+            token,
+            RUN_SEARCH_GRAPHQL,
+            {"query": query},
+            max_retries=max_retries,
+        )
     except (GraphQLError, HTTPRequestError) as exc:
         elapsed = time.monotonic() - start
         logger.warning("run-search query failed for %s: %s", repo_name, exc)
@@ -1317,6 +1343,80 @@ class HTTPRequestError(RuntimeError):
         self.body = body
 
 
+@dataclass(frozen=True)
+class GraphQLFieldCountViolation:
+    """Sourcegraph GraphQL field-count limit details from an error response"""
+
+    actual: int
+    limit: int
+
+
+def graphql_extension_int(value: object) -> int | None:
+    """Return an int from a GraphQL extension value when it is numeric"""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return None
+    return None
+
+
+def parse_field_count_violation(
+    error: HTTPRequestError,
+) -> GraphQLFieldCountViolation | None:
+    """Extract Sourcegraph's GraphQL field-count violation from an HTTP 400"""
+    try:
+        payload = json.loads(error.body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    errors = payload.get("errors")
+    if not isinstance(errors, list):
+        return None
+    for graph_error in errors:
+        if not isinstance(graph_error, dict):
+            continue
+        extensions = graph_error.get("extensions")
+        if not isinstance(extensions, dict):
+            continue
+        if extensions.get("code") != "ErrQueryComplexityLimitExceeded":
+            continue
+        if extensions.get("type") != "field count":
+            continue
+        actual = graphql_extension_int(extensions.get("actual"))
+        limit = graphql_extension_int(extensions.get("limit"))
+        if actual is None or limit is None:
+            continue
+        if actual <= 0 or limit <= 0:
+            continue
+        return GraphQLFieldCountViolation(actual=actual, limit=limit)
+    return None
+
+
+def retry_page_size_after_field_count_violation(
+    page_size: int,
+    violation: GraphQLFieldCountViolation,
+) -> int:
+    """Shrink page size from Sourcegraph's reported actual/limit ratio"""
+    next_page_size = (
+        page_size
+        * violation.limit
+        * GRAPHQL_FIELD_COUNT_RETRY_HEADROOM_PERCENT
+        // violation.actual
+        // 100
+    )
+    if next_page_size >= page_size:
+        next_page_size = page_size - 1
+    return max(1, next_page_size)
+
+
 def open_connection(
     parsed: ParseResult,
     timeout: int = REQUEST_TIMEOUT_SECONDS,
@@ -1370,42 +1470,55 @@ def send_once(
         conn.close()
 
 
-def send_or_capture_oserror(
-    url: str,
-    body: bytes,
-    headers: dict[str, str],
-    timeout: int = REQUEST_TIMEOUT_SECONDS,
-) -> dict[str, Any] | OSError:
-    """Send once; return OSError instances so callers can retry them"""
-    try:
-        return send_once(url, body, headers, timeout=timeout)
-    except OSError as exc:
-        return exc
+def retry_delay_seconds(retry_number: int) -> int:
+    """Return exponential retry delay: 1, 2, 4, 8, 16... seconds"""
+    return 2 ** (retry_number - 1)
 
 
-def send_with_retry(
-    url: str,
-    body: bytes,
-    headers: dict[str, str],
-    timeout: int = REQUEST_TIMEOUT_SECONDS,
-) -> dict[str, Any]:
-    """Retry socket-level failures; propagate definitive HTTP errors"""
-    for attempt in range(1, MAX_RETRIES + 1):
-        result = send_or_capture_oserror(url, body, headers, timeout=timeout)
-        if not isinstance(result, OSError):
-            return result
-        if attempt == MAX_RETRIES:
-            raise result
-        logger.warning(
-            "Request failed (attempt %d/%d): %s — retrying in %ds...",
-            attempt,
-            MAX_RETRIES,
-            result,
-            RETRY_DELAY_SECONDS,
-        )
-        time.sleep(RETRY_DELAY_SECONDS)
-    msg = "send_with_retry loop exhausted unexpectedly"
-    raise RuntimeError(msg)
+def sleep_before_retry(reason: str, retry_number: int, max_retries: int) -> None:
+    """Log and sleep before the next retry attempt for this request"""
+    delay = retry_delay_seconds(retry_number)
+    logger.warning(
+        "%s; retrying (%d/%d) in %ds...",
+        reason,
+        retry_number,
+        max_retries,
+        delay,
+    )
+    time.sleep(delay)
+
+
+def retryable_http_error(error: HTTPRequestError) -> bool:
+    """Return True for transient HTTP statuses worth retrying"""
+    return error.status in RETRYABLE_HTTP_STATUSES
+
+
+def graphql_error_message(graphql_error: object) -> str:
+    """Return a GraphQL error message string"""
+    if isinstance(graphql_error, dict):
+        message = graphql_error.get("message")
+        if isinstance(message, str):
+            return message
+    return str(graphql_error)
+
+
+def has_retryable_graphql_error(errors: object) -> bool:
+    """Return True when any GraphQL error looks transient"""
+    if not isinstance(errors, list):
+        return False
+    for graphql_error in errors:
+        message = graphql_error_message(graphql_error).lower()
+        if any(term in message for term in RETRYABLE_GRAPHQL_ERROR_TERMS):
+            return True
+    return False
+
+
+def summarize_graphql_errors(errors: object) -> str:
+    """Return compact GraphQL error messages for retry logs"""
+    if not isinstance(errors, list):
+        return str(errors)
+    messages = [graphql_error_message(error) for error in errors]
+    return "; ".join(messages)
 
 
 def graphql_request(
@@ -1414,6 +1527,7 @@ def graphql_request(
     query: str,
     variables: dict[str, Any],
     timeout: int = REQUEST_TIMEOUT_SECONDS,
+    max_retries: int = DEFAULT_MAX_RETRIES,
 ) -> dict[str, Any]:
     """Send a GraphQL query to the Sourcegraph API and return the data block"""
     url = endpoint.rstrip("/") + "/.api/graphql"
@@ -1423,25 +1537,70 @@ def graphql_request(
         "Content-Type": "application/json",
         "User-Agent": "list-repos/0.0.1",
     }
-    data = send_with_retry(url, body, headers, timeout=timeout)
-    if data.get("errors"):
+    for retry_count in range(max_retries + 1):
+        retry_number = retry_count + 1
+        try:
+            response = send_once(url, body, headers, timeout=timeout)
+        except HTTPRequestError as error:
+            if not retryable_http_error(error) or retry_count >= max_retries:
+                raise
+            sleep_before_retry(
+                f"HTTP {error.status} {error.reason}",
+                retry_number,
+                max_retries,
+            )
+            continue
+        except OSError as error:
+            if retry_count >= max_retries:
+                raise
+            sleep_before_retry(
+                f"Request failed: {error}",
+                retry_number,
+                max_retries,
+            )
+            continue
+
+        errors = response.get("errors")
+        if not errors:
+            return response["data"]
+
+        if has_retryable_graphql_error(errors) and retry_count < max_retries:
+            sleep_before_retry(
+                "GraphQL returned retryable error(s): "
+                + summarize_graphql_errors(errors),
+                retry_number,
+                max_retries,
+            )
+            continue
+
         # GraphQL can return both `errors` and partial `data`. If we have data,
-        # log the errors and keep going; only abort if no data was returned
-        if data.get("data"):
+        # log the errors and keep going; only abort if no data was returned.
+        if response.get("data"):
             logger.warning(
                 "GraphQL returned %d partial error(s): %s",
-                len(data["errors"]),
-                json.dumps(data["errors"], indent=2),
+                len(errors) if isinstance(errors, list) else 1,
+                json.dumps(errors, indent=2),
             )
-        else:
-            msg = f"GraphQL errors: {json.dumps(data['errors'], indent=2)}"
-            raise GraphQLError(msg)
-    return data["data"]
+            return response["data"]
+        msg = f"GraphQL errors: {json.dumps(errors, indent=2)}"
+        raise GraphQLError(msg)
+    msg = "graphql_request retry loop exhausted unexpectedly"
+    raise RuntimeError(msg)
 
 
-def fetch_current_user(endpoint: str, token: str) -> tuple[str, bool]:
+def fetch_current_user(
+    endpoint: str,
+    token: str,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+) -> tuple[str, bool]:
     """Return the authenticated username and site-admin flag"""
-    data = graphql_request(endpoint, token, CURRENT_USER_QUERY, {})
+    data = graphql_request(
+        endpoint,
+        token,
+        CURRENT_USER_QUERY,
+        {},
+        max_retries=max_retries,
+    )
     user: dict[str, Any] = data["currentUser"] or {}
     return str(user["username"]), bool(user.get("siteAdmin"))
 
@@ -1452,6 +1611,7 @@ def fetch_single_repo(
     repo_name: str,
     *,
     is_site_admin: bool,
+    max_retries: int = DEFAULT_MAX_RETRIES,
 ) -> dict[str, Any]:
     """Fetch one repo node in listing-query shape, respecting admin-only fields"""
     data = graphql_request(
@@ -1459,6 +1619,7 @@ def fetch_single_repo(
         token,
         SINGLE_REPO_QUERY,
         {"name": repo_name, "includeExternalServices": is_site_admin},
+        max_retries=max_retries,
     )
     repo = data.get("repository")
     if repo is None:
@@ -1466,20 +1627,42 @@ def fetch_single_repo(
     return cast("dict[str, Any]", repo)
 
 
-def trigger_reclone(endpoint: str, token: str, repo_id: str) -> bool:
+def trigger_reclone(
+    endpoint: str,
+    token: str,
+    repo_id: str,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+) -> bool:
     """Send recloneRepository mutation. Returns True on success, False on GraphQL error"""
     try:
-        graphql_request(endpoint, token, RECLONE_MUTATION, {"repo": repo_id})
+        graphql_request(
+            endpoint,
+            token,
+            RECLONE_MUTATION,
+            {"repo": repo_id},
+            max_retries=max_retries,
+        )
     except (GraphQLError, HTTPRequestError) as exc:
         logger.warning("recloneRepository failed for %s: %s", repo_id, exc)
         return False
     return True
 
 
-def trigger_reindex(endpoint: str, token: str, repo_id: str) -> bool:
+def trigger_reindex(
+    endpoint: str,
+    token: str,
+    repo_id: str,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+) -> bool:
     """Send reindexRepository mutation. Returns True on success, False on GraphQL error"""
     try:
-        graphql_request(endpoint, token, REINDEX_MUTATION, {"repository": repo_id})
+        graphql_request(
+            endpoint,
+            token,
+            REINDEX_MUTATION,
+            {"repository": repo_id},
+            max_retries=max_retries,
+        )
     except (GraphQLError, HTTPRequestError) as exc:
         logger.warning("reindexRepository failed for %s: %s", repo_id, exc)
         return False
@@ -1537,7 +1720,12 @@ def parse_repo_name(repo_rev: str) -> str:
     return name.rstrip("/")
 
 
-def verify_repo_rev(endpoint: str, token: str, repo_rev: str) -> str:
+def verify_repo_rev(
+    endpoint: str,
+    token: str,
+    repo_rev: str,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+) -> str:
     """Require repo/rev to resolve to an indexed commit; return output rev name"""
     name = parse_repo_name(repo_rev)
     rev = parse_repo_rev(repo_rev)
@@ -1546,6 +1734,7 @@ def verify_repo_rev(endpoint: str, token: str, repo_rev: str) -> str:
         token,
         REPO_REV_VALIDATION_QUERY,
         {"name": name, "rev": rev},
+        max_retries=max_retries,
     )
     repository: dict[str, Any] | None = data.get("repository")
     if repository is None:
@@ -1598,6 +1787,7 @@ def fetch_skipped_file_matches(
     token: str,
     name: str,
     rev: str,
+    max_retries: int = DEFAULT_MAX_RETRIES,
 ) -> list[dict[str, Any]]:
     """Return NOT-INDEXED matches; omit @rev because Zoekt exposes them at HEAD"""
     _ = rev  # verify_repo_rev already checked it maps to an indexed commit
@@ -1611,6 +1801,7 @@ def fetch_skipped_file_matches(
         token,
         SKIPPED_FILES_REASON_QUERY,
         {"query": search_query},
+        max_retries=max_retries,
     )
     raw_results: list[dict[str, Any] | None] = (
         data.get("search", {}).get("results", {}).get("results") or []
@@ -1623,6 +1814,7 @@ def write_skipped_files_reason(
     endpoint: str,
     token: str,
     repo_rev: str,
+    max_retries: int = DEFAULT_MAX_RETRIES,
 ) -> None:
     """Fetch skipped-file matches for repo_rev and write the per-file and stats CSVs"""
     endpoint_sanitized = sanitize_endpoint_for_filename(endpoint)
@@ -1633,7 +1825,7 @@ def write_skipped_files_reason(
     Path(f"{input_prefix}-skipped-files.csv").unlink(missing_ok=True)
     Path(f"{input_prefix}-skipped-stats.csv").unlink(missing_ok=True)
 
-    rev = verify_repo_rev(endpoint, token, repo_rev)
+    rev = verify_repo_rev(endpoint, token, repo_rev, max_retries=max_retries)
     name = parse_repo_name(repo_rev)
     name_sanitized = sanitize_for_filename(name)
     rev_sanitized = sanitize_for_filename(rev)
@@ -1680,7 +1872,13 @@ def write_skipped_files_reason(
         ("count", lambda r: r[1]),
     ]
 
-    matches = fetch_skipped_file_matches(endpoint, token, name, rev)
+    matches = fetch_skipped_file_matches(
+        endpoint,
+        token,
+        name,
+        rev,
+        max_retries=max_retries,
+    )
 
     reason_counts: collections.Counter[str] = collections.Counter()
     rows: list[list[Any]] = []
@@ -1761,8 +1959,10 @@ def fetch_repos(
     token: str,
     max_repos: int | None = None,
     *,
+    page_size: int = PAGE_SIZE,
     scope_repo: str | None = None,
     is_site_admin: bool,
+    max_retries: int = DEFAULT_MAX_RETRIES,
 ) -> Iterator[tuple[int, int, dict[str, Any]]]:
     """Yield (index, target, repo) tuples for a scoped repo or paged repo list"""
     if scope_repo is not None:
@@ -1771,6 +1971,7 @@ def fetch_repos(
             token,
             scope_repo,
             is_site_admin=is_site_admin,
+            max_retries=max_retries,
         )
         logger.info("Scope: single repository %s", scope_repo)
         yield 1, 1, repo
@@ -1779,20 +1980,51 @@ def fetch_repos(
     cursor: str | None = None
     total_fetched = 0
     first_page = True
+    current_page_size = page_size
+    logger.info(
+        "GraphQL listing page size: %d (will retry smaller if Sourcegraph "
+        "reports a field-count limit)",
+        current_page_size,
+    )
     while True:
-        page_size = PAGE_SIZE
+        request_page_size = current_page_size
         if max_repos is not None:
-            page_size = min(page_size, max_repos - total_fetched)
-        data = graphql_request(
-            endpoint,
-            token,
-            GRAPHQL_QUERY,
-            {
-                "first": page_size,
-                "after": cursor,
-                "includeExternalServices": is_site_admin,
-            },
-        )
+            remaining = max_repos - total_fetched
+            if remaining <= 0:
+                break
+            request_page_size = min(request_page_size, remaining)
+        while True:
+            try:
+                data = graphql_request(
+                    endpoint,
+                    token,
+                    GRAPHQL_QUERY,
+                    {
+                        "first": request_page_size,
+                        "after": cursor,
+                        "includeExternalServices": is_site_admin,
+                    },
+                    max_retries=max_retries,
+                )
+                break
+            except HTTPRequestError as error:
+                violation = parse_field_count_violation(error)
+                if violation is None or request_page_size <= 1:
+                    raise
+                next_page_size = retry_page_size_after_field_count_violation(
+                    request_page_size,
+                    violation,
+                )
+                logger.warning(
+                    "Sourcegraph rejected listing page size %d: GraphQL "
+                    "field count %d exceeds limit %d; retrying with page size %d",
+                    request_page_size,
+                    violation.actual,
+                    violation.limit,
+                    next_page_size,
+                )
+                current_page_size = min(current_page_size, next_page_size)
+                request_page_size = next_page_size
         connection = data["repositories"]
         total_count = connection["totalCount"]
         target = min(max_repos, total_count) if max_repos is not None else total_count
@@ -1882,6 +2114,257 @@ def csv_columns_for(
     return cols
 
 
+@dataclass(frozen=True)
+class RepoProcessingResult:
+    """Repo row plus optional per-repo query results"""
+
+    index: int
+    target: int
+    repo: dict[str, Any]
+    row: list[Any]
+    commit_count: int | None
+    all_refs_count: int | None
+    commit_elapsed_seconds: float | None
+    optimization_values: list[Any] | None
+    search_match_count: int | None
+    search_elapsed_seconds: float | None
+    search_limit_hit: bool
+    search_alert_title: str | None
+
+
+def collect_repo_processing_result(
+    endpoint: str,
+    token: str,
+    index: int,
+    target: int,
+    repo: dict[str, Any],
+    *,
+    count_commits: bool,
+    count_commits_rev: str,
+    run_search_pattern: str | None,
+    max_retries: int,
+) -> RepoProcessingResult:
+    """Build the row and run optional per-repo network queries"""
+    row = build_row(repo, endpoint)
+    commit_count: int | None = None
+    all_refs_count: int | None = None
+    commit_elapsed_seconds: float | None = None
+    optimization_values: list[Any] | None = None
+    search_match_count: int | None = None
+    search_elapsed_seconds: float | None = None
+    search_limit_hit = False
+    search_alert_title: str | None = None
+    repo_name = str(repo.get("name") or "")
+    if count_commits:
+        (
+            commit_count,
+            all_refs_count,
+            commit_elapsed_seconds,
+            optimization_values,
+        ) = fetch_commit_count(
+            endpoint,
+            token,
+            repo_name,
+            count_commits_rev,
+            max_retries=max_retries,
+        )
+    if run_search_pattern is not None:
+        (
+            search_match_count,
+            search_elapsed_seconds,
+            search_limit_hit,
+            search_alert_title,
+        ) = fetch_run_search(
+            endpoint,
+            token,
+            repo_name,
+            run_search_pattern,
+            max_retries=max_retries,
+        )
+    return RepoProcessingResult(
+        index=index,
+        target=target,
+        repo=repo,
+        row=row,
+        commit_count=commit_count,
+        all_refs_count=all_refs_count,
+        commit_elapsed_seconds=commit_elapsed_seconds,
+        optimization_values=optimization_values,
+        search_match_count=search_match_count,
+        search_elapsed_seconds=search_elapsed_seconds,
+        search_limit_hit=search_limit_hit,
+        search_alert_title=search_alert_title,
+    )
+
+
+def append_processing_result_columns(
+    row: list[Any],
+    result: RepoProcessingResult,
+    *,
+    count_commits: bool,
+    run_search: bool,
+) -> list[Any]:
+    """Append optional column blocks from a processed repo result"""
+    with_commit = append_commit_count(
+        row,
+        result.commit_count,
+        result.all_refs_count,
+        result.commit_elapsed_seconds,
+        result.optimization_values,
+        count_commits=count_commits,
+    )
+    return append_run_search(
+        with_commit,
+        result.search_match_count,
+        result.search_elapsed_seconds,
+        result.search_limit_hit,
+        result.search_alert_title,
+        run_search=run_search,
+    )
+
+
+def log_processing_result(
+    result: RepoProcessingResult,
+    *,
+    count_commits: bool,
+    run_search_pattern: str | None,
+) -> None:
+    """Log optional per-repo query results in CSV order"""
+    position = f"[{result.index}/{result.target}]"
+    repo_label = (
+        result.repo.get("name") or result.repo.get("url") or result.repo.get("id")
+    )
+    if count_commits:
+        default_str = "?" if result.commit_count is None else f"{result.commit_count}"
+        all_refs_str = (
+            "?" if result.all_refs_count is None else f"{result.all_refs_count}"
+        )
+        elapsed = result.commit_elapsed_seconds or 0.0
+        if result.commit_count is None:
+            logger.info(
+                "%s No commit count for %s (default=%s, allRefs=%s) [query took %.3fs]",
+                position,
+                repo_label,
+                default_str,
+                all_refs_str,
+                elapsed,
+            )
+        else:
+            logger.info(
+                "%s Commit count for %s: default=%s, allRefs=%s [query took %.3fs]",
+                position,
+                repo_label,
+                default_str,
+                all_refs_str,
+                elapsed,
+            )
+    if run_search_pattern is not None:
+        count_str = (
+            "?" if result.search_match_count is None else f"{result.search_match_count}"
+        )
+        limit_suffix = " (limit hit)" if result.search_limit_hit else ""
+        alert_suffix = (
+            f" alert={result.search_alert_title!r}" if result.search_alert_title else ""
+        )
+        logger.info(
+            "%s Search %s in %s: matches=%s%s%s [query took %.3fs]",
+            position,
+            run_search_pattern,
+            repo_label,
+            count_str,
+            limit_suffix,
+            alert_suffix,
+            result.search_elapsed_seconds or 0.0,
+        )
+
+
+def iter_repo_processing_results(
+    endpoint: str,
+    token: str,
+    max_repos: int | None,
+    *,
+    page_size: int,
+    scope_repo: str | None,
+    is_site_admin: bool,
+    count_commits: bool,
+    count_commits_rev: str,
+    run_search_pattern: str | None,
+    concurrency: int,
+    max_retries: int,
+) -> Iterator[RepoProcessingResult]:
+    """Yield processed repos, parallelizing optional per-repo queries"""
+    repos = fetch_repos(
+        endpoint,
+        token,
+        max_repos,
+        page_size=page_size,
+        scope_repo=scope_repo,
+        is_site_admin=is_site_admin,
+        max_retries=max_retries,
+    )
+    use_threads = concurrency > 1 and (count_commits or run_search_pattern is not None)
+    if not use_threads:
+        for index, target, repo in repos:
+            yield collect_repo_processing_result(
+                endpoint,
+                token,
+                index,
+                target,
+                repo,
+                count_commits=count_commits,
+                count_commits_rev=count_commits_rev,
+                run_search_pattern=run_search_pattern,
+                max_retries=max_retries,
+            )
+        return
+
+    logger.info("Per-repo query concurrency: %d threads", concurrency)
+    max_pending = concurrency * 2
+    repo_iterator = iter(repos)
+    pending_results: dict[concurrent.futures.Future[RepoProcessingResult], int] = {}
+
+    def submit_repo(
+        executor: concurrent.futures.ThreadPoolExecutor,
+        index: int,
+        target: int,
+        repo: dict[str, Any],
+    ) -> None:
+        future = executor.submit(
+            collect_repo_processing_result,
+            endpoint,
+            token,
+            index,
+            target,
+            repo,
+            count_commits=count_commits,
+            count_commits_rev=count_commits_rev,
+            run_search_pattern=run_search_pattern,
+            max_retries=max_retries,
+        )
+        pending_results[future] = index
+
+    def fill_pending(executor: concurrent.futures.ThreadPoolExecutor) -> None:
+        while len(pending_results) < max_pending:
+            try:
+                index, target, repo = next(repo_iterator)
+            except StopIteration:
+                return
+            submit_repo(executor, index, target, repo)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
+        fill_pending(executor)
+        while pending_results:
+            done, _ = concurrent.futures.wait(
+                pending_results,
+                return_when=concurrent.futures.FIRST_COMPLETED,
+            )
+            for future in done:
+                pending_results.pop(future)
+                result = future.result()
+                fill_pending(executor)
+                yield result
+
+
 def write_csv(
     out: TextIO,
     cloning_writer: LazyCSVWriter,
@@ -1897,6 +2380,9 @@ def write_csv(
     scope_repo: str | None = None,
     count_commits_rev: str = "HEAD",
     run_search_pattern: str | None = None,
+    page_size: int = PAGE_SIZE,
+    concurrency: int = DEFAULT_CONCURRENCY,
+    max_retries: int = DEFAULT_MAX_RETRIES,
     stats: StatsCollector | None = None,
     is_site_admin: bool,
 ) -> tuple[int, int, int]:
@@ -1914,110 +2400,34 @@ def write_csv(
     total = 0
     reclone_total = 0
     reindex_total = 0
-    for index, target, repo in fetch_repos(
+    for result in iter_repo_processing_results(
         endpoint,
         token,
         max_repos,
+        page_size=page_size,
         scope_repo=scope_repo,
         is_site_admin=is_site_admin,
+        count_commits=count_commits,
+        count_commits_rev=count_commits_rev,
+        run_search_pattern=run_search_pattern,
+        concurrency=concurrency,
+        max_retries=max_retries,
     ):
-        row = build_row(repo, endpoint)
-        commit_count: int | None = None
-        all_refs_count: int | None = None
-        elapsed_seconds: float | None = None
-        optimization_values: list[Any] | None = None
-        search_match_count: int | None = None
-        search_elapsed_seconds: float | None = None
-        search_limit_hit = False
-        search_alert_title: str | None = None
-        position = f"[{index}/{target}]"
-        repo_label = repo.get("name") or repo.get("url") or repo.get("id")
-        if count_commits:
-            repo_name = str(repo.get("name") or "")
-            (
-                commit_count,
-                all_refs_count,
-                elapsed_seconds,
-                optimization_values,
-            ) = fetch_commit_count(endpoint, token, repo_name, count_commits_rev)
-            # Keep progress/count logging compact for long-running runs
-            default_str = "?" if commit_count is None else f"{commit_count}"
-            all_refs_str = "?" if all_refs_count is None else f"{all_refs_count}"
-            if commit_count is None:
-                # Empty or not-yet-cloned repos commonly have no count
-                logger.info(
-                    "%s No commit count for %s (default=%s, allRefs=%s) "
-                    "[query took %.3fs]",
-                    position,
-                    repo_label,
-                    default_str,
-                    all_refs_str,
-                    elapsed_seconds,
-                )
-            else:
-                logger.info(
-                    "%s Commit count for %s: default=%s, allRefs=%s [query took %.3fs]",
-                    position,
-                    repo_label,
-                    default_str,
-                    all_refs_str,
-                    elapsed_seconds,
-                )
-        if run_search_pattern is not None:
-            repo_name = str(repo.get("name") or "")
-            (
-                search_match_count,
-                search_elapsed_seconds,
-                search_limit_hit,
-                search_alert_title,
-            ) = fetch_run_search(endpoint, token, repo_name, run_search_pattern)
-            count_str = "?" if search_match_count is None else f"{search_match_count}"
-            limit_suffix = " (limit hit)" if search_limit_hit else ""
-            alert_suffix = (
-                f" alert={search_alert_title!r}" if search_alert_title else ""
-            )
-            logger.info(
-                "%s Search %s in %s: matches=%s%s%s [query took %.3fs]",
-                position,
-                run_search_pattern,
-                repo_label,
-                count_str,
-                limit_suffix,
-                alert_suffix,
-                search_elapsed_seconds,
-            )
-
-        def _augmented(
-            base: list[Any],
-            *,
-            _commit_count: int | None = commit_count,
-            _all_refs_count: int | None = all_refs_count,
-            _elapsed_seconds: float | None = elapsed_seconds,
-            _optimization_values: list[Any] | None = optimization_values,
-            _search_match_count: int | None = search_match_count,
-            _search_elapsed_seconds: float | None = search_elapsed_seconds,
-            _search_limit_hit: bool = search_limit_hit,
-            _search_alert_title: str | None = search_alert_title,
-        ) -> list[Any]:
-            """Apply the optional commit-count and run-search columns in order"""
-            with_commit = append_commit_count(
-                base,
-                _commit_count,
-                _all_refs_count,
-                _elapsed_seconds,
-                _optimization_values,
+        repo = result.repo
+        row = result.row
+        log_processing_result(
+            result,
+            count_commits=count_commits,
+            run_search_pattern=run_search_pattern,
+        )
+        writer.writerow(
+            append_processing_result_columns(
+                row,
+                result,
                 count_commits=count_commits,
-            )
-            return append_run_search(
-                with_commit,
-                _search_match_count,
-                _search_elapsed_seconds,
-                _search_limit_hit,
-                _search_alert_title,
                 run_search=run_search_enabled,
-            )
-
-        writer.writerow(_augmented(row))
+            ),
+        )
         total += 1
         if stats is not None:
             stats.add(repo)
@@ -2025,12 +2435,15 @@ def write_csv(
         repo_has_indexing_error = has_indexing_error(repo)
         if repo_has_cloning_error:
             cloning_writer.writerow(
-                _augmented(
+                append_processing_result_columns(
                     row
                     + [
                         extract(repo)
                         for _, extract, _, _, _ in CLONING_ERROR_EXTRA_COLUMNS
                     ],
+                    result,
+                    count_commits=count_commits,
+                    run_search=run_search_enabled,
                 ),
             )
         # In single-repo (scope_repo) mode the user explicitly asked for
@@ -2038,21 +2451,31 @@ def write_csv(
         # full-repo mode keep the existing "only fix repos with errors"
         # guard so a blanket --reclone doesn't reclone the whole instance
         if reclone and (scope_repo is not None or repo_has_cloning_error):
-            if trigger_reclone(endpoint, token, repo["id"]):
+            if trigger_reclone(endpoint, token, repo["id"], max_retries=max_retries):
                 reclone_total += 1
         if repo_has_indexing_error:
-            indexing_writer.writerow(_augmented(row))
+            indexing_writer.writerow(
+                append_processing_result_columns(
+                    row,
+                    result,
+                    count_commits=count_commits,
+                    run_search=run_search_enabled,
+                ),
+            )
         if reindex and (scope_repo is not None or repo_has_indexing_error):
-            if trigger_reindex(endpoint, token, repo["id"]):
+            if trigger_reindex(endpoint, token, repo["id"], max_retries=max_retries):
                 reindex_total += 1
         if skipped_writer is not None and has_skipped_files(repo):
             skipped_writer.writerow(
-                _augmented(
+                append_processing_result_columns(
                     row
                     + [
                         extract(repo)
                         for _, extract, _, _, _ in SKIPPED_FILES_EXTRA_COLUMNS
                     ],
+                    result,
+                    count_commits=count_commits,
+                    run_search=run_search_enabled,
                 ),
             )
     return (total, reclone_total, reindex_total)
@@ -2177,6 +2600,19 @@ def positive_int(value: str) -> int:
     return n
 
 
+def non_negative_int(value: str) -> int:
+    """argparse type for integers >= 0"""
+    try:
+        n = int(value)
+    except ValueError:
+        msg = f"must be an integer, got {value!r}"
+        raise argparse.ArgumentTypeError(msg) from None
+    if n < 0:
+        msg = f"must be a non-negative integer (>=0), got {n}"
+        raise argparse.ArgumentTypeError(msg)
+    return n
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     """Parse command-line arguments into a Namespace"""
     parser = argparse.ArgumentParser(
@@ -2210,9 +2646,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--skipped-files-reason",
         metavar="REPO[@REV]",
         default=None,
-        help=(
-            "Write skipped-file details and reason counts for one repo"
-        ),
+        help=("Write skipped-file details and reason counts for one repo"),
     )
     parser.add_argument(
         "--reclone",
@@ -2252,14 +2686,42 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--run-search",
         metavar="PATTERN",
         default=None,
-        help=(
-            "Run PATTERN once per repo and append result columns"
-        ),
+        help=("Run PATTERN once per repo and append result columns"),
     )
     parser.add_argument(
         "--statistics",
         action="store_true",
         help="Write statistics CSV files",
+    )
+    parser.add_argument(
+        "--page-size",
+        type=positive_int,
+        default=PAGE_SIZE,
+        metavar="int",
+        help=(
+            "Starting GraphQL repository page size "
+            f"(default {PAGE_SIZE}; reduced automatically if rejected)"
+        ),
+    )
+    parser.add_argument(
+        "--concurrency",
+        type=positive_int,
+        default=DEFAULT_CONCURRENCY,
+        metavar="int",
+        help=(
+            "Concurrent per-repo query threads for --count-commits and "
+            f"--run-search (default {DEFAULT_CONCURRENCY})"
+        ),
+    )
+    parser.add_argument(
+        "--max-retries",
+        type=non_negative_int,
+        default=DEFAULT_MAX_RETRIES,
+        metavar="int",
+        help=(
+            "Retries per GraphQL request after the initial attempt "
+            f"(default {DEFAULT_MAX_RETRIES}; backoff 1s, 2s, 4s, ...)"
+        ),
     )
     parser.add_argument(
         "--write-csv-schema",
@@ -2322,6 +2784,10 @@ def collect_scope(args: argparse.Namespace) -> tuple[str, str] | None:
 
 def run(args: argparse.Namespace, endpoint: str, token: str) -> None:
     """Confirm the connection, then stream every repo to the CSV file"""
+    logger.info(
+        "Retry policy: %d retries per GraphQL request (backoff: 1s, 2s, 4s, ...)",
+        args.max_retries,
+    )
     if args.count_commits:
         # Announce the longer per-repo timeout because this mode can be slow
         logger.info(
@@ -2344,7 +2810,11 @@ def run(args: argparse.Namespace, endpoint: str, token: str) -> None:
     else:
         scope_repo = None
         scope_rev = "HEAD"
-    username, is_site_admin = fetch_current_user(endpoint, token)
+    username, is_site_admin = fetch_current_user(
+        endpoint,
+        token,
+        max_retries=args.max_retries,
+    )
     logger.info(
         "Connected to: %s as: %s (%s)",
         endpoint,
@@ -2384,6 +2854,9 @@ def run(args: argparse.Namespace, endpoint: str, token: str) -> None:
                 ("--reclone", args.reclone),
                 ("--reindex", args.reindex),
                 ("--limit", args.limit is not None),
+                ("--page-size", args.page_size != PAGE_SIZE),
+                ("--concurrency", args.concurrency != DEFAULT_CONCURRENCY),
+                ("--max-retries", args.max_retries != DEFAULT_MAX_RETRIES),
                 ("--skipped-files", args.skipped_files),
                 ("--count-commits", args.count_commits),
                 ("--run-search", args.run_search is not None),
@@ -2397,7 +2870,12 @@ def run(args: argparse.Namespace, endpoint: str, token: str) -> None:
                 "query and does not iterate the repo list",
                 ", ".join(ignored),
             )
-        write_skipped_files_reason(endpoint, token, args.skipped_files_reason)
+        write_skipped_files_reason(
+            endpoint,
+            token,
+            args.skipped_files_reason,
+            max_retries=args.max_retries,
+        )
         return
 
     # Prefix outputs with endpoint, plus scoped repo/rev when applicable
@@ -2483,6 +2961,9 @@ def run(args: argparse.Namespace, endpoint: str, token: str) -> None:
             scope_repo=scope_repo,
             count_commits_rev=scope_rev,
             run_search_pattern=run_search_pattern,
+            page_size=args.page_size,
+            concurrency=args.concurrency,
+            max_retries=args.max_retries,
             stats=stats,
             is_site_admin=is_site_admin,
         )
@@ -2536,6 +3017,12 @@ def redact_argv_for_log(argv: list[str]) -> str:
     return " ".join(shlex.quote(a) for a in redacted)
 
 
+def timestamped_log_path() -> Path:
+    """Return list-repos-YYYY-MM-DD-HH-MM-SS.log for this run"""
+    timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+    return Path(f"{DEFAULT_LOG_FILE_STEM}-{timestamp}.log")
+
+
 def configure_logging(log_path: Path) -> None:
     """Send INFO-level logs to both stderr (live feedback) and log_path"""
     root = logging.getLogger()
@@ -2572,8 +3059,8 @@ def _log_uncaught_exception(
 
 def main() -> None:
     """Entry point: configure logging, load env, parse args, run, handle errors"""
-    configure_logging(Path(DEFAULT_LOG_FILE))
-    # Include pre-run failures in list-repos.log
+    configure_logging(timestamped_log_path())
+    # Include pre-run failures in the timestamped log file
     sys.excepthook = _log_uncaught_exception
 
     args = parse_args(sys.argv[1:])
