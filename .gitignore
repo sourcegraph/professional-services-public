@@ -6,5 +6,6 @@ __pycache__
 .src_users_backup.json
 .vscode
 *.egg-info/
+*.log
 bin/
 schema.gql
