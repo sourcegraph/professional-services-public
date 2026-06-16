@@ -1,15 +1,15 @@
-# Pre-commit hooks for `repo-management/`.
+# Pre-commit hooks for `repo-troubleshooting/list-repos/`.
 #
 # This config lives in the subdirectory rather than at the repo root because
-# `repo-management/` is a self-contained project within
+# `repo-troubleshooting/list-repos/` is a self-contained project within
 # `professional-services-public/`. Install (run from the repo root) with:
 #
-#     pre-commit install --config repo-management/.pre-commit-config.yaml
+#     pre-commit install --config repo-troubleshooting/list-repos/.pre-commit-config.yaml
 #
 # Or run on demand without installing the git hook:
 #
-#     pre-commit run --config repo-management/.pre-commit-config.yaml \
-#         --files repo-management/list-repos.py
+#     pre-commit run --config repo-troubleshooting/list-repos/.pre-commit-config.yaml \
+#         --files repo-troubleshooting/list-repos/list-repos.py
 #
 # Pre-commit (https://pre-commit.com) is a separate tool — install it once
 # per machine (e.g. `pipx install pre-commit` or `uv tool install pre-commit`).
@@ -23,12 +23,12 @@ repos:
       # written on every customer-facing run of list-repos.py — this hook is
       # the contributor-side mechanism that keeps it from drifting.
       - id: write-csv-schema
-        name: Regenerate repo-management/CSV_SCHEMA.md
+        name: Regenerate repo-troubleshooting/list-repos/CSV_SCHEMA.md
         entry: >-
           bash -c
-          'cd repo-management
+          'cd repo-troubleshooting/list-repos
           && python3 list-repos.py --write-csv-schema
           && git add CSV_SCHEMA.md'
         language: system
-        files: ^repo-management/list-repos\.py$
+        files: ^repo-troubleshooting/list-repos/list-repos\.py$
         pass_filenames: false
