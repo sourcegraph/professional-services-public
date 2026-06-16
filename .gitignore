@@ -4,6 +4,9 @@ __pycache__
 .idea
 .ruff_cache
 .src_users_backup.json
+.venv
 .vscode
 *.egg-info/
+*.log
 bin/
+schema.gql
