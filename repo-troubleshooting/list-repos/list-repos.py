@@ -38,6 +38,7 @@ DEFAULT_INDEXING_ERRORS_FILE = "repos-with-indexing-errors.csv"
 DEFAULT_LOG_FILE_STEM = "list-repos"
 DEFAULT_OUTPUT_FILE = "repos.csv"
 DEFAULT_SKIPPED_FILES_FILE = "repos-with-skipped-files.csv"
+DEFAULT_SKIPPED_FILE_REASONS_FILE = "skipped-file-reasons.csv"
 DEFAULT_STATS_FILE_PREFIX = "stats"
 DEFAULT_MAX_RETRIES = 5
 GRAPHQL_FIELD_COUNT_RETRY_HEADROOM_PERCENT = 95
@@ -45,6 +46,9 @@ PAGE_SIZE = 500
 REQUEST_TIMEOUT_SECONDS = 60
 REQUEST_TIMEOUT_SECONDS_WITH_COMMIT_COUNT = (
     600  # Counting commits server-side can be slow on big monorepos
+)
+SKIPPED_FILE_REASON_SEARCH_TIMEOUT_PARAMETER = (
+    f"timeout:{REQUEST_TIMEOUT_SECONDS_WITH_COMMIT_COUNT}s"
 )
 RETRYABLE_HTTP_STATUSES = {408, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524}
 RETRYABLE_GRAPHQL_ERROR_TERMS = (
@@ -65,8 +69,11 @@ RETRYABLE_GRAPHQL_ERROR_TERMS = (
 
 # --- GraphQL queries ----------------------------------------------------------
 
-# Shared fields for full-listing and single-repo queries
-REPO_NODE_FRAGMENT = """
+# Shared fields for full-listing and single-repo queries. The text-search
+# index failure fields are added only when schema introspection confirms the
+# target Sourcegraph instance supports them; @include cannot hide unknown fields
+# from GraphQL validation on older instances.
+REPO_NODE_FRAGMENT_HEAD = """
 fragment RepoNodeFields on Repository {
   name
   id
@@ -106,6 +113,14 @@ fragment RepoNodeFields on Repository {
       defaultBranchNewLinesCount
       otherBranchesNewLinesCount
     }
+"""
+
+REPO_NODE_TEXT_SEARCH_INDEX_FAILURE_FIELDS = """
+    lastIndexStatus
+    lastIndexFailureMessage
+"""
+
+REPO_NODE_FRAGMENT_TAIL = """
     host {
       name
     }
@@ -127,10 +142,26 @@ fragment RepoNodeFields on Repository {
 }
 """
 
+
+def build_repo_node_fragment(include_index_failure_fields: bool) -> str:
+    """Return the shared Repository fragment with optional index-failure fields"""
+    return (
+        REPO_NODE_FRAGMENT_HEAD
+        + (
+            REPO_NODE_TEXT_SEARCH_INDEX_FAILURE_FIELDS
+            if include_index_failure_fields
+            else ""
+        )
+        + REPO_NODE_FRAGMENT_TAIL
+    )
+
+
 # Non-admin tokens set $includeExternalServices=false to skip admin-only fields
-GRAPHQL_QUERY = (
-    REPO_NODE_FRAGMENT
-    + """
+def build_repository_listing_query(include_index_failure_fields: bool) -> str:
+    """Return the paginated repository listing query"""
+    return (
+        build_repo_node_fragment(include_index_failure_fields)
+        + """
 query ListRepos($first: Int!, $after: String, $includeExternalServices: Boolean!) {
   repositories(first: $first, after: $after) {
     nodes {
@@ -144,27 +175,45 @@ query ListRepos($first: Int!, $after: String, $includeExternalServices: Boolean!
   }
 }
 """
-)
+    )
+
 
 # Single-repo lookup used by the scoped variants of --count-commits / --reclone
 # / --reindex. Returns the same field set as the listing query (via the shared
 # fragment) so the rest of the pipeline (build_row, write_csv, the error/skip
 # detectors, etc.) can treat the result identically to a listing-page node
-SINGLE_REPO_QUERY = (
-    REPO_NODE_FRAGMENT
-    + """
+def build_single_repo_query(include_index_failure_fields: bool) -> str:
+    """Return the single repository lookup query"""
+    return (
+        build_repo_node_fragment(include_index_failure_fields)
+        + """
 query SingleRepo($name: String!, $includeExternalServices: Boolean!) {
   repository(name: $name) {
     ...RepoNodeFields
   }
 }
 """
-)
+    )
+
 
 # Used once at startup to gate admin-only fields and mutations
 CURRENT_USER_QUERY = """
 query { currentUser { username siteAdmin } }
 """
+
+TEXT_SEARCH_INDEX_FIELDS_QUERY = """
+query TextSearchIndexFields {
+  __type(name: "RepositoryTextSearchIndex") {
+    fields {
+      name
+    }
+  }
+}
+"""
+
+TEXT_SEARCH_INDEX_FAILURE_FIELD_NAMES = frozenset(
+    {"lastIndexStatus", "lastIndexFailureMessage"},
+)
 
 # Per-repo query for exact rev count, cleanup metadata, and all-refs proxy
 # Omitting ancestors.first asks gitserver for the full reachable commit count
@@ -261,6 +310,12 @@ SKIPPED_FILES_REASON_QUERY = """
 query SkippedFileReasons($query: String!) {
   search(query: $query, version: V2) {
     results {
+      matchCount
+      limitHit
+      alert {
+        title
+        description
+      }
       results {
         ... on FileMatch {
           repository {
@@ -298,6 +353,10 @@ query ValidateRepoRev($name: String!, $rev: String!) {
         indexed
         indexedCommit {
           oid
+        }
+        skippedIndexed {
+          count
+          query
         }
       }
     }
@@ -432,11 +491,13 @@ def has_cloning_error(repo: dict[str, Any]) -> bool:
 
 
 def has_indexing_error(repo: dict[str, Any]) -> bool:
-    """Return True for cloned repos missing a search index"""
-    return (
-        derive_mirror_status(repo) == "cloned"
-        and get_path(repo, "textSearchIndex.status") is None
-    )
+    """Return True for cloned repos with a missing or failed search index"""
+    if derive_mirror_status(repo) != "cloned":
+        return False
+    if get_path(repo, "textSearchIndex.status") is None:
+        return True
+    last_status = get_path(repo, "textSearchIndex.lastIndexStatus")
+    return isinstance(last_status, str) and last_status.upper() == "FAILURE"
 
 
 def _index_refs(repo: dict[str, Any]) -> list[dict[str, Any]]:
@@ -459,19 +520,36 @@ def total_skipped_files(repo: dict[str, Any]) -> int:
 
 def refs_with_skips(repo: dict[str, Any]) -> str:
     """Return ';'-joined '<refName>=<count>' for refs with skipped files"""
-    parts: list[str] = []
+    return "; ".join(
+        f"{name}={skipped_count}"
+        for name, skipped_count in refs_with_skipped_file_counts(repo)
+    )
+
+
+def refs_with_skipped_file_queries(repo: dict[str, Any]) -> list[tuple[str, int, str]]:
+    """Return (ref name, skipped count, API search query) for refs with skips"""
+    refs: list[tuple[str, int, str]] = []
     for ref in _index_refs(repo):
         skipped: dict[str, Any] = ref.get("skippedIndexed") or {}
         count = skipped.get("count")
         if count is None:
             continue
-        n = int(count)
-        if n <= 0:
+        skipped_count = int(count)
+        if skipped_count <= 0:
             continue
         ref_node: dict[str, Any] = ref.get("ref") or {}
         name = str(ref_node.get("displayName") or "")
-        parts.append(f"{name}={n}")
-    return "; ".join(parts)
+        if name:
+            refs.append((name, skipped_count, str(skipped.get("query") or "")))
+    return refs
+
+
+def refs_with_skipped_file_counts(repo: dict[str, Any]) -> list[tuple[str, int]]:
+    """Return (ref name, skipped count) pairs for refs with skipped files"""
+    return [
+        (name, skipped_count)
+        for name, skipped_count, _query in refs_with_skipped_file_queries(repo)
+    ]
 
 
 def head_skipped_query(repo: dict[str, Any]) -> str:
@@ -521,6 +599,7 @@ def fetch_commit_count(
             },
             timeout=REQUEST_TIMEOUT_SECONDS_WITH_COMMIT_COUNT,
             max_retries=max_retries,
+            request_description=f"Commit count for {repo_name}",
         )
     except (GraphQLError, HTTPRequestError) as exc:
         elapsed = time.monotonic() - start
@@ -571,6 +650,7 @@ def fetch_run_search(
             RUN_SEARCH_GRAPHQL,
             {"query": query},
             max_retries=max_retries,
+            request_description=f"Search {pattern} in {repo_name}",
         )
     except (GraphQLError, HTTPRequestError) as exc:
         elapsed = time.monotonic() - start
@@ -736,6 +816,24 @@ COLUMNS: list[tuple[str, Callable[[dict[str, Any]], Any], str, bool, str]] = [
         "`not_indexed` otherwise",
         False,
         "enum (indexed, not_indexed)",
+    ),
+    (
+        "textSearchIndex.lastIndexStatus",
+        lambda r: get_path(r, "textSearchIndex.lastIndexStatus"),
+        "Most recent persisted text search indexing attempt result. "
+        "Blank when the Sourcegraph instance does not expose this field "
+        "or no attempt was reported",
+        False,
+        "enum (SUCCESS, FAILURE)",
+    ),
+    (
+        "textSearchIndex.lastIndexFailureMessage",
+        lambda r: get_path(r, "textSearchIndex.lastIndexFailureMessage"),
+        "Failure message from the most recent persisted text search indexing "
+        "attempt. Blank when the Sourcegraph instance does not expose this "
+        "field or no failure was reported",
+        False,
+        "string",
     ),
     (
         "textSearchIndex.status.updatedAt",
@@ -991,6 +1089,57 @@ SKIPPED_FILES_CSV_COLUMNS = CSV_COLUMNS + [
     name for name, _, _, _, _ in SKIPPED_FILES_EXTRA_COLUMNS
 ]
 
+SKIPPED_FILE_REASON_COLUMNS: list[tuple[str, str, bool, str]] = [
+    (
+        "repository.name",
+        "Sourcegraph repository name containing the skipped file",
+        False,
+        "string",
+    ),
+    (
+        "rev",
+        "Indexed revision parsed from Sourcegraph's skippedIndexed.query",
+        False,
+        "string",
+    ),
+    (
+        "reason",
+        "NOT-INDEXED reason parsed from the indexed placeholder content",
+        False,
+        "string",
+    ),
+    (
+        "file.extension",
+        "File extension derived from file.path",
+        False,
+        "string",
+    ),
+    (
+        "file.byteSize",
+        "Sourcegraph-reported file byte size",
+        False,
+        "integer",
+    ),
+    (
+        "skippedIndexed.count",
+        "Count Sourcegraph reported for this repo/ref before running the details search",
+        False,
+        "integer",
+    ),
+    (
+        "file.path",
+        "Path of the skipped file within the repository",
+        False,
+        "string",
+    ),
+    (
+        "file_url",
+        "Sourcegraph blob URL for the skipped file at the indexed ref",
+        False,
+        "string",
+    ),
+]
+
 
 # --- Statistics ---------------------------------------------------------------
 
@@ -1236,6 +1385,7 @@ def write_csv_schema(path: Path) -> None:
     main_list = format_columns_list(name_desc(COLUMNS))
     cloning_list = format_columns_list(name_desc(CLONING_ERROR_EXTRA_COLUMNS))
     skipped_list = format_columns_list(name_desc(SKIPPED_FILES_EXTRA_COLUMNS))
+    skipped_reason_list = format_columns_list(SKIPPED_FILE_REASON_COLUMNS)
     commit_count_list = format_columns_list(COMMIT_COUNT_COLUMNS)
     run_search_list = format_columns_list(RUN_SEARCH_COLUMNS)
     stats_files_list = format_stats_files_list()
@@ -1263,16 +1413,17 @@ so the script can run against multiple instances without overwriting files
 | `<prefix>-{DEFAULT_CLONING_ERRORS_FILE}` | at least one repo has a cloning error | main columns + cloning-error extras |
 | `<prefix>-{DEFAULT_INDEXING_ERRORS_FILE}` | at least one repo is cloned but is missing a search index | main columns |
 | `<prefix>-{DEFAULT_SKIPPED_FILES_FILE}` | `--skipped-files` is set and the last index excluded some files | main columns + skipped-files extras |
+| `<prefix>-{DEFAULT_SKIPPED_FILE_REASONS_FILE}` | `--skipped-files-reason` is set without `REPO[@REV]` | skipped-file reason columns |
 | `<prefix>-{DEFAULT_STATS_FILE_PREFIX}-*.csv` | `--statistics` is set | `bucket,count` (see Statistics section) |
 
 The optional `--count-commits` and `--run-search` flags append extra
-columns to *every* CSV listed above (except the `--statistics` files,
-which are summaries rather than per-repo rows), in this order: main
+columns to the repo-listing CSVs above, excluding the `--statistics`
+files and the skipped-file reason detail CSV, in this order: main
 columns → per-CSV extras → commit-count columns → run-search columns
 
 ## Main columns
 
-These are written to every CSV file
+These are written to every repo-listing CSV file
 
 {main_list}
 
@@ -1287,6 +1438,13 @@ Appended to `<prefix>-{DEFAULT_CLONING_ERRORS_FILE}`
 Appended to `<prefix>-{DEFAULT_SKIPPED_FILES_FILE}`
 
 {skipped_list}
+
+## Skipped-file reason columns
+
+Written to `<prefix>-{DEFAULT_SKIPPED_FILE_REASONS_FILE}` when
+`--skipped-files-reason` is used without `REPO[@REV]`
+
+{skipped_reason_list}
 
 ## `--count-commits` columns
 
@@ -1313,7 +1471,7 @@ main CSV, so enabling `--statistics` adds no extra GraphQL requests
 {stats_files_list}
 
 """
-    path.write_text(content, encoding="utf-8")
+    path.write_text(content.rstrip() + "\n", encoding="utf-8")
 
 
 # --- HTTP / GraphQL plumbing --------------------------------------------------
@@ -1528,6 +1686,7 @@ def graphql_request(
     variables: dict[str, Any],
     timeout: int = REQUEST_TIMEOUT_SECONDS,
     max_retries: int = DEFAULT_MAX_RETRIES,
+    request_description: str = "GraphQL request",
 ) -> dict[str, Any]:
     """Send a GraphQL query to the Sourcegraph API and return the data block"""
     url = endpoint.rstrip("/") + "/.api/graphql"
@@ -1537,6 +1696,7 @@ def graphql_request(
         "Content-Type": "application/json",
         "User-Agent": "list-repos/0.0.1",
     }
+    retry_prefix = f"{request_description}: " if request_description else ""
     for retry_count in range(max_retries + 1):
         retry_number = retry_count + 1
         try:
@@ -1545,7 +1705,7 @@ def graphql_request(
             if not retryable_http_error(error) or retry_count >= max_retries:
                 raise
             sleep_before_retry(
-                f"HTTP {error.status} {error.reason}",
+                f"{retry_prefix}HTTP {error.status} {error.reason}",
                 retry_number,
                 max_retries,
             )
@@ -1554,7 +1714,7 @@ def graphql_request(
             if retry_count >= max_retries:
                 raise
             sleep_before_retry(
-                f"Request failed: {error}",
+                f"{retry_prefix}Request failed: {error}",
                 retry_number,
                 max_retries,
             )
@@ -1566,7 +1726,7 @@ def graphql_request(
 
         if has_retryable_graphql_error(errors) and retry_count < max_retries:
             sleep_before_retry(
-                "GraphQL returned retryable error(s): "
+                f"{retry_prefix}GraphQL returned retryable error(s): "
                 + summarize_graphql_errors(errors),
                 retry_number,
                 max_retries,
@@ -1600,9 +1760,66 @@ def fetch_current_user(
         CURRENT_USER_QUERY,
         {},
         max_retries=max_retries,
+        request_description="Current user query",
     )
     user: dict[str, Any] = data["currentUser"] or {}
     return str(user["username"]), bool(user.get("siteAdmin"))
+
+
+def fetch_text_search_index_field_names(
+    endpoint: str,
+    token: str,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+) -> set[str]:
+    """Return fields exposed by RepositoryTextSearchIndex in the target schema"""
+    data = graphql_request(
+        endpoint,
+        token,
+        TEXT_SEARCH_INDEX_FIELDS_QUERY,
+        {},
+        max_retries=max_retries,
+        request_description="RepositoryTextSearchIndex schema query",
+    )
+    type_info: dict[str, Any] = data.get("__type") or {}
+    raw_fields: list[dict[str, Any]] = type_info.get("fields") or []
+    return {
+        name
+        for field in raw_fields
+        if isinstance(name := field.get("name"), str) and name
+    }
+
+
+def supports_text_search_index_failure_fields(
+    endpoint: str,
+    token: str,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+) -> bool:
+    """Return True when it is safe to query text-search index failure fields"""
+    try:
+        field_names = fetch_text_search_index_field_names(
+            endpoint,
+            token,
+            max_retries=max_retries,
+        )
+    except (GraphQLError, HTTPRequestError, OSError) as error:
+        logger.warning(
+            "Could not inspect Sourcegraph schema for new text-search index "
+            "failure fields (requires v7.5.0); leaving those CSV columns blank: %s",
+            error,
+        )
+        return False
+
+    missing = sorted(TEXT_SEARCH_INDEX_FAILURE_FIELD_NAMES - field_names)
+    if missing:
+        logger.info(
+            "Sourcegraph schema does not expose new text-search index "
+            "failure fields (requires v7.5.0); leaving those CSV columns blank: %s",
+            ", ".join(missing),
+        )
+        return False
+
+    logger.info("Including text-search index failure fields in repository queries")
+    return True
 
 
 def fetch_single_repo(
@@ -1611,15 +1828,17 @@ def fetch_single_repo(
     repo_name: str,
     *,
     is_site_admin: bool,
+    include_index_failure_fields: bool,
     max_retries: int = DEFAULT_MAX_RETRIES,
 ) -> dict[str, Any]:
     """Fetch one repo node in listing-query shape, respecting admin-only fields"""
     data = graphql_request(
         endpoint,
         token,
-        SINGLE_REPO_QUERY,
+        build_single_repo_query(include_index_failure_fields),
         {"name": repo_name, "includeExternalServices": is_site_admin},
         max_retries=max_retries,
+        request_description=f"Repository metadata for {repo_name}",
     )
     repo = data.get("repository")
     if repo is None:
@@ -1641,6 +1860,7 @@ def trigger_reclone(
             RECLONE_MUTATION,
             {"repo": repo_id},
             max_retries=max_retries,
+            request_description=f"Reclone repository {repo_id}",
         )
     except (GraphQLError, HTTPRequestError) as exc:
         logger.warning("recloneRepository failed for %s: %s", repo_id, exc)
@@ -1662,6 +1882,7 @@ def trigger_reindex(
             REINDEX_MUTATION,
             {"repository": repo_id},
             max_retries=max_retries,
+            request_description=f"Reindex repository {repo_id}",
         )
     except (GraphQLError, HTTPRequestError) as exc:
         logger.warning("reindexRepository failed for %s: %s", repo_id, exc)
@@ -1725,8 +1946,8 @@ def verify_repo_rev(
     token: str,
     repo_rev: str,
     max_retries: int = DEFAULT_MAX_RETRIES,
-) -> str:
-    """Require repo/rev to resolve to an indexed commit; return output rev name"""
+) -> tuple[str, str]:
+    """Require repo/rev to resolve to an index; return output rev and skip query"""
     name = parse_repo_name(repo_rev)
     rev = parse_repo_rev(repo_rev)
     data = graphql_request(
@@ -1735,6 +1956,7 @@ def verify_repo_rev(
         REPO_REV_VALIDATION_QUERY,
         {"name": name, "rev": rev},
         max_retries=max_retries,
+        request_description=f"Revision check for {name}@{rev}",
     )
     repository: dict[str, Any] | None = data.get("repository")
     if repository is None:
@@ -1748,6 +1970,10 @@ def verify_repo_rev(
     target_oid = commit.get("oid")
     indexed_oids: set[str] = set()
     indexed_names: list[str] = []
+    default_branch: dict[str, Any] = repository.get("defaultBranch") or {}
+    default_branch_name = str(default_branch.get("displayName") or "")
+    selected_skipped_query = ""
+    fallback_skipped_query = ""
     for ref in refs:
         if not ref.get("indexed"):
             continue
@@ -1756,7 +1982,19 @@ def verify_repo_rev(
         if oid:
             indexed_oids.add(str(oid))
         ref_node: dict[str, Any] = ref.get("ref") or {}
-        indexed_names.append(str(ref_node.get("displayName") or "?"))
+        ref_name = str(ref_node.get("displayName") or "?")
+        indexed_names.append(ref_name)
+        if oid != target_oid:
+            continue
+        skipped: dict[str, Any] = ref.get("skippedIndexed") or {}
+        skipped_count = int(skipped.get("count") or 0)
+        skipped_query = str(skipped.get("query") or "")
+        if skipped_count <= 0 or not skipped_query:
+            continue
+        if not fallback_skipped_query:
+            fallback_skipped_query = skipped_query
+        if ref_name == rev or (rev == "HEAD" and ref_name == default_branch_name):
+            selected_skipped_query = skipped_query
     if target_oid not in indexed_oids:
         if indexed_names:
             indexed_summary = "\n".join(f"  - {n}" for n in indexed_names)
@@ -1770,9 +2008,11 @@ def verify_repo_rev(
     # When the user didn't specify a rev (or explicitly used "HEAD"), substitute
     # the actual default branch name so filenames and URLs read naturally
     if rev == "HEAD":
-        default_branch: dict[str, Any] = repository.get("defaultBranch") or {}
-        return str(default_branch.get("displayName") or "HEAD")
-    return rev
+        return (
+            default_branch_name or "HEAD",
+            selected_skipped_query or fallback_skipped_query,
+        )
+    return rev, selected_skipped_query or fallback_skipped_query
 
 
 def file_url(endpoint: str, repo_name: str, rev: str, file_path: str) -> str:
@@ -1782,32 +2022,111 @@ def file_url(endpoint: str, repo_name: str, rev: str, file_path: str) -> str:
     return f"{base}/{repo_name}{rev_segment}/-/blob/{file_path}"
 
 
-def fetch_skipped_file_matches(
+def skipped_file_reason(match: dict[str, Any]) -> str:
+    """Extract the NOT-INDEXED reason from a skipped-file search match"""
+    chunks: list[dict[str, Any]] = match.get("chunkMatches") or []
+    for chunk in chunks:
+        reason_match = re.search(
+            r"NOT-INDEXED:\s*(.+)",
+            str(chunk.get("content") or ""),
+        )
+        if reason_match:
+            return reason_match.group(1).strip()
+    return ""
+
+
+def skipped_file_query_revision(query: str, fallback: str) -> str:
+    """Return the @rev term from a skippedIndexed query, or fallback"""
+    match = re.search(r"\br:\S+@([^\s]+)", query)
+    if match:
+        return match.group(1)
+    return fallback
+
+
+def skipped_file_reason_search_query(
+    skipped_indexed_query: str,
+    repo_name: str,
+    revision: str,
+) -> str:
+    """Build a reason-search query from Sourcegraph's skippedIndexed.query"""
+    if not skipped_indexed_query:
+        repo_filter = f"^{re.escape(repo_name)}$"
+        skipped_indexed_query = (
+            f"r:{repo_filter}@{revision} type:file index:only "
+            f"patternType:regexp ^NOT-INDEXED:"
+        )
+    terms = [
+        term
+        for term in skipped_indexed_query.split()
+        if term != "select:file"
+        and not term.startswith("count:")
+        and not term.startswith("timeout:")
+    ]
+    terms.append("count:all")
+    terms.append(SKIPPED_FILE_REASON_SEARCH_TIMEOUT_PARAMETER)
+    return " ".join(terms)
+
+
+def fetch_skipped_file_reason_query(
     endpoint: str,
     token: str,
     name: str,
     rev: str,
+    skipped_indexed_query: str,
     max_retries: int = DEFAULT_MAX_RETRIES,
-) -> list[dict[str, Any]]:
-    """Return NOT-INDEXED matches; omit @rev because Zoekt exposes them at HEAD"""
-    _ = rev  # verify_repo_rev already checked it maps to an indexed commit
-    repo_filter = f"^{re.escape(name)}$"
-    search_query = (
-        f"r:{repo_filter} type:file index:only "
-        f"patternType:regexp count:all ^NOT-INDEXED:"
-    )
+) -> SkippedFileReasonQueryResult:
+    """Return NOT-INDEXED matches and search metadata for one indexed repo ref"""
+    start = time.monotonic()
+    search_query = skipped_file_reason_search_query(skipped_indexed_query, name, rev)
     data = graphql_request(
         endpoint,
         token,
         SKIPPED_FILES_REASON_QUERY,
         {"query": search_query},
+        timeout=REQUEST_TIMEOUT_SECONDS_WITH_COMMIT_COUNT,
         max_retries=max_retries,
+        request_description=f"Skipped files for {name}@{rev}",
     )
-    raw_results: list[dict[str, Any] | None] = (
-        data.get("search", {}).get("results", {}).get("results") or []
-    )
+    elapsed = time.monotonic() - start
+    results_block: dict[str, Any] = data.get("search", {}).get("results", {})
+    raw_results: list[dict[str, Any] | None] = results_block.get("results") or []
     # Non-FileMatch results come back as empty objects; drop them
-    return [r for r in raw_results if r and r.get("file")]
+    matches = [result for result in raw_results if result and result.get("file")]
+    raw_match_count = results_block.get("matchCount")
+    match_count: int | None = (
+        raw_match_count if isinstance(raw_match_count, int) else None
+    )
+    limit_hit = bool(results_block.get("limitHit"))
+    alert: dict[str, Any] = results_block.get("alert") or {}
+    alert_title_raw = alert.get("title")
+    alert_description_raw = alert.get("description")
+    alert_title: str | None = (
+        alert_title_raw if isinstance(alert_title_raw, str) else None
+    )
+    alert_description: str | None = (
+        alert_description_raw if isinstance(alert_description_raw, str) else None
+    )
+    alert_parts = [part for part in (alert_title, alert_description) if part]
+    alert_suffix = f", alert={'; '.join(alert_parts)!r}" if alert_parts else ""
+    match_count_value = "?" if match_count is None else str(match_count)
+    logger.info(
+        "Skipped-file reason search for %s@%s: matchCount=%s, fileMatches=%d, "
+        "limitHit=%s%s [query took %.3fs]",
+        name,
+        rev,
+        match_count_value,
+        len(matches),
+        limit_hit,
+        alert_suffix,
+        elapsed,
+    )
+    return SkippedFileReasonQueryResult(
+        matches=matches,
+        match_count=match_count,
+        limit_hit=limit_hit,
+        alert_title=alert_title,
+        alert_description=alert_description,
+    )
 
 
 def write_skipped_files_reason(
@@ -1825,7 +2144,12 @@ def write_skipped_files_reason(
     Path(f"{input_prefix}-skipped-files.csv").unlink(missing_ok=True)
     Path(f"{input_prefix}-skipped-stats.csv").unlink(missing_ok=True)
 
-    rev = verify_repo_rev(endpoint, token, repo_rev, max_retries=max_retries)
+    rev, skipped_indexed_query = verify_repo_rev(
+        endpoint,
+        token,
+        repo_rev,
+        max_retries=max_retries,
+    )
     name = parse_repo_name(repo_rev)
     name_sanitized = sanitize_for_filename(name)
     rev_sanitized = sanitize_for_filename(rev)
@@ -1872,26 +2196,23 @@ def write_skipped_files_reason(
         ("count", lambda r: r[1]),
     ]
 
-    matches = fetch_skipped_file_matches(
+    query_result = fetch_skipped_file_reason_query(
         endpoint,
         token,
         name,
         rev,
+        skipped_indexed_query,
         max_retries=max_retries,
     )
+    matches = query_result.matches
 
     reason_counts: collections.Counter[str] = collections.Counter()
     rows: list[list[Any]] = []
     for match in matches:
         rows.append([extract(match) for _, extract in file_columns])
-        chunks: list[dict[str, Any]] = match.get("chunkMatches") or []
-        for chunk in chunks:
-            reason_match = re.search(
-                r"NOT-INDEXED:\s*(.+)",
-                str(chunk.get("content") or ""),
-            )
-            if reason_match:
-                reason_counts[reason_match.group(1).strip()] += 1
+        reason = skipped_file_reason(match)
+        if reason:
+            reason_counts[reason] += 1
 
     # Sort by chunkMatches.content so files with the same NOT-INDEXED reason
     # are grouped together; ties broken by byteSize, extension, then file_url
@@ -1954,6 +2275,111 @@ class LazyCSVWriter:
             self._file.close()
 
 
+@dataclass(frozen=True)
+class RepositoryPage:
+    """One repository listing page plus the page size Sourcegraph accepted"""
+
+    connection: dict[str, Any]
+    request_page_size: int
+
+
+@dataclass(frozen=True)
+class SkippedFileReasonQueryResult:
+    """Search response metadata and FileMatch results for one skipped-ref query"""
+
+    matches: list[dict[str, Any]]
+    match_count: int | None
+    limit_hit: bool
+    alert_title: str | None
+    alert_description: str | None
+
+
+@dataclass(frozen=True)
+class SkippedFileReasonSearchResult:
+    """Skipped-file search outcome for one indexed repo ref"""
+
+    repository_name: str
+    ref_name: str
+    skipped_count: int
+    matches: list[dict[str, Any]]
+    match_count: int | None
+    limit_hit: bool
+    alert_title: str | None
+    alert_description: str | None
+    error: str | None
+
+
+def repository_page_request_size(
+    current_page_size: int,
+    max_repos: int | None,
+    total_fetched: int,
+) -> int | None:
+    """Return the next listing request size, or None when enough repos are fetched"""
+    if max_repos is None:
+        return current_page_size
+    remaining = max_repos - total_fetched
+    if remaining <= 0:
+        return None
+    return min(current_page_size, remaining)
+
+
+def fetch_repository_page(
+    endpoint: str,
+    token: str,
+    cursor: str | None,
+    request_page_size: int,
+    *,
+    is_site_admin: bool,
+    include_index_failure_fields: bool,
+    max_retries: int,
+) -> RepositoryPage:
+    """Fetch one repository listing page, reducing page size on field-count errors"""
+    while True:
+        start = time.monotonic()
+        try:
+            data = graphql_request(
+                endpoint,
+                token,
+                build_repository_listing_query(include_index_failure_fields),
+                {
+                    "first": request_page_size,
+                    "after": cursor,
+                    "includeExternalServices": is_site_admin,
+                },
+                max_retries=max_retries,
+                request_description=(
+                    f"Repository listing page (first={request_page_size})"
+                ),
+            )
+            elapsed = time.monotonic() - start
+            cursor_label = "start" if cursor is None else "cursor"
+            logger.info(
+                "Repository listing page query finished: first=%d, after=%s "
+                "[query took %.3fs]",
+                request_page_size,
+                cursor_label,
+                elapsed,
+            )
+            return RepositoryPage(data["repositories"], request_page_size)
+        except HTTPRequestError as error:
+            violation = parse_field_count_violation(error)
+            if violation is None or request_page_size <= 1:
+                raise
+            next_page_size = retry_page_size_after_field_count_violation(
+                request_page_size,
+                violation,
+            )
+            logger.warning(
+                "Sourcegraph rejected listing page size %d: GraphQL "
+                "field count %d exceeds limit %d; retrying with page size %d",
+                request_page_size,
+                violation.actual,
+                violation.limit,
+                next_page_size,
+            )
+            request_page_size = next_page_size
+
+
 def fetch_repos(
     endpoint: str,
     token: str,
@@ -1962,6 +2388,7 @@ def fetch_repos(
     page_size: int = PAGE_SIZE,
     scope_repo: str | None = None,
     is_site_admin: bool,
+    include_index_failure_fields: bool,
     max_retries: int = DEFAULT_MAX_RETRIES,
 ) -> Iterator[tuple[int, int, dict[str, Any]]]:
     """Yield (index, target, repo) tuples for a scoped repo or paged repo list"""
@@ -1971,13 +2398,13 @@ def fetch_repos(
             token,
             scope_repo,
             is_site_admin=is_site_admin,
+            include_index_failure_fields=include_index_failure_fields,
             max_retries=max_retries,
         )
         logger.info("Scope: single repository %s", scope_repo)
         yield 1, 1, repo
         logger.info("Fetched 1/1 repositories...")
         return
-    cursor: str | None = None
     total_fetched = 0
     first_page = True
     current_page_size = page_size
@@ -1986,67 +2413,69 @@ def fetch_repos(
         "reports a field-count limit)",
         current_page_size,
     )
-    while True:
-        request_page_size = current_page_size
-        if max_repos is not None:
-            remaining = max_repos - total_fetched
-            if remaining <= 0:
-                break
-            request_page_size = min(request_page_size, remaining)
+    request_page_size = repository_page_request_size(
+        current_page_size,
+        max_repos,
+        total_fetched,
+    )
+    if request_page_size is None:
+        return
+    page = fetch_repository_page(
+        endpoint,
+        token,
+        None,
+        request_page_size,
+        is_site_admin=is_site_admin,
+        include_index_failure_fields=include_index_failure_fields,
+        max_retries=max_retries,
+    )
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as page_executor:
         while True:
-            try:
-                data = graphql_request(
-                    endpoint,
-                    token,
-                    GRAPHQL_QUERY,
-                    {
-                        "first": request_page_size,
-                        "after": cursor,
-                        "includeExternalServices": is_site_admin,
-                    },
-                    max_retries=max_retries,
-                )
-                break
-            except HTTPRequestError as error:
-                violation = parse_field_count_violation(error)
-                if violation is None or request_page_size <= 1:
-                    raise
-                next_page_size = retry_page_size_after_field_count_violation(
-                    request_page_size,
-                    violation,
-                )
-                logger.warning(
-                    "Sourcegraph rejected listing page size %d: GraphQL "
-                    "field count %d exceeds limit %d; retrying with page size %d",
-                    request_page_size,
-                    violation.actual,
-                    violation.limit,
-                    next_page_size,
-                )
-                current_page_size = min(current_page_size, next_page_size)
-                request_page_size = next_page_size
-        connection = data["repositories"]
-        total_count = connection["totalCount"]
-        target = min(max_repos, total_count) if max_repos is not None else total_count
-        if first_page:
-            logger.info(
-                "Fetching %d of %d total repositories...",
-                target,
-                total_count,
+            current_page_size = min(current_page_size, page.request_page_size)
+            connection = page.connection
+            total_count = connection["totalCount"]
+            target = (
+                min(max_repos, total_count) if max_repos is not None else total_count
             )
-            first_page = False
+            if first_page:
+                logger.info(
+                    "Fetching %d of %d total repositories...",
+                    target,
+                    total_count,
+                )
+                first_page = False
 
-        for repo in connection["nodes"]:
-            total_fetched += 1
-            yield total_fetched, target, repo
+            nodes: list[dict[str, Any]] = connection["nodes"]
+            total_after_page = total_fetched + len(nodes)
+            page_info: dict[str, Any] = connection["pageInfo"]
+            next_page = None
+            if page_info["hasNextPage"]:
+                next_request_page_size = repository_page_request_size(
+                    current_page_size,
+                    max_repos,
+                    total_after_page,
+                )
+                if next_request_page_size is not None:
+                    next_page = page_executor.submit(
+                        fetch_repository_page,
+                        endpoint,
+                        token,
+                        page_info["endCursor"],
+                        next_request_page_size,
+                        is_site_admin=is_site_admin,
+                        include_index_failure_fields=include_index_failure_fields,
+                        max_retries=max_retries,
+                    )
 
-        logger.info("Fetched %d/%d repositories...", total_fetched, target)
+            for repo in nodes:
+                total_fetched += 1
+                yield total_fetched, target, repo
 
-        if not connection["pageInfo"]["hasNextPage"]:
-            break
-        if max_repos is not None and total_fetched >= max_repos:
-            break
-        cursor = connection["pageInfo"]["endCursor"]
+            logger.info("Fetched %d/%d repositories...", total_fetched, target)
+
+            if next_page is None:
+                break
+            page = next_page.result()
 
 
 def build_row(repo: dict[str, Any], endpoint: str) -> list[Any]:
@@ -2114,6 +2543,143 @@ def csv_columns_for(
     return cols
 
 
+def collect_skipped_file_reason_search_results(
+    endpoint: str,
+    token: str,
+    repo: dict[str, Any],
+    max_retries: int,
+) -> list[SkippedFileReasonSearchResult]:
+    """Run skipped-file searches for every skipped indexed ref in one repo"""
+    repo_name = str(repo.get("name") or "")
+    results: list[SkippedFileReasonSearchResult] = []
+    for (
+        display_ref_name,
+        skipped_count,
+        skipped_indexed_query,
+    ) in refs_with_skipped_file_queries(
+        repo,
+    ):
+        revision = skipped_file_query_revision(skipped_indexed_query, display_ref_name)
+        try:
+            query_result = fetch_skipped_file_reason_query(
+                endpoint,
+                token,
+                repo_name,
+                revision,
+                skipped_indexed_query,
+                max_retries=max_retries,
+            )
+        except (GraphQLError, HTTPRequestError, OSError) as error:
+            results.append(
+                SkippedFileReasonSearchResult(
+                    repository_name=repo_name,
+                    ref_name=revision,
+                    skipped_count=skipped_count,
+                    matches=[],
+                    match_count=None,
+                    limit_hit=False,
+                    alert_title=None,
+                    alert_description=None,
+                    error=str(error),
+                ),
+            )
+            continue
+        results.append(
+            SkippedFileReasonSearchResult(
+                repository_name=repo_name,
+                ref_name=revision,
+                skipped_count=skipped_count,
+                matches=query_result.matches,
+                match_count=query_result.match_count,
+                limit_hit=query_result.limit_hit,
+                alert_title=query_result.alert_title,
+                alert_description=query_result.alert_description,
+                error=None,
+            ),
+        )
+    return results
+
+
+def write_skipped_file_reason_rows(
+    writer: LazyCSVWriter,
+    endpoint: str,
+    search_results: list[SkippedFileReasonSearchResult],
+) -> None:
+    """Append skipped-file detail rows from per-ref search results"""
+    for search_result in search_results:
+        if search_result.error is not None:
+            logger.warning(
+                "Skipped-file reason search failed for %s@%s: %s",
+                search_result.repository_name,
+                search_result.ref_name,
+                search_result.error,
+            )
+            continue
+        alert_parts = [
+            part
+            for part in (search_result.alert_title, search_result.alert_description)
+            if part
+        ]
+        if search_result.limit_hit:
+            logger.warning(
+                "Skipped-file reason search hit a result limit for %s@%s: "
+                "matchCount=%s, fileMatches=%d, skippedIndexed.count=%d",
+                search_result.repository_name,
+                search_result.ref_name,
+                search_result.match_count,
+                len(search_result.matches),
+                search_result.skipped_count,
+            )
+        if alert_parts:
+            logger.warning(
+                "Skipped-file reason search returned alert for %s@%s: %s",
+                search_result.repository_name,
+                search_result.ref_name,
+                "; ".join(alert_parts),
+            )
+        match_count_mismatch = (
+            search_result.match_count is not None
+            and search_result.match_count != search_result.skipped_count
+        )
+        if (
+            len(search_result.matches) != search_result.skipped_count
+            or match_count_mismatch
+        ):
+            logger.warning(
+                "Skipped-file reason search returned %d file match(es) "
+                "(matchCount=%s, limitHit=%s) for %s@%s; "
+                "textSearchIndex.refs.skippedIndexed.count reported %d",
+                len(search_result.matches),
+                search_result.match_count,
+                search_result.limit_hit,
+                search_result.repository_name,
+                search_result.ref_name,
+                search_result.skipped_count,
+            )
+        for match in search_result.matches:
+            file_obj: dict[str, Any] = match.get("file") or {}
+            file_path = str(file_obj.get("path") or "")
+            byte_size = file_obj.get("byteSize")
+            file_extension = Path(file_path).suffix.lstrip(".")
+            writer.writerow(
+                [
+                    search_result.repository_name,
+                    search_result.ref_name,
+                    skipped_file_reason(match),
+                    file_extension,
+                    int(byte_size) if byte_size is not None else "",
+                    search_result.skipped_count,
+                    file_path,
+                    file_url(
+                        endpoint,
+                        search_result.repository_name,
+                        search_result.ref_name,
+                        file_path,
+                    ),
+                ],
+            )
+
+
 @dataclass(frozen=True)
 class RepoProcessingResult:
     """Repo row plus optional per-repo query results"""
@@ -2130,6 +2696,7 @@ class RepoProcessingResult:
     search_elapsed_seconds: float | None
     search_limit_hit: bool
     search_alert_title: str | None
+    skipped_file_reason_search_results: list[SkippedFileReasonSearchResult]
 
 
 def collect_repo_processing_result(
@@ -2142,6 +2709,7 @@ def collect_repo_processing_result(
     count_commits: bool,
     count_commits_rev: str,
     run_search_pattern: str | None,
+    skipped_file_reasons: bool,
     max_retries: int,
 ) -> RepoProcessingResult:
     """Build the row and run optional per-repo network queries"""
@@ -2154,6 +2722,7 @@ def collect_repo_processing_result(
     search_elapsed_seconds: float | None = None
     search_limit_hit = False
     search_alert_title: str | None = None
+    skipped_file_reason_search_results: list[SkippedFileReasonSearchResult] = []
     repo_name = str(repo.get("name") or "")
     if count_commits:
         (
@@ -2181,6 +2750,13 @@ def collect_repo_processing_result(
             run_search_pattern,
             max_retries=max_retries,
         )
+    if skipped_file_reasons and has_skipped_files(repo):
+        skipped_file_reason_search_results = collect_skipped_file_reason_search_results(
+            endpoint,
+            token,
+            repo,
+            max_retries,
+        )
     return RepoProcessingResult(
         index=index,
         target=target,
@@ -2194,6 +2770,7 @@ def collect_repo_processing_result(
         search_elapsed_seconds=search_elapsed_seconds,
         search_limit_hit=search_limit_hit,
         search_alert_title=search_alert_title,
+        skipped_file_reason_search_results=skipped_file_reason_search_results,
     )
 
 
@@ -2286,9 +2863,11 @@ def iter_repo_processing_results(
     page_size: int,
     scope_repo: str | None,
     is_site_admin: bool,
+    include_index_failure_fields: bool,
     count_commits: bool,
     count_commits_rev: str,
     run_search_pattern: str | None,
+    skipped_file_reasons: bool,
     concurrency: int,
     max_retries: int,
 ) -> Iterator[RepoProcessingResult]:
@@ -2300,9 +2879,12 @@ def iter_repo_processing_results(
         page_size=page_size,
         scope_repo=scope_repo,
         is_site_admin=is_site_admin,
+        include_index_failure_fields=include_index_failure_fields,
         max_retries=max_retries,
     )
-    use_threads = concurrency > 1 and (count_commits or run_search_pattern is not None)
+    use_threads = concurrency > 1 and (
+        count_commits or run_search_pattern is not None or skipped_file_reasons
+    )
     if not use_threads:
         for index, target, repo in repos:
             yield collect_repo_processing_result(
@@ -2314,6 +2896,7 @@ def iter_repo_processing_results(
                 count_commits=count_commits,
                 count_commits_rev=count_commits_rev,
                 run_search_pattern=run_search_pattern,
+                skipped_file_reasons=skipped_file_reasons,
                 max_retries=max_retries,
             )
         return
@@ -2339,6 +2922,7 @@ def iter_repo_processing_results(
             count_commits=count_commits,
             count_commits_rev=count_commits_rev,
             run_search_pattern=run_search_pattern,
+            skipped_file_reasons=skipped_file_reasons,
             max_retries=max_retries,
         )
         pending_results[future] = index
@@ -2361,8 +2945,8 @@ def iter_repo_processing_results(
             for future in done:
                 pending_results.pop(future)
                 result = future.result()
-                fill_pending(executor)
                 yield result
+                fill_pending(executor)
 
 
 def write_csv(
@@ -2370,6 +2954,7 @@ def write_csv(
     cloning_writer: LazyCSVWriter,
     indexing_writer: LazyCSVWriter,
     skipped_writer: LazyCSVWriter | None,
+    skipped_file_reason_writer: LazyCSVWriter | None,
     endpoint: str,
     token: str,
     max_repos: int | None = None,
@@ -2385,9 +2970,11 @@ def write_csv(
     max_retries: int = DEFAULT_MAX_RETRIES,
     stats: StatsCollector | None = None,
     is_site_admin: bool,
+    include_index_failure_fields: bool,
 ) -> tuple[int, int, int]:
     """Stream repos to CSVs and optionally trigger reclone/reindex mutations"""
     run_search_enabled = run_search_pattern is not None
+    skipped_file_reasons_enabled = skipped_file_reason_writer is not None
     writer = csv.writer(out)
     writer.writerow(
         csv_columns_for(
@@ -2407,9 +2994,11 @@ def write_csv(
         page_size=page_size,
         scope_repo=scope_repo,
         is_site_admin=is_site_admin,
+        include_index_failure_fields=include_index_failure_fields,
         count_commits=count_commits,
         count_commits_rev=count_commits_rev,
         run_search_pattern=run_search_pattern,
+        skipped_file_reasons=skipped_file_reasons_enabled,
         concurrency=concurrency,
         max_retries=max_retries,
     ):
@@ -2477,6 +3066,12 @@ def write_csv(
                     count_commits=count_commits,
                     run_search=run_search_enabled,
                 ),
+            )
+        if skipped_file_reason_writer is not None:
+            write_skipped_file_reason_rows(
+                skipped_file_reason_writer,
+                endpoint,
+                result.skipped_file_reason_search_results,
             )
     return (total, reclone_total, reindex_total)
 
@@ -2638,15 +3233,44 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Fetch at most <int> repos (>=1)",
     )
     parser.add_argument(
+        "--statistics",
+        action="store_true",
+        help="Write statistics CSV files",
+    )
+    parser.add_argument(
+        "--count-commits",
+        nargs="?",
+        const=True,
+        default=False,
+        metavar="REPO[@REV]",
+        help=(
+            "Append per-repo commit counts and cleanup metadata\n"
+            "Optional REPO[@REV] scopes to one repo\n"
+            "@REV affects only the exact ancestors count"
+        ),
+    )
+    parser.add_argument(
         "--skipped-files",
         action="store_true",
         help="Write a CSV file for repos where Zoekt skipped files",
     )
     parser.add_argument(
         "--skipped-files-reason",
+        nargs="?",
+        const=True,
         metavar="REPO[@REV]",
         default=None,
-        help=("Write skipped-file details and reason counts for one repo"),
+        help=(
+            "Write skipped-file details and reason counts for one repo\n"
+            "Without REPO, write one aggregate skipped-file details CSV for "
+            "all repos with skipped files"
+        ),
+    )
+    parser.add_argument(
+        "--run-search",
+        metavar="PATTERN",
+        default=None,
+        help=("Run PATTERN once per repo and append result columns"),
     )
     parser.add_argument(
         "--reclone",
@@ -2669,29 +3293,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             "With REPO: reindex only that repository\n"
             "Without REPO: reindex all repos with indexing errors"
         ),
-    )
-    parser.add_argument(
-        "--count-commits",
-        nargs="?",
-        const=True,
-        default=False,
-        metavar="REPO[@REV]",
-        help=(
-            "Append per-repo commit counts and cleanup metadata\n"
-            "Optional REPO[@REV] scopes to one repo\n"
-            "@REV affects only the exact ancestors count"
-        ),
-    )
-    parser.add_argument(
-        "--run-search",
-        metavar="PATTERN",
-        default=None,
-        help=("Run PATTERN once per repo and append result columns"),
-    )
-    parser.add_argument(
-        "--statistics",
-        action="store_true",
-        help="Write statistics CSV files",
     )
     parser.add_argument(
         "--page-size",
@@ -2846,7 +3447,7 @@ def run(args: argparse.Namespace, endpoint: str, token: str) -> None:
         )
 
     # This targeted report does not need the full repo listing
-    if args.skipped_files_reason:
+    if isinstance(args.skipped_files_reason, str):
         # Other flags only affect full-listing mode
         ignored = [
             flag
@@ -2856,7 +3457,6 @@ def run(args: argparse.Namespace, endpoint: str, token: str) -> None:
                 ("--limit", args.limit is not None),
                 ("--page-size", args.page_size != PAGE_SIZE),
                 ("--concurrency", args.concurrency != DEFAULT_CONCURRENCY),
-                ("--max-retries", args.max_retries != DEFAULT_MAX_RETRIES),
                 ("--skipped-files", args.skipped_files),
                 ("--count-commits", args.count_commits),
                 ("--run-search", args.run_search is not None),
@@ -2878,6 +3478,12 @@ def run(args: argparse.Namespace, endpoint: str, token: str) -> None:
         )
         return
 
+    include_index_failure_fields = supports_text_search_index_failure_fields(
+        endpoint,
+        token,
+        max_retries=args.max_retries,
+    )
+
     # Prefix outputs with endpoint, plus scoped repo/rev when applicable
     endpoint_sanitized = sanitize_endpoint_for_filename(endpoint)
     if scope_repo is not None:
@@ -2894,11 +3500,18 @@ def run(args: argparse.Namespace, endpoint: str, token: str) -> None:
     skipped_files_path = (
         Path(f"{prefix}-{DEFAULT_SKIPPED_FILES_FILE}") if args.skipped_files else None
     )
+    skipped_file_reasons_path = (
+        Path(f"{prefix}-{DEFAULT_SKIPPED_FILE_REASONS_FILE}")
+        if args.skipped_files_reason is True
+        else None
+    )
     # Remove stale optional outputs; LazyCSVWriter recreates only non-empty ones
     cloning_errors_path.unlink(missing_ok=True)
     indexing_errors_path.unlink(missing_ok=True)
     if skipped_files_path is not None:
         skipped_files_path.unlink(missing_ok=True)
+    if skipped_file_reasons_path is not None:
+        skipped_file_reasons_path.unlink(missing_ok=True)
     # Clear stale stats outputs even when --statistics is not enabled this run
     for suffix, *_ in STATS_FILES:
         Path(f"{prefix}-{DEFAULT_STATS_FILE_PREFIX}-{suffix}.csv").unlink(
@@ -2937,21 +3550,36 @@ def run(args: argparse.Namespace, endpoint: str, token: str) -> None:
         if skipped_files_path is not None
         else None
     )
-    # Keep the optional skipped writer in the same context-manager block
+    skipped_file_reason_writer = (
+        LazyCSVWriter(
+            skipped_file_reasons_path,
+            [name for name, _, _, _ in SKIPPED_FILE_REASON_COLUMNS],
+        )
+        if skipped_file_reasons_path is not None
+        else None
+    )
+    # Keep optional writers in the same context-manager block
     skipped_cm = (
         skipped_writer if skipped_writer is not None else contextlib.nullcontext()
+    )
+    skipped_file_reason_cm = (
+        skipped_file_reason_writer
+        if skipped_file_reason_writer is not None
+        else contextlib.nullcontext()
     )
     with (
         output_path.open("w", newline="") as out,
         cloning_writer,
         indexing_writer,
         skipped_cm,
+        skipped_file_reason_cm,
     ):
         total, reclone_total, reindex_total = write_csv(
             out,
             cloning_writer,
             indexing_writer,
             skipped_writer,
+            skipped_file_reason_writer,
             endpoint,
             token,
             args.limit,
@@ -2966,6 +3594,7 @@ def run(args: argparse.Namespace, endpoint: str, token: str) -> None:
             max_retries=args.max_retries,
             stats=stats,
             is_site_admin=is_site_admin,
+            include_index_failure_fields=include_index_failure_fields,
         )
 
     if stats is not None:
@@ -2991,6 +3620,12 @@ def run(args: argparse.Namespace, endpoint: str, token: str) -> None:
             "Wrote %d repos with skipped files to %s",
             skipped_writer.count,
             skipped_writer.path.name,
+        )
+    if skipped_file_reason_writer is not None and skipped_file_reason_writer.count:
+        logger.info(
+            "Wrote %d skipped-file reason row(s) to %s",
+            skipped_file_reason_writer.count,
+            skipped_file_reason_writer.path.name,
         )
     if args.reclone:
         logger.info("Triggered recloneRepository for %d repo(s)", reclone_total)
@@ -3035,7 +3670,12 @@ def configure_logging(log_path: Path) -> None:
     stderr_handler.setFormatter(logging.Formatter("%(message)s"))
     root.addHandler(stderr_handler)
 
-    file_handler = logging.FileHandler(log_path, mode="w", encoding="utf-8")
+    file_handler = logging.FileHandler(
+        log_path,
+        mode="w",
+        encoding="utf-8",
+        delay=True,
+    )
     file_handler.setFormatter(
         logging.Formatter("%(asctime)s %(levelname)s %(message)s"),
     )

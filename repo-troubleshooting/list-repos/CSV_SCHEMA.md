@@ -21,16 +21,17 @@ so the script can run against multiple instances without overwriting files
 | `<prefix>-repos-with-cloning-errors.csv` | at least one repo has a cloning error | main columns + cloning-error extras |
 | `<prefix>-repos-with-indexing-errors.csv` | at least one repo is cloned but is missing a search index | main columns |
 | `<prefix>-repos-with-skipped-files.csv` | `--skipped-files` is set and the last index excluded some files | main columns + skipped-files extras |
+| `<prefix>-skipped-file-reasons.csv` | `--skipped-files-reason` is set without `REPO[@REV]` | skipped-file reason columns |
 | `<prefix>-stats-*.csv` | `--statistics` is set | `bucket,count` (see Statistics section) |
 
 The optional `--count-commits` and `--run-search` flags append extra
-columns to *every* CSV listed above (except the `--statistics` files,
-which are summaries rather than per-repo rows), in this order: main
+columns to the repo-listing CSVs above, excluding the `--statistics`
+files and the skipped-file reason detail CSV, in this order: main
 columns → per-CSV extras → commit-count columns → run-search columns
 
 ## Main columns
 
-These are written to every CSV file
+These are written to every repo-listing CSV file
 
 | Column | Type | Requires admin | Description |
 | --- | --- | --- | --- |
@@ -52,6 +53,8 @@ These are written to every CSV file
 | `mirrorInfo.updateSchedule.intervalSeconds` | integer | | Interval, in seconds, between scheduled mirror updates. Default max is 28800 seconds (8 hours), but is shortened for busy / popular repos |
 | `mirrorInfo.shard` | string | true | Pod name of the gitserver shard which holds this repo's clone |
 | `textSearchIndex.status` | enum (indexed, not_indexed) | | Search-index state, derived locally: `indexed` if Zoekt has built an index for this repo, `not_indexed` otherwise |
+| `textSearchIndex.lastIndexStatus` | enum (SUCCESS, FAILURE) | | Most recent persisted text search indexing attempt result. Blank when the Sourcegraph instance does not expose this field or no attempt was reported |
+| `textSearchIndex.lastIndexFailureMessage` | string | | Failure message from the most recent persisted text search indexing attempt. Blank when the Sourcegraph instance does not expose this field or no failure was reported |
 | `textSearchIndex.status.updatedAt` | timestamp | | Timestamp the repo was last indexed for fast search. It should be shortly after mirrorInfo.lastChanged, as indexing jobs are scheduled after new commits are fetched |
 | `textSearchIndex.status.contentFilesCount` | integer | | Number of files included in the index. Note that some files are excluded from indexing, ex. binary files |
 | `textSearchIndex.status.contentByteSize(MB)` | float | | Size, in megabytes, of the source content that was indexed. Note that some files are excluded from indexing, ex. binary files |
@@ -82,6 +85,22 @@ Appended to `<prefix>-repos-with-skipped-files.csv`
 | `skippedIndexed.totalCount` | integer | | Count of files Zoekt excluded while indexing this repo |
 | `skippedIndexed.refsWithSkips` | string (semicolon-joined) | | `<refName>=<count>` entries for every indexed ref which has at least one excluded file |
 | `skippedIndexed.headQuery` | string | | Sourcegraph search query that lists every excluded file on HEAD. This search is run when the script is run with the --skipped-files-reason arg |
+
+## Skipped-file reason columns
+
+Written to `<prefix>-skipped-file-reasons.csv` when
+`--skipped-files-reason` is used without `REPO[@REV]`
+
+| Column | Type | Requires admin | Description |
+| --- | --- | --- | --- |
+| `repository.name` | string | | Sourcegraph repository name containing the skipped file |
+| `rev` | string | | Indexed revision parsed from Sourcegraph's skippedIndexed.query |
+| `reason` | string | | NOT-INDEXED reason parsed from the indexed placeholder content |
+| `file.extension` | string | | File extension derived from file.path |
+| `file.byteSize` | integer | | Sourcegraph-reported file byte size |
+| `skippedIndexed.count` | integer | | Count Sourcegraph reported for this repo/ref before running the details search |
+| `file.path` | string | | Path of the skipped file within the repository |
+| `file_url` | string | | Sourcegraph blob URL for the skipped file at the indexed ref |
 
 ## `--count-commits` columns
 
@@ -127,4 +146,3 @@ main CSV, so enabling `--statistics` adds no extra GraphQL requests
 | `stats-index-byte-size.csv` | 0-1 MB, 1-10 MB, 10-100 MB, >100 MB | Distribution of indexed repos by `textSearchIndex.status.indexByteSize` (MB) |
 | `stats-content-vs-mirror-pct.csv` | 0-10%, 10-25%, 25-50%, 50-75%, 75-100%, 100-150%, >150% | Distribution of `contentByteSize / mirrorInfo.byteSize` (as a percentage) |
 | `stats-index-vs-content-pct.csv` | 0-10%, 10-25%, 25-50%, 50-75%, 75-100%, 100-150%, >150% | Distribution of `indexByteSize / contentByteSize` (as a percentage) |
-
