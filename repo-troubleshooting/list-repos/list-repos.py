@@ -60,6 +60,7 @@ RETRYABLE_GRAPHQL_ERROR_TERMS = (
     "dial tcp",
     "eof",
     "gateway timeout",
+    "index:only failed since indexed search is not available yet",
     "no such host",
     "temporarily unavailable",
     "timeout",
@@ -605,7 +606,7 @@ def fetch_commit_count(
         elapsed = time.monotonic() - start
         logger.warning("commit-count query failed for %s: %s", repo_name, exc)
         return None, None, elapsed, empty_extras
-    except OSError as exc:
+    except (OSError, http.client.HTTPException, json.JSONDecodeError) as exc:
         elapsed = time.monotonic() - start
         logger.warning(
             "commit-count network error for %s: %s",
@@ -656,7 +657,7 @@ def fetch_run_search(
         elapsed = time.monotonic() - start
         logger.warning("run-search query failed for %s: %s", repo_name, exc)
         return None, elapsed, False, None
-    except OSError as exc:
+    except (OSError, http.client.HTTPException, json.JSONDecodeError) as exc:
         elapsed = time.monotonic() - start
         logger.warning("run-search network error for %s: %s", repo_name, exc)
         return None, elapsed, False, None
@@ -1710,7 +1711,7 @@ def graphql_request(
                 max_retries,
             )
             continue
-        except OSError as error:
+        except (OSError, http.client.HTTPException, json.JSONDecodeError) as error:
             if retry_count >= max_retries:
                 raise
             sleep_before_retry(
@@ -1737,7 +1738,8 @@ def graphql_request(
         # log the errors and keep going; only abort if no data was returned.
         if response.get("data"):
             logger.warning(
-                "GraphQL returned %d partial error(s): %s",
+                "%sGraphQL returned %d partial error(s): %s",
+                retry_prefix,
                 len(errors) if isinstance(errors, list) else 1,
                 json.dumps(errors, indent=2),
             )
@@ -2088,7 +2090,14 @@ def fetch_skipped_file_reason_query(
         request_description=f"Skipped files for {name}@{rev}",
     )
     elapsed = time.monotonic() - start
-    results_block: dict[str, Any] = data.get("search", {}).get("results", {})
+    search_block = data.get("search")
+    if not isinstance(search_block, dict):
+        msg = f"skipped-file reason search returned no search data for {name}@{rev}"
+        raise GraphQLError(msg)
+    results_block = search_block.get("results")
+    if not isinstance(results_block, dict):
+        msg = f"skipped-file reason search returned no results data for {name}@{rev}"
+        raise GraphQLError(msg)
     raw_results: list[dict[str, Any] | None] = results_block.get("results") or []
     # Non-FileMatch results come back as empty objects; drop them
     matches = [result for result in raw_results if result and result.get("file")]
@@ -2569,7 +2578,13 @@ def collect_skipped_file_reason_search_results(
                 skipped_indexed_query,
                 max_retries=max_retries,
             )
-        except (GraphQLError, HTTPRequestError, OSError) as error:
+        except (
+            GraphQLError,
+            HTTPRequestError,
+            OSError,
+            http.client.HTTPException,
+            json.JSONDecodeError,
+        ) as error:
             results.append(
                 SkippedFileReasonSearchResult(
                     repository_name=repo_name,
@@ -3721,7 +3736,7 @@ def main() -> None:
     except HTTPRequestError as exc:
         log_http_error(exc)
         sys.exit(1)
-    except OSError:
+    except (OSError, http.client.HTTPException, json.JSONDecodeError):
         logger.exception(
             "Could not connect to the server. Check your network and SRC_ENDPOINT",
         )
