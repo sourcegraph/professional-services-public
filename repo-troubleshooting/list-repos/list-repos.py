@@ -86,7 +86,7 @@ DEFAULT_OUTPUT_FILE = "repos.csv"
 DEFAULT_SKIPPED_FILES_FILE = "repos-with-skipped-files.csv"
 DEFAULT_SKIPPED_FILE_REASONS_FILE = "skipped-file-reasons.csv"
 DEFAULT_STATS_FILE_PREFIX = "stats"
-CSV_RECORD_LINE_TERMINATOR = "\n"
+CSV_RECORD_LINE_TERMINATOR = "\r\n"
 DEFAULT_MAX_RETRIES = 5
 GRAPHQL_FIELD_COUNT_RETRY_HEADROOM_PERCENT = 95
 PAGE_SIZE = 500
@@ -129,7 +129,7 @@ def normalize_csv_row(row: list[Any]) -> list[Any]:
 
 
 def make_csv_writer(out: TextIO) -> Any:
-    """Return the repo's CSV writer with Unix record endings"""
+    """Return the repo's CSV writer with standard CSV record endings"""
     return csv.writer(out, lineterminator=CSV_RECORD_LINE_TERMINATOR)
 
 
