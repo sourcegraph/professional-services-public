@@ -4189,12 +4189,15 @@ def log_run_issue_summary() -> None:
 
 
 def main() -> None:
-    """Entry point: configure logging, load env, parse args, run, handle errors"""
+    """Entry point: parse args, configure logging, load env, run, handle errors"""
+    args = parse_args(sys.argv[1:])
+
     configure_logging(timestamped_log_path())
-    # Include pre-run failures in the timestamped log file
+    # Include credential, network, and run failures in the timestamped log file.
+    # ArgumentParser handles --help and parse errors before logging is configured
+    # so informational CLI exits do not create log files.
     sys.excepthook = _log_uncaught_exception
 
-    args = parse_args(sys.argv[1:])
     # Schema generation is offline and credential-free
     if args.write_csv_schema:
         try:
