@@ -19,6 +19,7 @@
 
 ## Other
 
+- This script needs to run the same on macOS, Linux, and Windows
 - Whenever changing / adding / removing / moving any columns in any of the CSV files,
   ensure the columns are updated in the `CSV_SCHEMA.md` printer function to match.
   `CSV_SCHEMA.md` is generated from the in-script column tuples by running
