@@ -86,6 +86,7 @@ DEFAULT_OUTPUT_FILE = "repos.csv"
 DEFAULT_SKIPPED_FILES_FILE = "repos-with-skipped-files.csv"
 DEFAULT_SKIPPED_FILE_REASONS_FILE = "skipped-file-reasons.csv"
 DEFAULT_STATS_FILE_PREFIX = "stats"
+CSV_RECORD_LINE_TERMINATOR = "\n"
 DEFAULT_MAX_RETRIES = 5
 GRAPHQL_FIELD_COUNT_RETRY_HEADROOM_PERCENT = 95
 PAGE_SIZE = 500
@@ -113,6 +114,28 @@ RETRYABLE_GRAPHQL_ERROR_TERMS = (
     "transport:",
 )
 TOO_MANY_TRIGRAMS_REASON = "contains too many trigrams"
+
+
+def normalize_csv_value(value: Any) -> Any:
+    """Keep CSV records one physical line while preserving text separators"""
+    if not isinstance(value, str):
+        return value
+    return value.replace("\r\n", "\\n").replace("\r", "\\n").replace("\n", "\\n")
+
+
+def normalize_csv_row(row: list[Any]) -> list[Any]:
+    """Return a row safe for line-oriented CSV consumers"""
+    return [normalize_csv_value(value) for value in row]
+
+
+def make_csv_writer(out: TextIO) -> Any:
+    """Return the repo's CSV writer with Unix record endings"""
+    return csv.writer(out, lineterminator=CSV_RECORD_LINE_TERMINATOR)
+
+
+def write_csv_row(writer: Any, row: list[Any]) -> None:
+    """Write one normalized CSV row"""
+    writer.writerow(normalize_csv_row(row))
 
 
 # --- GraphQL queries ----------------------------------------------------------
@@ -1425,12 +1448,12 @@ def write_stats(prefix: str, stats: StatsCollector) -> list[Path]:
         path = Path(f"{prefix}-{DEFAULT_STATS_FILE_PREFIX}-{suffix}.csv")
         counter: collections.Counter[str] = getattr(stats, attr)
         with path.open("w", newline="") as out:
-            writer = csv.writer(out)
-            writer.writerow(["bucket", "count"])
+            writer = make_csv_writer(out)
+            write_csv_row(writer, ["bucket", "count"])
             for label, _lo, _hi in buckets:
-                writer.writerow([label, counter.get(label, 0)])
+                write_csv_row(writer, [label, counter.get(label, 0)])
             for metric, value in summary_builder(stats):
-                writer.writerow([metric, value])
+                write_csv_row(writer, [metric, value])
         written.append(path)
     return written
 
@@ -2618,16 +2641,17 @@ def write_skipped_files_reason(
     )
 
     with files_path.open("w", newline="") as out:
-        writer = csv.writer(out)
-        writer.writerow([name for name, _ in file_columns])
-        writer.writerows(rows)
+        writer = make_csv_writer(out)
+        write_csv_row(writer, [name for name, _ in file_columns])
+        for row in rows:
+            write_csv_row(writer, row)
     files_written = len(rows)
 
     with stats_path.open("w", newline="") as out:
-        writer = csv.writer(out)
-        writer.writerow([name for name, _ in stats_columns])
+        writer = make_csv_writer(out)
+        write_csv_row(writer, [name for name, _ in stats_columns])
         for record in reason_counts.most_common():
-            writer.writerow([extract(record) for _, extract in stats_columns])
+            write_csv_row(writer, [extract(record) for _, extract in stats_columns])
 
     logger.info(
         "Wrote %d skipped-file match(es) to %s",
@@ -2657,9 +2681,9 @@ class LazyCSVWriter:
     def writerow(self, row: list[Any]) -> None:
         if self._writer is None:
             self._file = self.path.open("w", newline="")
-            self._writer = csv.writer(self._file)
-            self._writer.writerow(self.columns)
-        self._writer.writerow(row)
+            self._writer = make_csv_writer(self._file)
+            write_csv_row(self._writer, self.columns)
+        write_csv_row(self._writer, row)
         self.count += 1
 
     def __enter__(self) -> LazyCSVWriter:
@@ -3411,8 +3435,9 @@ def write_csv(
     """Stream repos to CSVs and optionally trigger reclone/reindex mutations"""
     run_search_enabled = run_search_pattern is not None
     skipped_file_reasons_enabled = skipped_file_reason_writer is not None
-    writer = csv.writer(out)
-    writer.writerow(
+    writer = make_csv_writer(out)
+    write_csv_row(
+        writer,
         csv_columns_for(
             CSV_COLUMNS,
             count_commits=count_commits,
@@ -3446,7 +3471,8 @@ def write_csv(
             count_commits=count_commits,
             run_search_pattern=run_search_pattern,
         )
-        writer.writerow(
+        write_csv_row(
+            writer,
             append_processing_result_columns(
                 row,
                 result,
