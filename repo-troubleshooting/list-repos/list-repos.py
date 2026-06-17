@@ -8,6 +8,7 @@ import collections
 import concurrent.futures
 import contextlib
 import csv
+import heapq
 import http.client
 import json
 import logging
@@ -15,6 +16,7 @@ import os
 import re
 import shlex
 import sys
+import tempfile
 import textwrap
 import threading
 import time
@@ -88,6 +90,7 @@ DEFAULT_SKIPPED_FILES_FILE = "repos-with-skipped-files.csv"
 DEFAULT_SKIPPED_FILE_REASONS_FILE = "skipped-files-reason-details.csv"
 DEFAULT_SKIPPED_FILE_REASON_STATS_FILE = "skipped-files-reason-stats.csv"
 DEFAULT_STATS_FILE_PREFIX = "stats"
+CSV_SORT_CHUNK_ROWS = 50_000
 CSV_RECORD_LINE_TERMINATOR = "\r\n"
 DEFAULT_MAX_RETRIES = 5
 GRAPHQL_FIELD_COUNT_RETRY_HEADROOM_PERCENT = 95
@@ -116,6 +119,16 @@ RETRYABLE_GRAPHQL_ERROR_TERMS = (
     "transport:",
 )
 TOO_MANY_TRIGRAMS_REASON = "contains too many trigrams"
+SORTED_CSV_OUTPUTS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (DEFAULT_OUTPUT_FILE, ("url",)),
+    (DEFAULT_CLONING_ERRORS_FILE, ("url",)),
+    (DEFAULT_INDEXING_ERRORS_FILE, ("url",)),
+    (DEFAULT_SKIPPED_FILES_FILE, ("url",)),
+    (
+        DEFAULT_SKIPPED_FILE_REASONS_FILE,
+        ("repository.name", "rev", "reason", "file.extension", "file.path"),
+    ),
+)
 
 
 def normalize_csv_value(value: Any) -> Any:
@@ -1487,6 +1500,22 @@ def table_row(*cells: str) -> str:
     return "|" + "|".join(f" {c} " if c else " " for c in cells) + "|"
 
 
+def format_output_sort_list() -> str:
+    """Render the configured output CSV sort keys as a Markdown table"""
+    rows = [
+        table_row("File", "Sort columns"),
+        table_row("---", "---"),
+    ]
+    for file_name, sort_columns in SORTED_CSV_OUTPUTS:
+        rows.append(
+            table_row(
+                f"`{file_name}`",
+                ", ".join(f"`{column}`" for column in sort_columns),
+            ),
+        )
+    return "\n".join(rows)
+
+
 def name_desc(
     columns: list[tuple[str, Callable[[dict[str, Any]], Any], str, bool, str]],
 ) -> list[tuple[str, str, bool, str]]:
@@ -1526,6 +1555,7 @@ def write_csv_schema(path: Path) -> None:
     commit_count_list = format_columns_list(COMMIT_COUNT_COLUMNS)
     run_search_list = format_columns_list(RUN_SEARCH_COLUMNS)
     stats_files_list = format_stats_files_list()
+    output_sort_list = format_output_sort_list()
 
     content = f"""# `list-repos.py` CSV column reference
 
@@ -1554,6 +1584,12 @@ rows for it
 | `{DEFAULT_SKIPPED_FILE_REASONS_FILE}` | `--skipped-files-reason` is set, and at least one skipped-file detail row is found | skipped-file reason columns, plus skipped-file metrics columns when `--skipped-file-metrics` is set |
 | `{DEFAULT_SKIPPED_FILE_REASON_STATS_FILE}` | `--skipped-files-reason REPO[@REV]` is set, and at least one NOT-INDEXED reason category is found | `reason,count` |
 | `{DEFAULT_STATS_FILE_PREFIX}-*.csv` | `--stats` is set and repo rows were processed | `bucket,count` (see Stats section) |
+
+The row-bearing output CSVs below are sorted before the run exits, using a
+stdlib Python external sort that writes bounded temporary chunks instead of
+holding every output row in memory
+
+{output_sort_list}
 
 The optional `--count-commits` and `--run-search` flags append extra
 columns to the repo-listing CSVs above, excluding the `--stats`
@@ -2668,6 +2704,150 @@ class LazyCSVWriter:
             self._file.close()
 
 
+def csv_sort_key(row: list[str], column_indexes: list[int]) -> tuple[str, ...]:
+    """Return the configured sort key for one CSV row"""
+    return tuple(
+        row[column_index] if column_index < len(row) else ""
+        for column_index in column_indexes
+    )
+
+
+def make_temporary_csv_path(directory: Path, prefix: str) -> Path:
+    """Reserve and close a temporary CSV path for normal text writing"""
+    file_descriptor, temporary_name = tempfile.mkstemp(
+        dir=directory,
+        prefix=prefix,
+        suffix=".csv",
+    )
+    os.close(file_descriptor)
+    return Path(temporary_name)
+
+
+def write_sorted_csv_chunk(
+    rows: list[list[str]],
+    column_indexes: list[int],
+    directory: Path,
+    source_name: str,
+) -> Path:
+    """Sort a bounded CSV row chunk and write it to a temporary file"""
+    rows.sort(key=lambda row: csv_sort_key(row, column_indexes))
+    temporary_path = make_temporary_csv_path(
+        directory,
+        f".{source_name}.sort-chunk-",
+    )
+    with temporary_path.open("w", newline="") as output_file:
+        writer = make_csv_writer(output_file)
+        for row in rows:
+            write_csv_row(writer, row)
+    return temporary_path
+
+
+def replace_with_merged_csv_chunks(
+    path: Path,
+    header: list[str],
+    chunk_paths: list[Path],
+    column_indexes: list[int],
+) -> None:
+    """Merge sorted temporary CSV chunks and atomically replace path"""
+    replacement_path = make_temporary_csv_path(
+        path.parent,
+        f".{path.name}.sorted-",
+    )
+    try:
+        with replacement_path.open("w", newline="") as output_file:
+            writer = make_csv_writer(output_file)
+            write_csv_row(writer, header)
+            with contextlib.ExitStack() as stack:
+                readers: list[Any] = []
+                for chunk_path in chunk_paths:
+                    chunk_file = stack.enter_context(chunk_path.open(newline=""))
+                    readers.append(csv.reader(chunk_file))
+                for row in heapq.merge(
+                    *readers,
+                    key=lambda row: csv_sort_key(row, column_indexes),
+                ):
+                    write_csv_row(writer, row)
+        replacement_path.replace(path)
+    except Exception:
+        replacement_path.unlink(missing_ok=True)
+        raise
+
+
+def sort_csv_output_file(
+    path: Path,
+    sort_columns: tuple[str, ...],
+    chunk_rows: int = CSV_SORT_CHUNK_ROWS,
+) -> None:
+    """Sort a CSV file by named columns using bounded memory"""
+    if not path.is_file():
+        return
+    temporary_chunk_paths: list[Path] = []
+    try:
+        with path.open(newline="") as input_file:
+            reader = csv.reader(input_file)
+            header = next(reader, None)
+            if header is None:
+                return
+            missing_columns = [
+                column for column in sort_columns if column not in header
+            ]
+            if missing_columns:
+                logger.error(
+                    "Cannot sort %s: missing column(s): %s",
+                    path.name,
+                    ", ".join(missing_columns),
+                )
+                return
+            column_indexes = [header.index(column) for column in sort_columns]
+            current_rows: list[list[str]] = []
+            row_count = 0
+            for row in reader:
+                current_rows.append(row)
+                row_count += 1
+                if len(current_rows) >= chunk_rows:
+                    temporary_chunk_paths.append(
+                        write_sorted_csv_chunk(
+                            current_rows,
+                            column_indexes,
+                            path.parent,
+                            path.name,
+                        ),
+                    )
+                    current_rows = []
+            if row_count <= 1:
+                return
+            if current_rows:
+                temporary_chunk_paths.append(
+                    write_sorted_csv_chunk(
+                        current_rows,
+                        column_indexes,
+                        path.parent,
+                        path.name,
+                    ),
+                )
+        replace_with_merged_csv_chunks(
+            path,
+            header,
+            temporary_chunk_paths,
+            column_indexes,
+        )
+        logger.info(
+            "Sorted %d row(s) in %s by %s",
+            row_count,
+            path.name,
+            ", ".join(sort_columns),
+        )
+    finally:
+        for chunk_path in temporary_chunk_paths:
+            chunk_path.unlink(missing_ok=True)
+
+
+def sort_csv_outputs(output_dir: Path) -> None:
+    """Sort configured CSV outputs that were created during this run"""
+    for file_name, sort_columns in SORTED_CSV_OUTPUTS:
+        sort_csv_output_file(output_dir / file_name, sort_columns)
+
+
 @dataclass(frozen=True)
 class RepositoryPage:
     """One repository listing page plus the page size Sourcegraph accepted"""
@@ -3026,6 +3206,7 @@ def write_skipped_file_reason_rows(
     for search_result in search_results:
         if search_result.error is not None:
             continue
+        matches = search_result.matches
         alert_parts = [
             part
             for part in (search_result.alert_title, search_result.alert_description)
@@ -3038,7 +3219,7 @@ def write_skipped_file_reason_rows(
                 search_result.repository_name,
                 search_result.ref_name,
                 search_result.match_count,
-                len(search_result.matches),
+                len(matches),
                 search_result.skipped_count,
             )
         if alert_parts:
@@ -3052,22 +3233,19 @@ def write_skipped_file_reason_rows(
             search_result.match_count is not None
             and search_result.match_count != search_result.skipped_count
         )
-        if (
-            len(search_result.matches) != search_result.skipped_count
-            or match_count_mismatch
-        ):
+        if len(matches) != search_result.skipped_count or match_count_mismatch:
             logger.warning(
                 "Skipped-file reason search returned %d file match(es) "
                 "(matchCount=%s, limitHit=%s) for %s@%s; "
                 "textSearchIndex.refs.skippedIndexed.count reported %d",
-                len(search_result.matches),
+                len(matches),
                 search_result.match_count,
                 search_result.limit_hit,
                 search_result.repository_name,
                 search_result.ref_name,
                 search_result.skipped_count,
             )
-        for match in search_result.matches:
+        for match in matches:
             file_obj: dict[str, Any] = match.get("file") or {}
             file_path = str(file_obj.get("path") or "")
             byte_size = file_obj.get("byteSize")
@@ -3098,6 +3276,8 @@ def write_skipped_file_reason_rows(
             writer.writerow(
                 row,
             )
+        matches.clear()
+        search_result.distinct_trigram_counts_by_path.clear()
 
 
 @dataclass(frozen=True)
@@ -3923,6 +4103,7 @@ def run(args: argparse.Namespace, endpoint: str, token: str, output_dir: Path) -
             max_retries=args.max_retries,
             skipped_file_metrics=args.skipped_file_metrics,
         )
+        sort_csv_outputs(output_dir)
         return
 
     include_index_failure_fields = supports_text_search_index_failure_fields(
@@ -4037,6 +4218,8 @@ def run(args: argparse.Namespace, endpoint: str, token: str, output_dir: Path) -
             logger.info("Wrote stats to %s", stats_path.name)
     elif stats is not None:
         logger.info("No repo rows processed; stats files not written")
+
+    sort_csv_outputs(output_dir)
 
     if output_writer.count:
         logger.info("Wrote %d repos to %s", output_writer.count, output_path.name)

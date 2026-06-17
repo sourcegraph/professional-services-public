@@ -26,6 +26,18 @@ rows for it
 | `skipped-files-reason-stats.csv` | `--skipped-files-reason REPO[@REV]` is set, and at least one NOT-INDEXED reason category is found | `reason,count` |
 | `stats-*.csv` | `--stats` is set and repo rows were processed | `bucket,count` (see Stats section) |
 
+The row-bearing output CSVs below are sorted before the run exits, using a
+stdlib Python external sort that writes bounded temporary chunks instead of
+holding every output row in memory
+
+| File | Sort columns |
+| --- | --- |
+| `repos.csv` | `url` |
+| `repos-with-cloning-errors.csv` | `url` |
+| `repos-with-indexing-errors.csv` | `url` |
+| `repos-with-skipped-files.csv` | `url` |
+| `skipped-files-reason-details.csv` | `repository.name`, `rev`, `reason`, `file.extension`, `file.path` |
+
 The optional `--count-commits` and `--run-search` flags append extra
 columns to the repo-listing CSVs above, excluding the `--stats`
 files and the skipped-file reason detail CSV, in this order: main
