@@ -3740,9 +3740,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--skipped-file-metrics",
         action="store_true",
         help=(
-            "With --skipped-files-reason, fetch GitBlob.content only for files "
-            "skipped because they contain too many trigrams, then append "
-            "file.distinctTrigramCount"
+            "With --skipped-files-reason, pulls file contents for local metrics analysis\n"
+            "eg. calculates the number of trigrams in a file for files with too many trigrams"
         ),
     )
     parser.add_argument(
@@ -3812,15 +3811,18 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--src-endpoint",
         default=None,
         metavar="URL",
-        help="Sourcegraph endpoint URL (e.g. https://sourcegraph.example.com)",
+        help=(
+            "Sourcegraph endpoint URL (e.g. https://sourcegraph.example.com)\n"
+            "Prefer to use the SRC_ENDPOINT environment variable for security"
+        ),
     )
     parser.add_argument(
         "--src-access-token",
         default=None,
         metavar="TOKEN",
         help=(
-            "Sourcegraph access token (must start with 'sgp_'); prefer the "
-            "SRC_ACCESS_TOKEN environment variable"
+            "Sourcegraph access token (must start with 'sgp_')\n"
+            "Prefer to use the SRC_ACCESS_TOKEN environment variable for security"
         ),
     )
     return parser.parse_args(argv)
