@@ -11,18 +11,19 @@ to the repository
 
 ## Output files
 
-The script prefixes output file names with the sanitized Sourcegraph endpoint
-(e.g. `sourcegraph.example.com-repos.csv`),
-so the script can run against multiple instances without overwriting files
+Each run writes outputs under
+`list-repos-runs/<sanitized-endpoint>/<timestamp>/`, so each run has its
+own directory. Files are created lazily: a CSV is absent when that run had no
+rows for it
 
 | File | Written when | Columns |
 | --- | --- | --- |
-| `<prefix>-repos.csv` | always | main columns |
-| `<prefix>-repos-with-cloning-errors.csv` | at least one repo has a cloning error | main columns + cloning-error extras |
-| `<prefix>-repos-with-indexing-errors.csv` | at least one repo is cloned but is missing a search index | main columns |
-| `<prefix>-repos-with-skipped-files.csv` | `--skipped-files` is set and the last index excluded some files | main columns + skipped-files extras |
-| `<prefix>-skipped-file-reasons.csv` | `--skipped-files-reason` is set without `REPO[@REV]` | skipped-file reason columns, plus skipped-file metrics columns when `--skipped-file-metrics` is set |
-| `<prefix>-stats-*.csv` | `--statistics` is set | `bucket,count` (see Statistics section) |
+| `repos.csv` | at least one repo row is written | main columns |
+| `repos-with-cloning-errors.csv` | at least one repo has a cloning error | main columns + cloning-error extras |
+| `repos-with-indexing-errors.csv` | at least one repo is cloned but is missing a search index | main columns |
+| `repos-with-skipped-files.csv` | `--skipped-files` is set and the last index excluded files in at least one repo | main columns + skipped-files extras |
+| `skipped-file-reasons.csv` | `--skipped-files-reason` is set without `REPO[@REV]`, and at least one skipped-file detail row is found | skipped-file reason columns, plus skipped-file metrics columns when `--skipped-file-metrics` is set |
+| `stats-*.csv` | `--statistics` is set and repo rows were processed | `bucket,count` (see Statistics section) |
 
 The optional `--count-commits` and `--run-search` flags append extra
 columns to the repo-listing CSVs above, excluding the `--statistics`
@@ -67,7 +68,7 @@ These are written to every repo-listing CSV file
 
 ## Cloning-error extras
 
-Appended to `<prefix>-repos-with-cloning-errors.csv`
+Appended to `repos-with-cloning-errors.csv`
 
 | Column | Type | Requires admin | Description |
 | --- | --- | --- | --- |
@@ -78,7 +79,7 @@ Appended to `<prefix>-repos-with-cloning-errors.csv`
 
 ## Skipped-files extras
 
-Appended to `<prefix>-repos-with-skipped-files.csv`
+Appended to `repos-with-skipped-files.csv`
 
 | Column | Type | Requires admin | Description |
 | --- | --- | --- | --- |
@@ -88,7 +89,7 @@ Appended to `<prefix>-repos-with-skipped-files.csv`
 
 ## Skipped-file reason columns
 
-Written to `<prefix>-skipped-file-reasons.csv` when
+Written to `skipped-file-reasons.csv` when
 `--skipped-files-reason` is used without `REPO[@REV]`
 
 | Column | Type | Requires admin | Description |

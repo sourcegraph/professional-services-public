@@ -83,6 +83,7 @@ DEFAULT_CSV_SCHEMA_FILE = "CSV_SCHEMA.md"
 DEFAULT_INDEXING_ERRORS_FILE = "repos-with-indexing-errors.csv"
 DEFAULT_LOG_FILE_STEM = "list-repos"
 DEFAULT_OUTPUT_FILE = "repos.csv"
+DEFAULT_RUNS_DIR = "list-repos-runs"
 DEFAULT_SKIPPED_FILES_FILE = "repos-with-skipped-files.csv"
 DEFAULT_SKIPPED_FILE_REASONS_FILE = "skipped-file-reasons.csv"
 DEFAULT_STATS_FILE_PREFIX = "stats"
@@ -1443,20 +1444,21 @@ STATS_FILES: list[
 ]
 
 
-def write_stats(prefix: str, stats: StatsCollector) -> list[Path]:
+def write_stats(output_dir: Path, stats: StatsCollector) -> list[Path]:
     """Write one bucket/count CSV per stat and return the paths written"""
     written: list[Path] = []
     for suffix, _desc, buckets, attr, summary_builder in STATS_FILES:
-        path = Path(f"{prefix}-{DEFAULT_STATS_FILE_PREFIX}-{suffix}.csv")
         counter: collections.Counter[str] = getattr(stats, attr)
-        with path.open("w", newline="") as out:
-            writer = make_csv_writer(out)
-            write_csv_row(writer, ["bucket", "count"])
+        with LazyCSVWriter(
+            output_dir / f"{DEFAULT_STATS_FILE_PREFIX}-{suffix}.csv",
+            ["bucket", "count"],
+        ) as writer:
             for label, _lo, _hi in buckets:
-                write_csv_row(writer, [label, counter.get(label, 0)])
+                writer.writerow([label, counter.get(label, 0)])
             for metric, value in summary_builder(stats):
-                write_csv_row(writer, [metric, value])
-        written.append(path)
+                writer.writerow([metric, value])
+            if writer.count:
+                written.append(writer.path)
     return written
 
 
@@ -1537,18 +1539,19 @@ to the repository
 
 ## Output files
 
-The script prefixes output file names with the sanitized Sourcegraph endpoint
-(e.g. `sourcegraph.example.com-repos.csv`),
-so the script can run against multiple instances without overwriting files
+Each run writes outputs under
+`{DEFAULT_RUNS_DIR}/<sanitized-endpoint>/<timestamp>/`, so each run has its
+own directory. Files are created lazily: a CSV is absent when that run had no
+rows for it
 
 | File | Written when | Columns |
 | --- | --- | --- |
-| `<prefix>-{DEFAULT_OUTPUT_FILE}` | always | main columns |
-| `<prefix>-{DEFAULT_CLONING_ERRORS_FILE}` | at least one repo has a cloning error | main columns + cloning-error extras |
-| `<prefix>-{DEFAULT_INDEXING_ERRORS_FILE}` | at least one repo is cloned but is missing a search index | main columns |
-| `<prefix>-{DEFAULT_SKIPPED_FILES_FILE}` | `--skipped-files` is set and the last index excluded some files | main columns + skipped-files extras |
-| `<prefix>-{DEFAULT_SKIPPED_FILE_REASONS_FILE}` | `--skipped-files-reason` is set without `REPO[@REV]` | skipped-file reason columns, plus skipped-file metrics columns when `--skipped-file-metrics` is set |
-| `<prefix>-{DEFAULT_STATS_FILE_PREFIX}-*.csv` | `--statistics` is set | `bucket,count` (see Statistics section) |
+| `{DEFAULT_OUTPUT_FILE}` | at least one repo row is written | main columns |
+| `{DEFAULT_CLONING_ERRORS_FILE}` | at least one repo has a cloning error | main columns + cloning-error extras |
+| `{DEFAULT_INDEXING_ERRORS_FILE}` | at least one repo is cloned but is missing a search index | main columns |
+| `{DEFAULT_SKIPPED_FILES_FILE}` | `--skipped-files` is set and the last index excluded files in at least one repo | main columns + skipped-files extras |
+| `{DEFAULT_SKIPPED_FILE_REASONS_FILE}` | `--skipped-files-reason` is set without `REPO[@REV]`, and at least one skipped-file detail row is found | skipped-file reason columns, plus skipped-file metrics columns when `--skipped-file-metrics` is set |
+| `{DEFAULT_STATS_FILE_PREFIX}-*.csv` | `--statistics` is set and repo rows were processed | `bucket,count` (see Statistics section) |
 
 The optional `--count-commits` and `--run-search` flags append extra
 columns to the repo-listing CSVs above, excluding the `--statistics`
@@ -1563,19 +1566,19 @@ These are written to every repo-listing CSV file
 
 ## Cloning-error extras
 
-Appended to `<prefix>-{DEFAULT_CLONING_ERRORS_FILE}`
+Appended to `{DEFAULT_CLONING_ERRORS_FILE}`
 
 {cloning_list}
 
 ## Skipped-files extras
 
-Appended to `<prefix>-{DEFAULT_SKIPPED_FILES_FILE}`
+Appended to `{DEFAULT_SKIPPED_FILES_FILE}`
 
 {skipped_list}
 
 ## Skipped-file reason columns
 
-Written to `<prefix>-{DEFAULT_SKIPPED_FILE_REASONS_FILE}` when
+Written to `{DEFAULT_SKIPPED_FILE_REASONS_FILE}` when
 `--skipped-files-reason` is used without `REPO[@REV]`
 
 {skipped_reason_list}
@@ -2530,18 +2533,11 @@ def write_skipped_files_reason(
     endpoint: str,
     token: str,
     repo_rev: str,
+    output_dir: Path,
     max_retries: int = DEFAULT_MAX_RETRIES,
     skipped_file_metrics: bool = False,
 ) -> None:
     """Fetch skipped-file matches for repo_rev and write the per-file and stats CSVs"""
-    endpoint_sanitized = sanitize_endpoint_for_filename(endpoint)
-    # Remove raw-input outputs before validation so failures cannot leave stale CSVs
-    input_name_sanitized = sanitize_for_filename(parse_repo_name(repo_rev))
-    input_rev_sanitized = sanitize_for_filename(parse_repo_rev(repo_rev))
-    input_prefix = f"{endpoint_sanitized}-{input_name_sanitized}-{input_rev_sanitized}"
-    Path(f"{input_prefix}-skipped-files.csv").unlink(missing_ok=True)
-    Path(f"{input_prefix}-skipped-stats.csv").unlink(missing_ok=True)
-
     display_rev, indexed_rev, skipped_indexed_query = verify_repo_rev(
         endpoint,
         token,
@@ -2549,15 +2545,6 @@ def write_skipped_files_reason(
         max_retries=max_retries,
     )
     name = parse_repo_name(repo_rev)
-    name_sanitized = sanitize_for_filename(name)
-    rev_sanitized = sanitize_for_filename(display_rev)
-    prefix = f"{endpoint_sanitized}-{name_sanitized}-{rev_sanitized}"
-    files_path = Path(f"{prefix}-skipped-files.csv")
-    stats_path = Path(f"{prefix}-skipped-stats.csv")
-    # Also remove resolved-rev outputs when they differ from the raw input names
-    if prefix != input_prefix:
-        files_path.unlink(missing_ok=True)
-        stats_path.unlink(missing_ok=True)
 
     # Keep each local CSV header beside the extractor that writes its value
     def chunk_matches_content(m: dict[str, Any]) -> str:
@@ -2642,29 +2629,40 @@ def write_skipped_files_reason(
         key=row_sort_key,
     )
 
-    with files_path.open("w", newline="") as out:
-        writer = make_csv_writer(out)
-        write_csv_row(writer, [name for name, _ in file_columns])
+    files_writer = LazyCSVWriter(
+        output_dir / "skipped-files.csv",
+        [name for name, _ in file_columns],
+    )
+    with files_writer as writer:
         for row in rows:
-            write_csv_row(writer, row)
-    files_written = len(rows)
+            writer.writerow(row)
 
-    with stats_path.open("w", newline="") as out:
-        writer = make_csv_writer(out)
-        write_csv_row(writer, [name for name, _ in stats_columns])
+    stats_writer = LazyCSVWriter(
+        output_dir / "skipped-stats.csv",
+        [name for name, _ in stats_columns],
+    )
+    with stats_writer as writer:
         for record in reason_counts.most_common():
-            write_csv_row(writer, [extract(record) for _, extract in stats_columns])
+            writer.writerow([extract(record) for _, extract in stats_columns])
 
-    logger.info(
-        "Wrote %d skipped-file match(es) to %s",
-        files_written,
-        files_path.name,
-    )
-    logger.info(
-        "Wrote %d NOT-INDEXED reason categor(ies) to %s",
-        len(reason_counts),
-        stats_path.name,
-    )
+    if files_writer.count:
+        logger.info(
+            "Wrote %d skipped-file match(es) to %s",
+            files_writer.count,
+            files_writer.path.name,
+        )
+    else:
+        logger.info(
+            "No skipped-file matches found for %s@%s; skipped-files.csv not written",
+            name,
+            display_rev,
+        )
+    if stats_writer.count:
+        logger.info(
+            "Wrote %d NOT-INDEXED reason categor(ies) to %s",
+            stats_writer.count,
+            stats_writer.path.name,
+        )
 
 
 # --- Repo CSV pipeline --------------------------------------------------------
@@ -2682,6 +2680,7 @@ class LazyCSVWriter:
 
     def writerow(self, row: list[Any]) -> None:
         if self._writer is None:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
             self._file = self.path.open("w", newline="")
             self._writer = make_csv_writer(self._file)
             write_csv_row(self._writer, self.columns)
@@ -3415,7 +3414,7 @@ def iter_repo_processing_results(
 
 
 def write_csv(
-    out: TextIO,
+    output_writer: LazyCSVWriter,
     cloning_writer: LazyCSVWriter,
     indexing_writer: LazyCSVWriter,
     skipped_writer: LazyCSVWriter | None,
@@ -3441,15 +3440,6 @@ def write_csv(
     """Stream repos to CSVs and optionally trigger reclone/reindex mutations"""
     run_search_enabled = run_search_pattern is not None
     skipped_file_reasons_enabled = skipped_file_reason_writer is not None
-    writer = make_csv_writer(out)
-    write_csv_row(
-        writer,
-        csv_columns_for(
-            CSV_COLUMNS,
-            count_commits=count_commits,
-            run_search=run_search_enabled,
-        ),
-    )
 
     total = 0
     reclone_total = 0
@@ -3477,8 +3467,7 @@ def write_csv(
             count_commits=count_commits,
             run_search_pattern=run_search_pattern,
         )
-        write_csv_row(
-            writer,
+        output_writer.writerow(
             append_processing_result_columns(
                 row,
                 result,
@@ -3864,7 +3853,7 @@ def collect_scope(args: argparse.Namespace) -> tuple[str, str] | None:
     return repo_name, rev
 
 
-def run(args: argparse.Namespace, endpoint: str, token: str) -> None:
+def run(args: argparse.Namespace, endpoint: str, token: str, output_dir: Path) -> None:
     """Confirm the connection, then stream every repo to the CSV file"""
     logger.info(
         "Retry policy: %d retries per GraphQL request (backoff: 1s, 2s, 4s, ...)",
@@ -3957,6 +3946,7 @@ def run(args: argparse.Namespace, endpoint: str, token: str) -> None:
             endpoint,
             token,
             args.skipped_files_reason,
+            output_dir,
             max_retries=args.max_retries,
             skipped_file_metrics=args.skipped_file_metrics,
         )
@@ -3968,44 +3958,30 @@ def run(args: argparse.Namespace, endpoint: str, token: str) -> None:
         max_retries=args.max_retries,
     )
 
-    # Prefix outputs with endpoint, plus scoped repo/rev when applicable
-    endpoint_sanitized = sanitize_endpoint_for_filename(endpoint)
-    if scope_repo is not None:
-        scope_suffix = sanitize_for_filename(scope_repo)
-        # Only --count-commits uses rev; reclone/reindex filenames stay repo-only
-        if args.count_commits and scope_rev != "HEAD":
-            scope_suffix = f"{scope_suffix}-{sanitize_for_filename(scope_rev)}"
-        prefix = f"{endpoint_sanitized}-{scope_suffix}"
-    else:
-        prefix = endpoint_sanitized
-    output_path = Path(f"{prefix}-{DEFAULT_OUTPUT_FILE}")
-    cloning_errors_path = Path(f"{prefix}-{DEFAULT_CLONING_ERRORS_FILE}")
-    indexing_errors_path = Path(f"{prefix}-{DEFAULT_INDEXING_ERRORS_FILE}")
+    output_path = output_dir / DEFAULT_OUTPUT_FILE
+    cloning_errors_path = output_dir / DEFAULT_CLONING_ERRORS_FILE
+    indexing_errors_path = output_dir / DEFAULT_INDEXING_ERRORS_FILE
     skipped_files_path = (
-        Path(f"{prefix}-{DEFAULT_SKIPPED_FILES_FILE}") if args.skipped_files else None
+        output_dir / DEFAULT_SKIPPED_FILES_FILE if args.skipped_files else None
     )
     skipped_file_reasons_path = (
-        Path(f"{prefix}-{DEFAULT_SKIPPED_FILE_REASONS_FILE}")
+        output_dir / DEFAULT_SKIPPED_FILE_REASONS_FILE
         if args.skipped_files_reason is True
         else None
     )
-    # Remove stale optional outputs; LazyCSVWriter recreates only non-empty ones
-    cloning_errors_path.unlink(missing_ok=True)
-    indexing_errors_path.unlink(missing_ok=True)
-    if skipped_files_path is not None:
-        skipped_files_path.unlink(missing_ok=True)
-    if skipped_file_reasons_path is not None:
-        skipped_file_reasons_path.unlink(missing_ok=True)
-    # Clear stale stats outputs even when --statistics is not enabled this run
-    for suffix, *_ in STATS_FILES:
-        Path(f"{prefix}-{DEFAULT_STATS_FILE_PREFIX}-{suffix}.csv").unlink(
-            missing_ok=True,
-        )
 
     stats = StatsCollector() if args.statistics else None
     count_commits_enabled = bool(args.count_commits)
     run_search_pattern: str | None = args.run_search
     run_search_enabled = run_search_pattern is not None
+    output_writer = LazyCSVWriter(
+        output_path,
+        csv_columns_for(
+            CSV_COLUMNS,
+            count_commits=count_commits_enabled,
+            run_search=run_search_enabled,
+        ),
+    )
     cloning_writer = LazyCSVWriter(
         cloning_errors_path,
         csv_columns_for(
@@ -4052,14 +4028,14 @@ def run(args: argparse.Namespace, endpoint: str, token: str) -> None:
         else contextlib.nullcontext()
     )
     with (
-        output_path.open("w", newline="") as out,
+        output_writer,
         cloning_writer,
         indexing_writer,
         skipped_cm,
         skipped_file_reason_cm,
     ):
         total, reclone_total, reindex_total = write_csv(
-            out,
+            output_writer,
             cloning_writer,
             indexing_writer,
             skipped_writer,
@@ -4082,12 +4058,17 @@ def run(args: argparse.Namespace, endpoint: str, token: str) -> None:
             include_index_failure_fields=include_index_failure_fields,
         )
 
-    if stats is not None:
-        stats_paths = write_stats(prefix, stats)
+    if stats is not None and total:
+        stats_paths = write_stats(output_dir, stats)
         for stats_path in stats_paths:
             logger.info("Wrote statistics to %s", stats_path.name)
+    elif stats is not None:
+        logger.info("No repo rows processed; statistics files not written")
 
-    logger.info("Wrote %d repos to %s", total, output_path.name)
+    if output_writer.count:
+        logger.info("Wrote %d repos to %s", output_writer.count, output_path.name)
+    else:
+        logger.info("No repo rows written; %s not written", output_path.name)
     if cloning_writer.count:
         logger.info(
             "Wrote %d repos with cloning errors to %s",
@@ -4137,10 +4118,23 @@ def redact_argv_for_log(argv: list[str]) -> str:
     return " ".join(shlex.quote(a) for a in redacted)
 
 
-def timestamped_log_path() -> Path:
-    """Return list-repos-YYYY-MM-DD-HH-MM-SS.log for this run"""
-    timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
-    return Path(f"{DEFAULT_LOG_FILE_STEM}-{timestamp}.log")
+def run_timestamp() -> str:
+    """Return a filesystem-safe timestamp unique enough for one run directory"""
+    return datetime.now().strftime("%Y-%m-%d-%H-%M-%S-%f")
+
+
+def run_output_dir(endpoint: str, timestamp: str) -> Path:
+    """Return the per-run output directory path without creating it"""
+    endpoint_name = sanitize_endpoint_for_filename(endpoint) or "unknown-endpoint"
+    return Path(DEFAULT_RUNS_DIR) / endpoint_name / timestamp
+
+
+class LazyDirectoryFileHandler(logging.FileHandler):
+    """FileHandler that creates its parent directory only when first opened"""
+
+    def _open(self):
+        Path(self.baseFilename).parent.mkdir(parents=True, exist_ok=True)
+        return super()._open()
 
 
 def configure_logging(log_path: Path) -> None:
@@ -4158,7 +4152,7 @@ def configure_logging(log_path: Path) -> None:
     stderr_handler.setFormatter(logging.Formatter("%(message)s"))
     root.addHandler(stderr_handler)
 
-    file_handler = logging.FileHandler(
+    file_handler = LazyDirectoryFileHandler(
         log_path,
         mode="w",
         encoding="utf-8",
@@ -4200,29 +4194,30 @@ def main() -> None:
     """Entry point: parse args, configure logging, load env, run, handle errors"""
     args = parse_args(sys.argv[1:])
 
-    configure_logging(timestamped_log_path())
-    # Include credential, network, and run failures in the timestamped log file.
-    # ArgumentParser handles --help and parse errors before logging is configured
-    # so informational CLI exits do not create log files.
-    sys.excepthook = _log_uncaught_exception
-
     # Schema generation is offline and credential-free
     if args.write_csv_schema:
-        try:
-            write_csv_schema(Path(DEFAULT_CSV_SCHEMA_FILE))
-        finally:
-            log_run_issue_summary()
+        write_csv_schema(Path(DEFAULT_CSV_SCHEMA_FILE))
         return
 
+    load_dotenv()
+    raw_endpoint = args.src_endpoint or os.environ.get("SRC_ENDPOINT", "")
+    timestamp = run_timestamp()
+    output_dir = run_output_dir(raw_endpoint, timestamp)
+    configure_logging(output_dir / f"{DEFAULT_LOG_FILE_STEM}.log")
+    # Include credential, network, and run failures in the per-run log file.
+    # ArgumentParser handles --help and parse errors before logging is configured
+    # so informational CLI exits do not create run directories or log files.
+    sys.excepthook = _log_uncaught_exception
+
     try:
-        load_dotenv()
         endpoint, token = require_credentials(args)
         logger.info(
             "Running: %s (SRC_ENDPOINT=%s)",
             redact_argv_for_log(sys.argv),
             endpoint,
         )
-        run(args, endpoint, token)
+        logger.info("Output directory: %s", output_dir)
+        run(args, endpoint, token, output_dir)
     except HTTPRequestError as exc:
         log_http_error(exc)
         sys.exit(1)
