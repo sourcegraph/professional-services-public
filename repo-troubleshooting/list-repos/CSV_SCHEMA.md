@@ -21,7 +21,7 @@ so the script can run against multiple instances without overwriting files
 | `<prefix>-repos-with-cloning-errors.csv` | at least one repo has a cloning error | main columns + cloning-error extras |
 | `<prefix>-repos-with-indexing-errors.csv` | at least one repo is cloned but is missing a search index | main columns |
 | `<prefix>-repos-with-skipped-files.csv` | `--skipped-files` is set and the last index excluded some files | main columns + skipped-files extras |
-| `<prefix>-skipped-file-reasons.csv` | `--skipped-files-reason` is set without `REPO[@REV]` | skipped-file reason columns |
+| `<prefix>-skipped-file-reasons.csv` | `--skipped-files-reason` is set without `REPO[@REV]` | skipped-file reason columns, plus skipped-file metrics columns when `--skipped-file-metrics` is set |
 | `<prefix>-stats-*.csv` | `--statistics` is set | `bucket,count` (see Statistics section) |
 
 The optional `--count-commits` and `--run-search` flags append extra
@@ -98,9 +98,19 @@ Written to `<prefix>-skipped-file-reasons.csv` when
 | `reason` | string | | NOT-INDEXED reason parsed from the indexed placeholder content |
 | `file.extension` | string | | File extension derived from file.path |
 | `file.byteSize` | integer | | Sourcegraph-reported file byte size |
-| `skippedIndexed.count` | integer | | Count Sourcegraph reported for this repo/ref before running the details search |
+| `repoRevSkippedIndexed.count` | integer | | Count Sourcegraph reported for this repo/ref before running the details search |
 | `file.path` | string | | Path of the skipped file within the repository |
 | `file_url` | string | | Sourcegraph blob URL for the skipped file at the indexed ref |
+
+## Skipped-file metrics columns
+
+Appended to skipped-file detail CSVs only when `--skipped-file-metrics`
+is used. These columns may require extra GitBlob content requests, and are
+therefore not fetched by default
+
+| Column | Type | Requires admin | Description |
+| --- | --- | --- | --- |
+| `file.distinctTrigramCount` | integer | | Distinct three-rune trigrams computed from GitBlob.content. Only populated for skipped files whose reason is `contains too many trigrams` |
 
 ## `--count-commits` columns
 

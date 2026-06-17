@@ -112,6 +112,7 @@ RETRYABLE_GRAPHQL_ERROR_TERMS = (
     "timeout",
     "transport:",
 )
+TOO_MANY_TRIGRAMS_REASON = "contains too many trigrams"
 
 
 # --- GraphQL queries ----------------------------------------------------------
@@ -376,6 +377,18 @@ query SkippedFileReasons($query: String!) {
             content
           }
         }
+      }
+    }
+  }
+}
+"""
+
+SKIPPED_FILE_BLOB_CONTENT_QUERY = """
+query SkippedFileBlobContent($repo: String!, $rev: String!, $path: String!) {
+  repository(name: $repo) {
+    commit(rev: $rev) {
+      blob(path: $path) {
+        content
       }
     }
   }
@@ -1184,7 +1197,7 @@ SKIPPED_FILE_REASON_COLUMNS: list[tuple[str, str, bool, str]] = [
         "integer",
     ),
     (
-        "skippedIndexed.count",
+        "repoRevSkippedIndexed.count",
         "Count Sourcegraph reported for this repo/ref before running the details search",
         False,
         "integer",
@@ -1202,6 +1215,24 @@ SKIPPED_FILE_REASON_COLUMNS: list[tuple[str, str, bool, str]] = [
         "string",
     ),
 ]
+
+SKIPPED_FILE_METRIC_COLUMNS: list[tuple[str, str, bool, str]] = [
+    (
+        "file.distinctTrigramCount",
+        "Distinct three-rune trigrams computed from GitBlob.content. "
+        "Only populated for skipped files whose reason is `contains too many trigrams`",
+        False,
+        "integer",
+    ),
+]
+
+
+def skipped_file_reason_column_names(skipped_file_metrics: bool) -> list[str]:
+    """Return skipped-file detail CSV columns for the enabled modes"""
+    columns = [name for name, _, _, _ in SKIPPED_FILE_REASON_COLUMNS]
+    if skipped_file_metrics:
+        columns.extend(name for name, _, _, _ in SKIPPED_FILE_METRIC_COLUMNS)
+    return columns
 
 
 # --- Statistics ---------------------------------------------------------------
@@ -1449,6 +1480,7 @@ def write_csv_schema(path: Path) -> None:
     cloning_list = format_columns_list(name_desc(CLONING_ERROR_EXTRA_COLUMNS))
     skipped_list = format_columns_list(name_desc(SKIPPED_FILES_EXTRA_COLUMNS))
     skipped_reason_list = format_columns_list(SKIPPED_FILE_REASON_COLUMNS)
+    skipped_metrics_list = format_columns_list(SKIPPED_FILE_METRIC_COLUMNS)
     commit_count_list = format_columns_list(COMMIT_COUNT_COLUMNS)
     run_search_list = format_columns_list(RUN_SEARCH_COLUMNS)
     stats_files_list = format_stats_files_list()
@@ -1476,7 +1508,7 @@ so the script can run against multiple instances without overwriting files
 | `<prefix>-{DEFAULT_CLONING_ERRORS_FILE}` | at least one repo has a cloning error | main columns + cloning-error extras |
 | `<prefix>-{DEFAULT_INDEXING_ERRORS_FILE}` | at least one repo is cloned but is missing a search index | main columns |
 | `<prefix>-{DEFAULT_SKIPPED_FILES_FILE}` | `--skipped-files` is set and the last index excluded some files | main columns + skipped-files extras |
-| `<prefix>-{DEFAULT_SKIPPED_FILE_REASONS_FILE}` | `--skipped-files-reason` is set without `REPO[@REV]` | skipped-file reason columns |
+| `<prefix>-{DEFAULT_SKIPPED_FILE_REASONS_FILE}` | `--skipped-files-reason` is set without `REPO[@REV]` | skipped-file reason columns, plus skipped-file metrics columns when `--skipped-file-metrics` is set |
 | `<prefix>-{DEFAULT_STATS_FILE_PREFIX}-*.csv` | `--statistics` is set | `bucket,count` (see Statistics section) |
 
 The optional `--count-commits` and `--run-search` flags append extra
@@ -1508,6 +1540,14 @@ Written to `<prefix>-{DEFAULT_SKIPPED_FILE_REASONS_FILE}` when
 `--skipped-files-reason` is used without `REPO[@REV]`
 
 {skipped_reason_list}
+
+## Skipped-file metrics columns
+
+Appended to skipped-file detail CSVs only when `--skipped-file-metrics`
+is used. These columns may require extra GitBlob content requests, and are
+therefore not fetched by default
+
+{skipped_metrics_list}
 
 ## `--count-commits` columns
 
@@ -2212,6 +2252,97 @@ def skipped_file_reason(match: dict[str, Any]) -> str:
     return ""
 
 
+def skipped_file_needs_metrics(match: dict[str, Any]) -> bool:
+    """Return True when extra GitBlob metrics are useful for this skipped file"""
+    return skipped_file_reason(match) == TOO_MANY_TRIGRAMS_REASON
+
+
+def distinct_trigram_count(content: str) -> int:
+    """Return the count of distinct three-rune trigrams in content"""
+    if len(content) < 3:
+        return 0
+    return len({content[index : index + 3] for index in range(len(content) - 2)})
+
+
+def fetch_blob_distinct_trigram_count(
+    endpoint: str,
+    token: str,
+    repo_name: str,
+    rev: str,
+    file_path: str,
+    max_retries: int,
+) -> int:
+    """Fetch GitBlob.content, compute trigram count, and retain only the count"""
+
+    def validate(data: dict[str, Any]) -> None:
+        repository = require_dict(data.get("repository"), "blob-content repository")
+        commit = require_dict(repository.get("commit"), "blob-content commit")
+        blob = require_dict(commit.get("blob"), "blob-content blob")
+        content = blob.get("content")
+        if not isinstance(content, str):
+            msg = "blob-content content missing or not a string"
+            raise GraphQLError(msg)
+
+    data = graphql_request_with_validation(
+        endpoint,
+        token,
+        SKIPPED_FILE_BLOB_CONTENT_QUERY,
+        {"repo": repo_name, "rev": rev, "path": file_path},
+        timeout=REQUEST_TIMEOUT_SECONDS_WITH_COMMIT_COUNT,
+        max_retries=max_retries,
+        request_description=f"Blob content for {repo_name}@{rev}:{file_path}",
+        validate=validate,
+    )
+    repository = require_dict(data.get("repository"), "blob-content repository")
+    commit = require_dict(repository.get("commit"), "blob-content commit")
+    blob = require_dict(commit.get("blob"), "blob-content blob")
+    content = blob.get("content")
+    if not isinstance(content, str):
+        msg = "blob-content content missing or not a string"
+        raise GraphQLError(msg)
+    count = distinct_trigram_count(content)
+    # Do not retain GitBlob.content longer than needed. The count is the only
+    # metric stored for CSV output.
+    del content, blob, commit, repository, data
+    return count
+
+
+def collect_distinct_trigram_counts(
+    endpoint: str,
+    token: str,
+    repo_name: str,
+    rev: str,
+    matches: list[dict[str, Any]],
+    max_retries: int,
+) -> dict[str, int]:
+    """Fetch blob content and compute distinct trigram counts where needed"""
+    counts: dict[str, int] = {}
+    for match in matches:
+        if not skipped_file_needs_metrics(match):
+            continue
+        file_obj: dict[str, Any] = match.get("file") or {}
+        file_path = str(file_obj.get("path") or "")
+        if not file_path:
+            logger.error(
+                "Cannot fetch skipped-file metrics for %s@%s: search result has no file path",
+                repo_name,
+                rev,
+            )
+            continue
+        try:
+            counts[file_path] = fetch_blob_distinct_trigram_count(
+                endpoint,
+                token,
+                repo_name,
+                rev,
+                file_path,
+                max_retries,
+            )
+        except REQUEST_FAILURE_TYPES:
+            continue
+    return counts
+
+
 def skipped_file_query_revision(query: str, fallback: str) -> str:
     """Return the @rev term from a skippedIndexed query, or fallback"""
     match = re.search(r"\br:\S+@([^\s]+)", query)
@@ -2321,6 +2452,7 @@ def write_skipped_files_reason(
     token: str,
     repo_rev: str,
     max_retries: int = DEFAULT_MAX_RETRIES,
+    skipped_file_metrics: bool = False,
 ) -> None:
     """Fetch skipped-file matches for repo_rev and write the per-file and stats CSVs"""
     endpoint_sanitized = sanitize_endpoint_for_filename(endpoint)
@@ -2372,12 +2504,21 @@ def write_skipped_files_reason(
             str(file_obj.get("path") or ""),
         )
 
+    distinct_trigram_counts_by_path: dict[str, int] = {}
+
+    def match_distinct_trigram_count(m: dict[str, Any]) -> int | str:
+        file_obj: dict[str, Any] = m.get("file") or {}
+        file_path = str(file_obj.get("path") or "")
+        return distinct_trigram_counts_by_path.get(file_path, "")
+
     file_columns: list[tuple[str, Callable[[dict[str, Any]], Any]]] = [
         ("chunkMatches.content", chunk_matches_content),
         ("file.byteSize", match_file_byte_size),
         ("file.extension", match_file_extension),
         ("file_url", match_file_url),
     ]
+    if skipped_file_metrics:
+        file_columns.append(("file.distinctTrigramCount", match_distinct_trigram_count))
     stats_columns: list[tuple[str, Callable[[tuple[str, int]], Any]]] = [
         ("reason", lambda r: r[0]),
         ("count", lambda r: r[1]),
@@ -2392,6 +2533,15 @@ def write_skipped_files_reason(
         max_retries=max_retries,
     )
     matches = query_result.matches
+    if skipped_file_metrics:
+        distinct_trigram_counts_by_path = collect_distinct_trigram_counts(
+            endpoint,
+            token,
+            name,
+            rev,
+            matches,
+            max_retries,
+        )
 
     reason_counts: collections.Counter[str] = collections.Counter()
     rows: list[list[Any]] = []
@@ -2493,6 +2643,7 @@ class SkippedFileReasonSearchResult:
     limit_hit: bool
     alert_title: str | None
     alert_description: str | None
+    distinct_trigram_counts_by_path: dict[str, int]
     error: str | None
 
 
@@ -2735,6 +2886,7 @@ def collect_skipped_file_reason_search_results(
     token: str,
     repo: dict[str, Any],
     max_retries: int,
+    skipped_file_metrics: bool,
 ) -> list[SkippedFileReasonSearchResult]:
     """Run skipped-file searches for every skipped indexed ref in one repo"""
     repo_name = str(repo.get("name") or "")
@@ -2767,10 +2919,23 @@ def collect_skipped_file_reason_search_results(
                     limit_hit=False,
                     alert_title=None,
                     alert_description=None,
+                    distinct_trigram_counts_by_path={},
                     error=request_error_summary(error),
                 ),
             )
             continue
+        distinct_trigram_counts_by_path = (
+            collect_distinct_trigram_counts(
+                endpoint,
+                token,
+                repo_name,
+                revision,
+                query_result.matches,
+                max_retries,
+            )
+            if skipped_file_metrics
+            else {}
+        )
         results.append(
             SkippedFileReasonSearchResult(
                 repository_name=repo_name,
@@ -2781,6 +2946,7 @@ def collect_skipped_file_reason_search_results(
                 limit_hit=query_result.limit_hit,
                 alert_title=query_result.alert_title,
                 alert_description=query_result.alert_description,
+                distinct_trigram_counts_by_path=distinct_trigram_counts_by_path,
                 error=None,
             ),
         )
@@ -2791,6 +2957,7 @@ def write_skipped_file_reason_rows(
     writer: LazyCSVWriter,
     endpoint: str,
     search_results: list[SkippedFileReasonSearchResult],
+    skipped_file_metrics: bool,
 ) -> None:
     """Append skipped-file detail rows from per-ref search results"""
     for search_result in search_results:
@@ -2842,22 +3009,27 @@ def write_skipped_file_reason_rows(
             file_path = str(file_obj.get("path") or "")
             byte_size = file_obj.get("byteSize")
             file_extension = Path(file_path).suffix.lstrip(".")
-            writer.writerow(
-                [
+            row = [
+                search_result.repository_name,
+                search_result.ref_name,
+                skipped_file_reason(match),
+                file_extension,
+                int(byte_size) if byte_size is not None else "",
+                search_result.skipped_count,
+                file_path,
+                file_url(
+                    endpoint,
                     search_result.repository_name,
                     search_result.ref_name,
-                    skipped_file_reason(match),
-                    file_extension,
-                    int(byte_size) if byte_size is not None else "",
-                    search_result.skipped_count,
                     file_path,
-                    file_url(
-                        endpoint,
-                        search_result.repository_name,
-                        search_result.ref_name,
-                        file_path,
-                    ),
-                ],
+                ),
+            ]
+            if skipped_file_metrics:
+                row.append(
+                    search_result.distinct_trigram_counts_by_path.get(file_path, ""),
+                )
+            writer.writerow(
+                row,
             )
 
 
@@ -2893,6 +3065,7 @@ def collect_repo_processing_result(
     count_commits_rev: str,
     run_search_pattern: str | None,
     skipped_file_reasons: bool,
+    skipped_file_metrics: bool,
     max_retries: int,
 ) -> RepoProcessingResult:
     """Build the row and run optional per-repo network queries"""
@@ -2947,6 +3120,7 @@ def collect_repo_processing_result(
             token,
             repo,
             max_retries,
+            skipped_file_metrics,
         )
     return RepoProcessingResult(
         index=index,
@@ -3061,6 +3235,7 @@ def iter_repo_processing_results(
     count_commits_rev: str,
     run_search_pattern: str | None,
     skipped_file_reasons: bool,
+    skipped_file_metrics: bool,
     concurrency: int,
     max_retries: int,
 ) -> Iterator[RepoProcessingResult]:
@@ -3090,6 +3265,7 @@ def iter_repo_processing_results(
                 count_commits_rev=count_commits_rev,
                 run_search_pattern=run_search_pattern,
                 skipped_file_reasons=skipped_file_reasons,
+                skipped_file_metrics=skipped_file_metrics,
                 max_retries=max_retries,
             )
         return
@@ -3116,6 +3292,7 @@ def iter_repo_processing_results(
             count_commits_rev=count_commits_rev,
             run_search_pattern=run_search_pattern,
             skipped_file_reasons=skipped_file_reasons,
+            skipped_file_metrics=skipped_file_metrics,
             max_retries=max_retries,
         )
         pending_results[future] = index
@@ -3158,6 +3335,7 @@ def write_csv(
     scope_repo: str | None = None,
     count_commits_rev: str = "HEAD",
     run_search_pattern: str | None = None,
+    skipped_file_metrics: bool = False,
     page_size: int = PAGE_SIZE,
     concurrency: int = DEFAULT_CONCURRENCY,
     max_retries: int = DEFAULT_MAX_RETRIES,
@@ -3192,6 +3370,7 @@ def write_csv(
         count_commits_rev=count_commits_rev,
         run_search_pattern=run_search_pattern,
         skipped_file_reasons=skipped_file_reasons_enabled,
+        skipped_file_metrics=skipped_file_metrics,
         concurrency=concurrency,
         max_retries=max_retries,
     ):
@@ -3265,6 +3444,7 @@ def write_csv(
                 skipped_file_reason_writer,
                 endpoint,
                 result.skipped_file_reason_search_results,
+                skipped_file_metrics,
             )
     return (total, reclone_total, reindex_total)
 
@@ -3460,6 +3640,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--skipped-file-metrics",
+        action="store_true",
+        help=(
+            "With --skipped-files-reason, fetch GitBlob.content only for files "
+            "skipped because they contain too many trigrams, then append "
+            "file.distinctTrigramCount"
+        ),
+    )
+    parser.add_argument(
         "--run-search",
         metavar="PATTERN",
         default=None,
@@ -3582,6 +3771,8 @@ def run(args: argparse.Namespace, endpoint: str, token: str) -> None:
         "Retry policy: %d retries per GraphQL request (backoff: 1s, 2s, 4s, ...)",
         args.max_retries,
     )
+    if args.skipped_file_metrics and args.skipped_files_reason is None:
+        die("--skipped-file-metrics requires --skipped-files-reason")
     if args.count_commits:
         # Announce the longer per-repo timeout because this mode can be slow
         logger.info(
@@ -3668,6 +3859,7 @@ def run(args: argparse.Namespace, endpoint: str, token: str) -> None:
             token,
             args.skipped_files_reason,
             max_retries=args.max_retries,
+            skipped_file_metrics=args.skipped_file_metrics,
         )
         return
 
@@ -3746,7 +3938,7 @@ def run(args: argparse.Namespace, endpoint: str, token: str) -> None:
     skipped_file_reason_writer = (
         LazyCSVWriter(
             skipped_file_reasons_path,
-            [name for name, _, _, _ in SKIPPED_FILE_REASON_COLUMNS],
+            skipped_file_reason_column_names(args.skipped_file_metrics),
         )
         if skipped_file_reasons_path is not None
         else None
@@ -3782,6 +3974,7 @@ def run(args: argparse.Namespace, endpoint: str, token: str) -> None:
             scope_repo=scope_repo,
             count_commits_rev=scope_rev,
             run_search_pattern=run_search_pattern,
+            skipped_file_metrics=args.skipped_file_metrics,
             page_size=args.page_size,
             concurrency=args.concurrency,
             max_retries=args.max_retries,
