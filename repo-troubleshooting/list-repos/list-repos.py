@@ -2207,8 +2207,8 @@ def verify_repo_rev(
     token: str,
     repo_rev: str,
     max_retries: int = DEFAULT_MAX_RETRIES,
-) -> tuple[str, str, str]:
-    """Resolve repo/rev to an indexed ref; return display rev, indexed rev, and skip query"""
+) -> tuple[str, str, str, int]:
+    """Resolve repo/rev to an indexed ref; return display rev, indexed rev, skip query, and skip count"""
     name = parse_repo_name(repo_rev)
     rev = parse_repo_rev(repo_rev)
     data = graphql_request(
@@ -2238,9 +2238,11 @@ def verify_repo_rev(
     selected_ref_name = ""
     selected_indexed_oid = ""
     selected_skipped_query = ""
+    selected_skipped_count = 0
     target_match_ref_name = ""
     target_match_indexed_oid = ""
     target_match_skipped_query = ""
+    target_match_skipped_count = 0
     for ref in refs:
         if not ref.get("indexed"):
             continue
@@ -2255,11 +2257,13 @@ def verify_repo_rev(
         if ref_name == requested_indexed_ref:
             selected_ref_name = ref_name
             selected_indexed_oid = oid
+            selected_skipped_count = skipped_count
             if skipped_count > 0:
                 selected_skipped_query = skipped_query
         if oid == target_oid:
             target_match_ref_name = ref_name
             target_match_indexed_oid = oid
+            target_match_skipped_count = skipped_count
             if skipped_count > 0:
                 target_match_skipped_query = skipped_query
 
@@ -2267,6 +2271,7 @@ def verify_repo_rev(
         selected_ref_name = target_match_ref_name
         selected_indexed_oid = target_match_indexed_oid
         selected_skipped_query = target_match_skipped_query
+        selected_skipped_count = target_match_skipped_count
 
     if not selected_ref_name:
         if indexed_names:
@@ -2293,7 +2298,7 @@ def verify_repo_rev(
             selected_ref_name,
             selected_indexed_oid,
         )
-    return display_rev, indexed_rev, selected_skipped_query
+    return display_rev, indexed_rev, selected_skipped_query, selected_skipped_count
 
 
 def file_url(endpoint: str, repo_name: str, rev: str, file_path: str) -> str:
@@ -2540,53 +2545,13 @@ def write_skipped_files_reason(
     skipped_file_metrics: bool = False,
 ) -> None:
     """Fetch skipped-file matches for repo_rev and write the per-file and stats CSVs"""
-    display_rev, indexed_rev, skipped_indexed_query = verify_repo_rev(
+    display_rev, indexed_rev, skipped_indexed_query, skipped_count = verify_repo_rev(
         endpoint,
         token,
         repo_rev,
         max_retries=max_retries,
     )
     name = parse_repo_name(repo_rev)
-
-    # Keep each local CSV header beside the extractor that writes its value
-    def chunk_matches_content(m: dict[str, Any]) -> str:
-        chunks: list[dict[str, Any]] = m.get("chunkMatches") or []
-        return "\n".join(str(c.get("content") or "") for c in chunks)
-
-    def match_file_byte_size(m: dict[str, Any]) -> int | str:
-        file_obj: dict[str, Any] = m.get("file") or {}
-        bs = file_obj.get("byteSize")
-        return int(bs) if bs is not None else ""
-
-    def match_file_extension(m: dict[str, Any]) -> str:
-        file_obj: dict[str, Any] = m.get("file") or {}
-        return Path(str(file_obj.get("path") or "")).suffix.lstrip(".")
-
-    def match_file_url(m: dict[str, Any]) -> str:
-        repo_obj: dict[str, Any] = m.get("repository") or {}
-        file_obj: dict[str, Any] = m.get("file") or {}
-        return file_url(
-            endpoint,
-            str(repo_obj.get("name") or ""),
-            indexed_rev,
-            str(file_obj.get("path") or ""),
-        )
-
-    distinct_trigram_counts_by_path: dict[str, int] = {}
-
-    def match_distinct_trigram_count(m: dict[str, Any]) -> int | str:
-        file_obj: dict[str, Any] = m.get("file") or {}
-        file_path = str(file_obj.get("path") or "")
-        return distinct_trigram_counts_by_path.get(file_path, "")
-
-    file_columns: list[tuple[str, Callable[[dict[str, Any]], Any]]] = [
-        ("chunkMatches.content", chunk_matches_content),
-        ("file.extension", match_file_extension),
-        ("file.byteSize", match_file_byte_size),
-    ]
-    if skipped_file_metrics:
-        file_columns.append(("file.distinctTrigramCount", match_distinct_trigram_count))
-    file_columns.append(("file_url", match_file_url))
     stats_columns: list[tuple[str, Callable[[tuple[str, int]], Any]]] = [
         ("reason", lambda r: r[0]),
         ("count", lambda r: r[1]),
@@ -2601,6 +2566,7 @@ def write_skipped_files_reason(
         max_retries=max_retries,
     )
     matches = query_result.matches
+    distinct_trigram_counts_by_path: dict[str, int] = {}
     if skipped_file_metrics:
         distinct_trigram_counts_by_path = collect_distinct_trigram_counts(
             endpoint,
@@ -2612,32 +2578,36 @@ def write_skipped_files_reason(
         )
 
     reason_counts: collections.Counter[str] = collections.Counter()
-    rows: list[list[Any]] = []
     for match in matches:
-        rows.append([extract(match) for _, extract in file_columns])
         reason = skipped_file_reason(match)
         if reason:
             reason_counts[reason] += 1
 
-    # Sort by chunkMatches.content so files with the same NOT-INDEXED reason are
-    # grouped together; ties broken by extension, byteSize, metric, then file_url.
-    # Coerce numeric cells to int so an int/str union can't blow up the comparator.
-    def row_sort_key(row: list[Any]) -> tuple[Any, ...]:
-        byte_size = row[2] if isinstance(row[2], int) else -1
-        metric = row[3] if skipped_file_metrics and isinstance(row[3], int) else -1
-        return (row[0], row[1], byte_size, metric, row[-1])
-
-    rows.sort(
-        key=row_sort_key,
+    search_result = SkippedFileReasonSearchResult(
+        repository_name=name,
+        ref_name=display_rev,
+        indexed_rev=indexed_rev,
+        skipped_count=skipped_count,
+        matches=matches,
+        match_count=query_result.match_count,
+        limit_hit=query_result.limit_hit,
+        alert_title=query_result.alert_title,
+        alert_description=query_result.alert_description,
+        distinct_trigram_counts_by_path=distinct_trigram_counts_by_path,
+        error=None,
     )
 
     files_writer = LazyCSVWriter(
         output_dir / DEFAULT_SKIPPED_FILE_REASONS_FILE,
-        [name for name, _ in file_columns],
+        skipped_file_reason_column_names(skipped_file_metrics),
     )
     with files_writer as writer:
-        for row in rows:
-            writer.writerow(row)
+        write_skipped_file_reason_rows(
+            writer,
+            endpoint,
+            [search_result],
+            skipped_file_metrics,
+        )
 
     stats_writer = LazyCSVWriter(
         output_dir / DEFAULT_SKIPPED_FILE_REASON_STATS_FILE,
