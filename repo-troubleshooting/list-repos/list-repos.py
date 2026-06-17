@@ -176,6 +176,10 @@ REPO_NODE_FRAGMENT_TAIL = """
       ref {
         displayName
       }
+      indexed
+      indexedCommit {
+        oid
+      }
       skippedIndexed {
         count
         query
@@ -586,10 +590,14 @@ def refs_with_skips(repo: dict[str, Any]) -> str:
     )
 
 
-def refs_with_skipped_file_queries(repo: dict[str, Any]) -> list[tuple[str, int, str]]:
-    """Return (ref name, skipped count, API search query) for refs with skips"""
-    refs: list[tuple[str, int, str]] = []
+def refs_with_skipped_file_queries(
+    repo: dict[str, Any],
+) -> list[tuple[str, int, str, str]]:
+    """Return (ref name, skipped count, API search query, indexed commit) tuples"""
+    refs: list[tuple[str, int, str, str]] = []
     for ref in _index_refs(repo):
+        if ref.get("indexed") is False:
+            continue
         skipped: dict[str, Any] = ref.get("skippedIndexed") or {}
         count = skipped.get("count")
         if count is None:
@@ -600,7 +608,11 @@ def refs_with_skipped_file_queries(repo: dict[str, Any]) -> list[tuple[str, int,
         ref_node: dict[str, Any] = ref.get("ref") or {}
         name = str(ref_node.get("displayName") or "")
         if name:
-            refs.append((name, skipped_count, str(skipped.get("query") or "")))
+            indexed_commit: dict[str, Any] = ref.get("indexedCommit") or {}
+            indexed_oid = str(indexed_commit.get("oid") or "")
+            refs.append(
+                (name, skipped_count, str(skipped.get("query") or ""), indexed_oid)
+            )
     return refs
 
 
@@ -608,7 +620,9 @@ def refs_with_skipped_file_counts(repo: dict[str, Any]) -> list[tuple[str, int]]
     """Return (ref name, skipped count) pairs for refs with skipped files"""
     return [
         (name, skipped_count)
-        for name, skipped_count, _query in refs_with_skipped_file_queries(repo)
+        for name, skipped_count, _query, _indexed_oid in refs_with_skipped_file_queries(
+            repo
+        )
     ]
 
 
@@ -2163,8 +2177,8 @@ def verify_repo_rev(
     token: str,
     repo_rev: str,
     max_retries: int = DEFAULT_MAX_RETRIES,
-) -> tuple[str, str]:
-    """Require repo/rev to resolve to an index; return output rev and skip query"""
+) -> tuple[str, str, str]:
+    """Resolve repo/rev to an indexed ref; return display rev, indexed rev, and skip query"""
     name = parse_repo_name(repo_rev)
     rev = parse_repo_rev(repo_rev)
     data = graphql_request(
@@ -2184,52 +2198,72 @@ def verify_repo_rev(
 
     text_index: dict[str, Any] | None = repository.get("textSearchIndex")
     refs: list[dict[str, Any]] = (text_index or {}).get("refs") or []
-    target_oid = commit.get("oid")
-    indexed_oids: set[str] = set()
+    target_oid = str(commit.get("oid") or "")
     indexed_names: list[str] = []
     default_branch: dict[str, Any] = repository.get("defaultBranch") or {}
     default_branch_name = str(default_branch.get("displayName") or "")
+    requested_indexed_ref = default_branch_name if rev == "HEAD" else rev
+    if not requested_indexed_ref:
+        requested_indexed_ref = "HEAD"
+    selected_ref_name = ""
+    selected_indexed_oid = ""
     selected_skipped_query = ""
-    fallback_skipped_query = ""
+    target_match_ref_name = ""
+    target_match_indexed_oid = ""
+    target_match_skipped_query = ""
     for ref in refs:
         if not ref.get("indexed"):
             continue
         indexed_commit: dict[str, Any] = ref.get("indexedCommit") or {}
-        oid = indexed_commit.get("oid")
-        if oid:
-            indexed_oids.add(str(oid))
+        oid = str(indexed_commit.get("oid") or "")
         ref_node: dict[str, Any] = ref.get("ref") or {}
         ref_name = str(ref_node.get("displayName") or "?")
         indexed_names.append(ref_name)
-        if oid != target_oid:
-            continue
         skipped: dict[str, Any] = ref.get("skippedIndexed") or {}
         skipped_count = int(skipped.get("count") or 0)
         skipped_query = str(skipped.get("query") or "")
-        if skipped_count <= 0 or not skipped_query:
-            continue
-        if not fallback_skipped_query:
-            fallback_skipped_query = skipped_query
-        if ref_name == rev or (rev == "HEAD" and ref_name == default_branch_name):
-            selected_skipped_query = skipped_query
-    if target_oid not in indexed_oids:
+        if ref_name == requested_indexed_ref:
+            selected_ref_name = ref_name
+            selected_indexed_oid = oid
+            if skipped_count > 0:
+                selected_skipped_query = skipped_query
+        if oid == target_oid:
+            target_match_ref_name = ref_name
+            target_match_indexed_oid = oid
+            if skipped_count > 0:
+                target_match_skipped_query = skipped_query
+
+    if not selected_ref_name and target_match_ref_name:
+        selected_ref_name = target_match_ref_name
+        selected_indexed_oid = target_match_indexed_oid
+        selected_skipped_query = target_match_skipped_query
+
+    if not selected_ref_name:
         if indexed_names:
             indexed_summary = "\n".join(f"  - {n}" for n in indexed_names)
         else:
             indexed_summary = "  (none)"
         die(
-            f"revision {rev!r} (commit {target_oid}) is not currently indexed "
-            f"in repository {name!r}.\nIndexed refs:\n{indexed_summary}",
+            f"revision {rev!r} did not match an indexed ref in repository "
+            f"{name!r}.\nIndexed refs:\n{indexed_summary}",
         )
-
-    # When the user didn't specify a rev (or explicitly used "HEAD"), substitute
-    # the actual default branch name so filenames and URLs read naturally
     if rev == "HEAD":
-        return (
-            default_branch_name or "HEAD",
-            selected_skipped_query or fallback_skipped_query,
+        display_rev = default_branch_name or selected_ref_name or "HEAD"
+    else:
+        display_rev = rev
+    indexed_rev = selected_indexed_oid or display_rev
+    if selected_indexed_oid and selected_indexed_oid != target_oid:
+        logger.warning(
+            "revision %r resolves to commit %s in repository %s, but the text "
+            "search index has ref %s at commit %s; using the indexed commit for "
+            "skipped-file details",
+            rev,
+            target_oid,
+            name,
+            selected_ref_name,
+            selected_indexed_oid,
         )
-    return rev, selected_skipped_query or fallback_skipped_query
+    return display_rev, indexed_rev, selected_skipped_query
 
 
 def file_url(endpoint: str, repo_name: str, rev: str, file_path: str) -> str:
@@ -2351,6 +2385,17 @@ def skipped_file_query_revision(query: str, fallback: str) -> str:
     return fallback
 
 
+def repo_filter_term_at_revision(term: str, revision: str) -> str:
+    """Return a repo-filter query term pinned to revision"""
+    for prefix in ("r:", "repo:"):
+        if term.startswith(prefix):
+            repo_filter = term[len(prefix) :]
+            if "@" in repo_filter:
+                repo_filter = repo_filter.rsplit("@", 1)[0]
+            return f"{prefix}{repo_filter}@{revision}"
+    return term
+
+
 def skipped_file_reason_search_query(
     skipped_indexed_query: str,
     repo_name: str,
@@ -2363,13 +2408,22 @@ def skipped_file_reason_search_query(
             f"r:{repo_filter}@{revision} type:file index:only "
             f"patternType:regexp ^NOT-INDEXED:"
         )
-    terms = [
-        term
-        for term in skipped_indexed_query.split()
-        if term != "select:file"
-        and not term.startswith("count:")
-        and not term.startswith("timeout:")
-    ]
+    terms: list[str] = []
+    has_repo_filter = False
+    for term in skipped_indexed_query.split():
+        if (
+            term == "select:file"
+            or term.startswith("count:")
+            or term.startswith("timeout:")
+        ):
+            continue
+        revised_term = repo_filter_term_at_revision(term, revision)
+        if term.startswith(("r:", "repo:")):
+            has_repo_filter = True
+        terms.append(revised_term)
+    if not has_repo_filter:
+        repo_filter = f"^{re.escape(repo_name)}$"
+        terms.insert(0, f"r:{repo_filter}@{revision}")
     terms.append("count:all")
     terms.append(SKIPPED_FILE_REASON_SEARCH_TIMEOUT_PARAMETER)
     return " ".join(terms)
@@ -2463,7 +2517,7 @@ def write_skipped_files_reason(
     Path(f"{input_prefix}-skipped-files.csv").unlink(missing_ok=True)
     Path(f"{input_prefix}-skipped-stats.csv").unlink(missing_ok=True)
 
-    rev, skipped_indexed_query = verify_repo_rev(
+    display_rev, indexed_rev, skipped_indexed_query = verify_repo_rev(
         endpoint,
         token,
         repo_rev,
@@ -2471,7 +2525,7 @@ def write_skipped_files_reason(
     )
     name = parse_repo_name(repo_rev)
     name_sanitized = sanitize_for_filename(name)
-    rev_sanitized = sanitize_for_filename(rev)
+    rev_sanitized = sanitize_for_filename(display_rev)
     prefix = f"{endpoint_sanitized}-{name_sanitized}-{rev_sanitized}"
     files_path = Path(f"{prefix}-skipped-files.csv")
     stats_path = Path(f"{prefix}-skipped-stats.csv")
@@ -2500,7 +2554,7 @@ def write_skipped_files_reason(
         return file_url(
             endpoint,
             str(repo_obj.get("name") or ""),
-            rev,
+            indexed_rev,
             str(file_obj.get("path") or ""),
         )
 
@@ -2513,12 +2567,12 @@ def write_skipped_files_reason(
 
     file_columns: list[tuple[str, Callable[[dict[str, Any]], Any]]] = [
         ("chunkMatches.content", chunk_matches_content),
-        ("file.byteSize", match_file_byte_size),
         ("file.extension", match_file_extension),
-        ("file_url", match_file_url),
+        ("file.byteSize", match_file_byte_size),
     ]
     if skipped_file_metrics:
         file_columns.append(("file.distinctTrigramCount", match_distinct_trigram_count))
+    file_columns.append(("file_url", match_file_url))
     stats_columns: list[tuple[str, Callable[[tuple[str, int]], Any]]] = [
         ("reason", lambda r: r[0]),
         ("count", lambda r: r[1]),
@@ -2528,7 +2582,7 @@ def write_skipped_files_reason(
         endpoint,
         token,
         name,
-        rev,
+        indexed_rev,
         skipped_indexed_query,
         max_retries=max_retries,
     )
@@ -2538,7 +2592,7 @@ def write_skipped_files_reason(
             endpoint,
             token,
             name,
-            rev,
+            indexed_rev,
             matches,
             max_retries,
         )
@@ -2551,23 +2605,27 @@ def write_skipped_files_reason(
         if reason:
             reason_counts[reason] += 1
 
-    # Sort by chunkMatches.content so files with the same NOT-INDEXED reason
-    # are grouped together; ties broken by byteSize, extension, then file_url
-    # Coerce byteSize to int (treating missing values as -1) so an int/str
-    # union can't blow up the comparator
+    # Sort by chunkMatches.content so files with the same NOT-INDEXED reason are
+    # grouped together; ties broken by extension, byteSize, metric, then file_url.
+    # Coerce numeric cells to int so an int/str union can't blow up the comparator.
+    def row_sort_key(row: list[Any]) -> tuple[Any, ...]:
+        byte_size = row[2] if isinstance(row[2], int) else -1
+        metric = row[3] if skipped_file_metrics and isinstance(row[3], int) else -1
+        return (row[0], row[1], byte_size, metric, row[-1])
+
     rows.sort(
-        key=lambda r: (r[0], r[1] if isinstance(r[1], int) else -1, r[2], r[3]),
+        key=row_sort_key,
     )
 
     with files_path.open("w", newline="") as out:
         writer = csv.writer(out)
-        writer.writerow([n for n, _ in file_columns])
+        writer.writerow([name for name, _ in file_columns])
         writer.writerows(rows)
     files_written = len(rows)
 
     with stats_path.open("w", newline="") as out:
         writer = csv.writer(out)
-        writer.writerow([n for n, _ in stats_columns])
+        writer.writerow([name for name, _ in stats_columns])
         for record in reason_counts.most_common():
             writer.writerow([extract(record) for _, extract in stats_columns])
 
@@ -2637,6 +2695,7 @@ class SkippedFileReasonSearchResult:
 
     repository_name: str
     ref_name: str
+    indexed_rev: str
     skipped_count: int
     matches: list[dict[str, Any]]
     match_count: int | None
@@ -2895,16 +2954,20 @@ def collect_skipped_file_reason_search_results(
         display_ref_name,
         skipped_count,
         skipped_indexed_query,
+        indexed_commit_oid,
     ) in refs_with_skipped_file_queries(
         repo,
     ):
-        revision = skipped_file_query_revision(skipped_indexed_query, display_ref_name)
+        indexed_rev = indexed_commit_oid or skipped_file_query_revision(
+            skipped_indexed_query,
+            display_ref_name,
+        )
         try:
             query_result = fetch_skipped_file_reason_query(
                 endpoint,
                 token,
                 repo_name,
-                revision,
+                indexed_rev,
                 skipped_indexed_query,
                 max_retries=max_retries,
             )
@@ -2912,7 +2975,8 @@ def collect_skipped_file_reason_search_results(
             results.append(
                 SkippedFileReasonSearchResult(
                     repository_name=repo_name,
-                    ref_name=revision,
+                    ref_name=display_ref_name,
+                    indexed_rev=indexed_rev,
                     skipped_count=skipped_count,
                     matches=[],
                     match_count=None,
@@ -2929,7 +2993,7 @@ def collect_skipped_file_reason_search_results(
                 endpoint,
                 token,
                 repo_name,
-                revision,
+                indexed_rev,
                 query_result.matches,
                 max_retries,
             )
@@ -2939,7 +3003,8 @@ def collect_skipped_file_reason_search_results(
         results.append(
             SkippedFileReasonSearchResult(
                 repository_name=repo_name,
-                ref_name=revision,
+                ref_name=display_ref_name,
+                indexed_rev=indexed_rev,
                 skipped_count=skipped_count,
                 matches=query_result.matches,
                 match_count=query_result.match_count,
@@ -3020,7 +3085,7 @@ def write_skipped_file_reason_rows(
                 file_url(
                     endpoint,
                     search_result.repository_name,
-                    search_result.ref_name,
+                    search_result.indexed_rev,
                     file_path,
                 ),
             ]
