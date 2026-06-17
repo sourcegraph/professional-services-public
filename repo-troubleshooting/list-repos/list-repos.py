@@ -1266,9 +1266,11 @@ SKIPPED_FILE_METRIC_COLUMNS: list[tuple[str, str, bool, str]] = [
 
 def skipped_file_reason_column_names(skipped_file_metrics: bool) -> list[str]:
     """Return skipped-file detail CSV columns for the enabled modes"""
-    columns = [name for name, _, _, _ in SKIPPED_FILE_REASON_COLUMNS]
-    if skipped_file_metrics:
-        columns.extend(name for name, _, _, _ in SKIPPED_FILE_METRIC_COLUMNS)
+    columns: list[str] = []
+    for name, _, _, _ in SKIPPED_FILE_REASON_COLUMNS:
+        columns.append(name)
+        if skipped_file_metrics and name == "file.byteSize":
+            columns.extend(name for name, _, _, _ in SKIPPED_FILE_METRIC_COLUMNS)
     return columns
 
 
@@ -3104,19 +3106,23 @@ def write_skipped_file_reason_rows(
                 skipped_file_reason(match),
                 file_extension,
                 int(byte_size) if byte_size is not None else "",
-                search_result.skipped_count,
-                file_path,
-                file_url(
-                    endpoint,
-                    search_result.repository_name,
-                    search_result.indexed_rev,
-                    file_path,
-                ),
             ]
             if skipped_file_metrics:
                 row.append(
                     search_result.distinct_trigram_counts_by_path.get(file_path, ""),
                 )
+            row.extend(
+                [
+                    search_result.skipped_count,
+                    file_path,
+                    file_url(
+                        endpoint,
+                        search_result.repository_name,
+                        search_result.indexed_rev,
+                        file_path,
+                    ),
+                ],
+            )
             writer.writerow(
                 row,
             )
