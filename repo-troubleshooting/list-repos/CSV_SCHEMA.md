@@ -23,10 +23,10 @@ rows for it
 | `repos-with-indexing-errors.csv` | at least one repo is cloned but is missing a search index | main columns |
 | `repos-with-skipped-files.csv` | `--skipped-files` is set and the last index excluded files in at least one repo | main columns + skipped-files extras |
 | `skipped-file-reasons.csv` | `--skipped-files-reason` is set without `REPO[@REV]`, and at least one skipped-file detail row is found | skipped-file reason columns, plus skipped-file metrics columns when `--skipped-file-metrics` is set |
-| `stats-*.csv` | `--statistics` is set and repo rows were processed | `bucket,count` (see Statistics section) |
+| `stats-*.csv` | `--stats` is set and repo rows were processed | `bucket,count` (see Stats section) |
 
 The optional `--count-commits` and `--run-search` flags append extra
-columns to the repo-listing CSVs above, excluding the `--statistics`
+columns to the repo-listing CSVs above, excluding the `--stats`
 files and the skipped-file reason detail CSV, in this order: main
 columns → per-CSV extras → commit-count columns → run-search columns
 
@@ -140,15 +140,15 @@ Appended to CSV files when `--run-search PATTERN` is used
 | `runSearch.limitHit` | boolean | | `True` when the search hit a limit, so the results are incomplete |
 | `runSearch.alertTitle` | string | | Title of the search-API alert when the server's `timeout:` budget was exceeded or the query was malformed |
 
-## `--statistics` files
+## `--stats` files
 
-- Written when `--statistics` is used
+- Written when `--stats` is used
 - One CSV file per dimension
 - Each file has two columns listing every bucket in declaration
 order, followed by per-stat summary rows (totals) appended below the
 bucket rows
 - Counts come from the same listing pass that produces the
-main CSV, so enabling `--statistics` adds no extra GraphQL requests
+main CSV, so enabling `--stats` adds no extra GraphQL requests
 
 | File suffix | Buckets | Description |
 | --- | --- | --- |

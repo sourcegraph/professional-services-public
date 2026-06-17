@@ -1275,9 +1275,9 @@ def skipped_file_reason_column_names(skipped_file_metrics: bool) -> list[str]:
     return columns
 
 
-# --- Statistics ---------------------------------------------------------------
+# --- Stats --------------------------------------------------------------------
 
-# --statistics buckets repo/content/index sizes and size ratios during listing
+# --stats buckets repo/content/index sizes and size ratios during listing
 
 # (label, lo_inclusive_mb, hi_exclusive_mb_or_None) — used for the repo and
 # indexed-content size distributions, which span many orders of magnitude
@@ -1325,7 +1325,7 @@ def bucket_label(
 
 
 class StatsCollector:
-    """Accumulate per-repo size and ratio counts for --statistics"""
+    """Accumulate per-repo size and ratio counts for --stats"""
 
     def __init__(self) -> None:
         self.mirror_buckets: collections.Counter[str] = collections.Counter()
@@ -1551,10 +1551,10 @@ rows for it
 | `{DEFAULT_INDEXING_ERRORS_FILE}` | at least one repo is cloned but is missing a search index | main columns |
 | `{DEFAULT_SKIPPED_FILES_FILE}` | `--skipped-files` is set and the last index excluded files in at least one repo | main columns + skipped-files extras |
 | `{DEFAULT_SKIPPED_FILE_REASONS_FILE}` | `--skipped-files-reason` is set without `REPO[@REV]`, and at least one skipped-file detail row is found | skipped-file reason columns, plus skipped-file metrics columns when `--skipped-file-metrics` is set |
-| `{DEFAULT_STATS_FILE_PREFIX}-*.csv` | `--statistics` is set and repo rows were processed | `bucket,count` (see Statistics section) |
+| `{DEFAULT_STATS_FILE_PREFIX}-*.csv` | `--stats` is set and repo rows were processed | `bucket,count` (see Stats section) |
 
 The optional `--count-commits` and `--run-search` flags append extra
-columns to the repo-listing CSVs above, excluding the `--statistics`
+columns to the repo-listing CSVs above, excluding the `--stats`
 files and the skipped-file reason detail CSV, in this order: main
 columns → per-CSV extras → commit-count columns → run-search columns
 
@@ -1603,15 +1603,15 @@ Appended to CSV files when `--run-search PATTERN` is used
 
 {run_search_list}
 
-## `--statistics` files
+## `--stats` files
 
-- Written when `--statistics` is used
+- Written when `--stats` is used
 - One CSV file per dimension
 - Each file has two columns listing every bucket in declaration
 order, followed by per-stat summary rows (totals) appended below the
 bucket rows
 - Counts come from the same listing pass that produces the
-main CSV, so enabling `--statistics` adds no extra GraphQL requests
+main CSV, so enabling `--stats` adds no extra GraphQL requests
 
 {stats_files_list}
 
@@ -3692,9 +3692,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Fetch at most <int> repos (>=1)",
     )
     parser.add_argument(
-        "--statistics",
+        "--stats",
         action="store_true",
-        help="Write statistics CSV files",
+        help="Write stats CSV files",
     )
     parser.add_argument(
         "--count-commits",
@@ -3932,7 +3932,7 @@ def run(args: argparse.Namespace, endpoint: str, token: str, output_dir: Path) -
                 ("--skipped-files", args.skipped_files),
                 ("--count-commits", args.count_commits),
                 ("--run-search", args.run_search is not None),
-                ("--statistics", args.statistics),
+                ("--stats", args.stats),
             )
             if set_
         ]
@@ -3970,7 +3970,7 @@ def run(args: argparse.Namespace, endpoint: str, token: str, output_dir: Path) -
         else None
     )
 
-    stats = StatsCollector() if args.statistics else None
+    stats = StatsCollector() if args.stats else None
     count_commits_enabled = bool(args.count_commits)
     run_search_pattern: str | None = args.run_search
     run_search_enabled = run_search_pattern is not None
@@ -4061,9 +4061,9 @@ def run(args: argparse.Namespace, endpoint: str, token: str, output_dir: Path) -
     if stats is not None and total:
         stats_paths = write_stats(output_dir, stats)
         for stats_path in stats_paths:
-            logger.info("Wrote statistics to %s", stats_path.name)
+            logger.info("Wrote stats to %s", stats_path.name)
     elif stats is not None:
-        logger.info("No repo rows processed; statistics files not written")
+        logger.info("No repo rows processed; stats files not written")
 
     if output_writer.count:
         logger.info("Wrote %d repos to %s", output_writer.count, output_path.name)
