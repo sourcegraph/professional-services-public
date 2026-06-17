@@ -21,8 +21,9 @@ rows for it
 | `repos.csv` | at least one repo row is written | main columns |
 | `repos-with-cloning-errors.csv` | at least one repo has a cloning error | main columns + cloning-error extras |
 | `repos-with-indexing-errors.csv` | at least one repo is cloned but is missing a search index | main columns |
-| `repos-with-skipped-files.csv` | `--skipped-files` is set and the last index excluded files in at least one repo | main columns + skipped-files extras |
-| `skipped-file-reasons.csv` | `--skipped-files-reason` is set without `REPO[@REV]`, and at least one skipped-file detail row is found | skipped-file reason columns, plus skipped-file metrics columns when `--skipped-file-metrics` is set |
+| `skipped-files-repos.csv` | `--skipped-files` is set and the last index excluded files in at least one repo | main columns + skipped-files extras |
+| `skipped-files-reason-details.csv` | `--skipped-files-reason` is set, and at least one skipped-file detail row is found | skipped-file reason columns, plus skipped-file metrics columns when `--skipped-file-metrics` is set |
+| `skipped-files-reason-stats.csv` | `--skipped-files-reason REPO[@REV]` is set, and at least one NOT-INDEXED reason category is found | `reason,count` |
 | `stats-*.csv` | `--stats` is set and repo rows were processed | `bucket,count` (see Stats section) |
 
 The optional `--count-commits` and `--run-search` flags append extra
@@ -79,7 +80,7 @@ Appended to `repos-with-cloning-errors.csv`
 
 ## Skipped-files extras
 
-Appended to `repos-with-skipped-files.csv`
+Appended to `skipped-files-repos.csv`
 
 | Column | Type | Requires admin | Description |
 | --- | --- | --- | --- |
@@ -89,8 +90,8 @@ Appended to `repos-with-skipped-files.csv`
 
 ## Skipped-file reason columns
 
-Written to `skipped-file-reasons.csv` when
-`--skipped-files-reason` is used without `REPO[@REV]`
+Written to `skipped-files-reason-details.csv` when
+`--skipped-files-reason` finds detail rows
 
 | Column | Type | Requires admin | Description |
 | --- | --- | --- | --- |

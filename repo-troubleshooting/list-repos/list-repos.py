@@ -84,8 +84,9 @@ DEFAULT_INDEXING_ERRORS_FILE = "repos-with-indexing-errors.csv"
 DEFAULT_LOG_FILE_STEM = "list-repos"
 DEFAULT_OUTPUT_FILE = "repos.csv"
 DEFAULT_RUNS_DIR = "list-repos-runs"
-DEFAULT_SKIPPED_FILES_FILE = "repos-with-skipped-files.csv"
-DEFAULT_SKIPPED_FILE_REASONS_FILE = "skipped-file-reasons.csv"
+DEFAULT_SKIPPED_FILES_FILE = "skipped-files-repos.csv"
+DEFAULT_SKIPPED_FILE_REASONS_FILE = "skipped-files-reason-details.csv"
+DEFAULT_SKIPPED_FILE_REASON_STATS_FILE = "skipped-files-reason-stats.csv"
 DEFAULT_STATS_FILE_PREFIX = "stats"
 CSV_RECORD_LINE_TERMINATOR = "\r\n"
 DEFAULT_MAX_RETRIES = 5
@@ -1550,7 +1551,8 @@ rows for it
 | `{DEFAULT_CLONING_ERRORS_FILE}` | at least one repo has a cloning error | main columns + cloning-error extras |
 | `{DEFAULT_INDEXING_ERRORS_FILE}` | at least one repo is cloned but is missing a search index | main columns |
 | `{DEFAULT_SKIPPED_FILES_FILE}` | `--skipped-files` is set and the last index excluded files in at least one repo | main columns + skipped-files extras |
-| `{DEFAULT_SKIPPED_FILE_REASONS_FILE}` | `--skipped-files-reason` is set without `REPO[@REV]`, and at least one skipped-file detail row is found | skipped-file reason columns, plus skipped-file metrics columns when `--skipped-file-metrics` is set |
+| `{DEFAULT_SKIPPED_FILE_REASONS_FILE}` | `--skipped-files-reason` is set, and at least one skipped-file detail row is found | skipped-file reason columns, plus skipped-file metrics columns when `--skipped-file-metrics` is set |
+| `{DEFAULT_SKIPPED_FILE_REASON_STATS_FILE}` | `--skipped-files-reason REPO[@REV]` is set, and at least one NOT-INDEXED reason category is found | `reason,count` |
 | `{DEFAULT_STATS_FILE_PREFIX}-*.csv` | `--stats` is set and repo rows were processed | `bucket,count` (see Stats section) |
 
 The optional `--count-commits` and `--run-search` flags append extra
@@ -1579,7 +1581,7 @@ Appended to `{DEFAULT_SKIPPED_FILES_FILE}`
 ## Skipped-file reason columns
 
 Written to `{DEFAULT_SKIPPED_FILE_REASONS_FILE}` when
-`--skipped-files-reason` is used without `REPO[@REV]`
+`--skipped-files-reason` finds detail rows
 
 {skipped_reason_list}
 
@@ -2630,7 +2632,7 @@ def write_skipped_files_reason(
     )
 
     files_writer = LazyCSVWriter(
-        output_dir / "skipped-files.csv",
+        output_dir / DEFAULT_SKIPPED_FILE_REASONS_FILE,
         [name for name, _ in file_columns],
     )
     with files_writer as writer:
@@ -2638,7 +2640,7 @@ def write_skipped_files_reason(
             writer.writerow(row)
 
     stats_writer = LazyCSVWriter(
-        output_dir / "skipped-stats.csv",
+        output_dir / DEFAULT_SKIPPED_FILE_REASON_STATS_FILE,
         [name for name, _ in stats_columns],
     )
     with stats_writer as writer:
@@ -2653,9 +2655,10 @@ def write_skipped_files_reason(
         )
     else:
         logger.info(
-            "No skipped-file matches found for %s@%s; skipped-files.csv not written",
+            "No skipped-file matches found for %s@%s; %s not written",
             name,
             display_rev,
+            DEFAULT_SKIPPED_FILE_REASONS_FILE,
         )
     if stats_writer.count:
         logger.info(
