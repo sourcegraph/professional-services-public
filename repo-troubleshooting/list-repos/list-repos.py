@@ -16,8 +16,9 @@ import re
 import shlex
 import sys
 import textwrap
+import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn, TextIO, cast
@@ -27,6 +28,51 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class RunIssueCounts:
+    """Count warnings, errors, and retries emitted during this run"""
+
+    warnings: int = 0
+    errors: int = 0
+    retries: int = 0
+    _lock: Any = field(default_factory=threading.Lock, init=False, repr=False)
+
+    def reset(self) -> None:
+        """Reset counters before configuring a new run"""
+        with self._lock:
+            self.warnings = 0
+            self.errors = 0
+            self.retries = 0
+
+    def increment_retry(self) -> None:
+        """Count one retry sleep"""
+        with self._lock:
+            self.retries += 1
+
+    def increment_log_record(self, record: logging.LogRecord) -> None:
+        """Count a warning or error log record"""
+        with self._lock:
+            if record.levelno >= logging.ERROR:
+                self.errors += 1
+            elif record.levelno >= logging.WARNING:
+                self.warnings += 1
+
+    def snapshot(self) -> tuple[int, int, int]:
+        """Return stable (errors, warnings, retries) counts"""
+        with self._lock:
+            return self.errors, self.warnings, self.retries
+
+
+RUN_ISSUE_COUNTS = RunIssueCounts()
+
+
+class IssueCountingHandler(logging.Handler):
+    """Logging handler that counts warning and error records without output"""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        RUN_ISSUE_COUNTS.increment_log_record(record)
 
 
 # --- Tune-ables -----------------------------------------------------------------
@@ -586,47 +632,66 @@ def fetch_commit_count(
     max_retries: int = DEFAULT_MAX_RETRIES,
 ) -> tuple[int | None, int | None, float, list[Any]]:
     """Return exact rev count, approximate all-refs count, elapsed time, extras"""
-    empty_extras: list[Any] = [None] * len(COMMIT_COUNT_OPTIMIZATION_COLUMNS)
     start = time.monotonic()
-    try:
-        data = graphql_request(
-            endpoint,
-            token,
-            COMMIT_COUNT_QUERY,
-            {
-                "name": repo_name,
-                "rev": rev,
-                "allRefsSearch": build_all_refs_search(repo_name),
-            },
-            timeout=REQUEST_TIMEOUT_SECONDS_WITH_COMMIT_COUNT,
-            max_retries=max_retries,
-            request_description=f"Commit count for {repo_name}",
+
+    def validate(data: dict[str, Any]) -> None:
+        repo_block = require_dict(data.get("repository"), "commit-count repository")
+        commit_block = require_dict(
+            repo_block.get("commit"),
+            "commit-count commit",
+            retryable=False,
         )
-    except (GraphQLError, HTTPRequestError) as exc:
-        elapsed = time.monotonic() - start
-        logger.warning("commit-count query failed for %s: %s", repo_name, exc)
-        return None, None, elapsed, empty_extras
-    except (OSError, http.client.HTTPException, json.JSONDecodeError) as exc:
-        elapsed = time.monotonic() - start
-        logger.warning(
-            "commit-count network error for %s: %s",
-            repo_name,
-            exc,
+        ancestors_block = require_dict(
+            commit_block.get("ancestors"),
+            "commit-count ancestors",
         )
-        return None, None, elapsed, empty_extras
-    elapsed = time.monotonic() - start
-    repo: dict[str, Any] = data.get("repository") or {}
-    commit: dict[str, Any] = repo.get("commit") or {}
-    ancestors: dict[str, Any] = commit.get("ancestors") or {}
-    default_count_raw = ancestors.get("totalCount")
-    default_count: int | None = (
-        default_count_raw if isinstance(default_count_raw, int) else None
+        require_int(
+            ancestors_block.get("totalCount"),
+            "commit-count default branch totalCount",
+        )
+        search_block = require_dict(data.get("search"), "commit-count search")
+        search_results = require_dict(
+            search_block.get("results"),
+            "commit-count search results",
+        )
+        require_int(
+            search_results.get("matchCount"), "commit-count all-refs matchCount"
+        )
+
+    data = graphql_request_with_validation(
+        endpoint,
+        token,
+        COMMIT_COUNT_QUERY,
+        {
+            "name": repo_name,
+            "rev": rev,
+            "allRefsSearch": build_all_refs_search(repo_name),
+        },
+        timeout=REQUEST_TIMEOUT_SECONDS_WITH_COMMIT_COUNT,
+        max_retries=max_retries,
+        request_description=f"Commit count for {repo_name}",
+        validate=validate,
     )
-    search_block: dict[str, Any] = data.get("search") or {}
-    search_results: dict[str, Any] = search_block.get("results") or {}
-    all_refs_count_raw = search_results.get("matchCount")
-    all_refs_count: int | None = (
-        all_refs_count_raw if isinstance(all_refs_count_raw, int) else None
+    elapsed = time.monotonic() - start
+    repo = require_dict(data.get("repository"), "commit-count repository")
+    commit = require_dict(
+        repo.get("commit"),
+        "commit-count commit",
+        retryable=False,
+    )
+    ancestors = require_dict(commit.get("ancestors"), "commit-count ancestors")
+    default_count = require_int(
+        ancestors.get("totalCount"),
+        "commit-count default branch totalCount",
+    )
+    search_block = require_dict(data.get("search"), "commit-count search")
+    search_results = require_dict(
+        search_block.get("results"),
+        "commit-count search results",
+    )
+    all_refs_count = require_int(
+        search_results.get("matchCount"),
+        "commit-count all-refs matchCount",
     )
     optimization_values = [
         extract(repo) for _, extract, _, _, _ in COMMIT_COUNT_OPTIMIZATION_COLUMNS
@@ -644,26 +709,23 @@ def fetch_run_search(
     """Return --run-search match count, elapsed time, limit flag, and alert"""
     start = time.monotonic()
     query = build_run_search_query(repo_name, pattern)
-    try:
-        data = graphql_request(
-            endpoint,
-            token,
-            RUN_SEARCH_GRAPHQL,
-            {"query": query},
-            max_retries=max_retries,
-            request_description=f"Search {pattern} in {repo_name}",
-        )
-    except (GraphQLError, HTTPRequestError) as exc:
-        elapsed = time.monotonic() - start
-        logger.warning("run-search query failed for %s: %s", repo_name, exc)
-        return None, elapsed, False, None
-    except (OSError, http.client.HTTPException, json.JSONDecodeError) as exc:
-        elapsed = time.monotonic() - start
-        logger.warning("run-search network error for %s: %s", repo_name, exc)
-        return None, elapsed, False, None
+
+    def validate(data: dict[str, Any]) -> None:
+        search_block = require_dict(data.get("search"), "run-search search")
+        require_dict(search_block.get("results"), "run-search results")
+
+    data = graphql_request_with_validation(
+        endpoint,
+        token,
+        RUN_SEARCH_GRAPHQL,
+        {"query": query},
+        max_retries=max_retries,
+        request_description=f"Search {pattern} in {repo_name}",
+        validate=validate,
+    )
     elapsed = time.monotonic() - start
-    search_block: dict[str, Any] = data.get("search") or {}
-    results: dict[str, Any] = search_block.get("results") or {}
+    search_block = require_dict(data.get("search"), "run-search search")
+    results = require_dict(search_block.get("results"), "run-search results")
     raw_count = results.get("matchCount")
     match_count: int | None = raw_count if isinstance(raw_count, int) else None
     limit_hit = bool(results.get("limitHit"))
@@ -1482,6 +1544,10 @@ class GraphQLError(RuntimeError):
     """Raised when the Sourcegraph GraphQL API returns errors"""
 
 
+class NonRetryableGraphQLError(GraphQLError):
+    """Raised when GraphQL data is missing for a deterministic reason"""
+
+
 class HTTPRequestError(RuntimeError):
     """Raised when the server returns a definitive 4xx/5xx HTTP response"""
 
@@ -1500,6 +1566,15 @@ class HTTPRequestError(RuntimeError):
         self.url = url
         self.headers = headers
         self.body = body
+
+
+REQUEST_FAILURE_TYPES = (
+    GraphQLError,
+    HTTPRequestError,
+    OSError,
+    http.client.HTTPException,
+    json.JSONDecodeError,
+)
 
 
 @dataclass(frozen=True)
@@ -1637,6 +1712,7 @@ def retry_delay_seconds(retry_number: int) -> int:
 def sleep_before_retry(reason: str, retry_number: int, max_retries: int) -> None:
     """Log and sleep before the next retry attempt for this request"""
     delay = retry_delay_seconds(retry_number)
+    RUN_ISSUE_COUNTS.increment_retry()
     logger.warning(
         "%s; retrying (%d/%d) in %ds...",
         reason,
@@ -1678,6 +1754,97 @@ def summarize_graphql_errors(errors: object) -> str:
         return str(errors)
     messages = [graphql_error_message(error) for error in errors]
     return "; ".join(messages)
+
+
+def request_error_summary(error: Exception) -> str:
+    """Return a compact request failure string for logs"""
+    if isinstance(error, HTTPRequestError):
+        body = error.body.decode(errors="replace").strip()
+        if body:
+            return f"HTTP {error.status} {error.reason}: {body}"
+        return f"HTTP {error.status} {error.reason}"
+    return str(error)
+
+
+def request_failure_can_retry(error: Exception) -> bool:
+    """Return True if the request failure should consume retry budget"""
+    if isinstance(error, NonRetryableGraphQLError):
+        return False
+    if isinstance(error, HTTPRequestError):
+        return retryable_http_error(error)
+    return True
+
+
+def require_dict(
+    value: object,
+    description: str,
+    *,
+    retryable: bool = True,
+) -> dict[str, Any]:
+    """Return value as a dict, or raise GraphQLError for validation"""
+    if isinstance(value, dict):
+        return value
+    msg = f"{description} missing or not an object"
+    if retryable:
+        raise GraphQLError(msg)
+    raise NonRetryableGraphQLError(msg)
+
+
+def require_int(value: object, description: str) -> int:
+    """Return value as an int, or raise GraphQLError for validation"""
+    if isinstance(value, bool):
+        msg = f"{description} missing or not an integer"
+        raise GraphQLError(msg)
+    if isinstance(value, int):
+        return value
+    msg = f"{description} missing or not an integer"
+    raise GraphQLError(msg)
+
+
+def graphql_request_with_validation(
+    endpoint: str,
+    token: str,
+    query: str,
+    variables: dict[str, Any],
+    *,
+    timeout: int = REQUEST_TIMEOUT_SECONDS,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    request_description: str,
+    validate: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """Run a GraphQL request and retry transport, GraphQL, and shape errors"""
+    for retry_count in range(max_retries + 1):
+        retry_number = retry_count + 1
+        try:
+            data = graphql_request(
+                endpoint,
+                token,
+                query,
+                variables,
+                timeout=timeout,
+                max_retries=0,
+                request_description=request_description,
+            )
+            if validate is not None:
+                validate(data)
+            return data
+        except REQUEST_FAILURE_TYPES as error:
+            error_summary = request_error_summary(error)
+            if retry_count >= max_retries or not request_failure_can_retry(error):
+                logger.error(
+                    "%s failed after %d attempt(s): %s",
+                    request_description,
+                    retry_number,
+                    error_summary,
+                )
+                raise
+            sleep_before_retry(
+                f"{request_description} failed: {error_summary}",
+                retry_number,
+                max_retries,
+            )
+    msg = f"{request_description} retry loop exhausted unexpectedly"
+    raise RuntimeError(msg)
 
 
 def graphql_request(
@@ -1723,27 +1890,27 @@ def graphql_request(
 
         errors = response.get("errors")
         if not errors:
-            return response["data"]
+            data = response.get("data")
+            if isinstance(data, dict):
+                return data
+            if retry_count < max_retries:
+                sleep_before_retry(
+                    f"{retry_prefix}GraphQL response data missing or not an object",
+                    retry_number,
+                    max_retries,
+                )
+                continue
+            raise GraphQLError("GraphQL response data missing or not an object")
 
-        if has_retryable_graphql_error(errors) and retry_count < max_retries:
+        if retry_count < max_retries:
+            retry_label = "retryable " if has_retryable_graphql_error(errors) else ""
             sleep_before_retry(
-                f"{retry_prefix}GraphQL returned retryable error(s): "
-                + summarize_graphql_errors(errors),
+                f"{retry_prefix}GraphQL returned {retry_label}error(s): "
+                f"{summarize_graphql_errors(errors)}",
                 retry_number,
                 max_retries,
             )
             continue
-
-        # GraphQL can return both `errors` and partial `data`. If we have data,
-        # log the errors and keep going; only abort if no data was returned.
-        if response.get("data"):
-            logger.warning(
-                "%sGraphQL returned %d partial error(s): %s",
-                retry_prefix,
-                len(errors) if isinstance(errors, list) else 1,
-                json.dumps(errors, indent=2),
-            )
-            return response["data"]
         msg = f"GraphQL errors: {json.dumps(errors, indent=2)}"
         raise GraphQLError(msg)
     msg = "graphql_request retry loop exhausted unexpectedly"
@@ -1803,11 +1970,11 @@ def supports_text_search_index_failure_fields(
             token,
             max_retries=max_retries,
         )
-    except (GraphQLError, HTTPRequestError, OSError) as error:
-        logger.warning(
+    except REQUEST_FAILURE_TYPES as error:
+        logger.error(
             "Could not inspect Sourcegraph schema for new text-search index "
             "failure fields (requires v7.5.0); leaving those CSV columns blank: %s",
-            error,
+            request_error_summary(error),
         )
         return False
 
@@ -1854,7 +2021,7 @@ def trigger_reclone(
     repo_id: str,
     max_retries: int = DEFAULT_MAX_RETRIES,
 ) -> bool:
-    """Send recloneRepository mutation. Returns True on success, False on GraphQL error"""
+    """Send recloneRepository mutation. Returns True on success, False on request error"""
     try:
         graphql_request(
             endpoint,
@@ -1864,8 +2031,12 @@ def trigger_reclone(
             max_retries=max_retries,
             request_description=f"Reclone repository {repo_id}",
         )
-    except (GraphQLError, HTTPRequestError) as exc:
-        logger.warning("recloneRepository failed for %s: %s", repo_id, exc)
+    except REQUEST_FAILURE_TYPES as error:
+        logger.error(
+            "recloneRepository failed for %s: %s",
+            repo_id,
+            request_error_summary(error),
+        )
         return False
     return True
 
@@ -1876,7 +2047,7 @@ def trigger_reindex(
     repo_id: str,
     max_retries: int = DEFAULT_MAX_RETRIES,
 ) -> bool:
-    """Send reindexRepository mutation. Returns True on success, False on GraphQL error"""
+    """Send reindexRepository mutation. Returns True on success, False on request error"""
     try:
         graphql_request(
             endpoint,
@@ -1886,8 +2057,12 @@ def trigger_reindex(
             max_retries=max_retries,
             request_description=f"Reindex repository {repo_id}",
         )
-    except (GraphQLError, HTTPRequestError) as exc:
-        logger.warning("reindexRepository failed for %s: %s", repo_id, exc)
+    except REQUEST_FAILURE_TYPES as error:
+        logger.error(
+            "reindexRepository failed for %s: %s",
+            repo_id,
+            request_error_summary(error),
+        )
         return False
     return True
 
@@ -2080,7 +2255,12 @@ def fetch_skipped_file_reason_query(
     """Return NOT-INDEXED matches and search metadata for one indexed repo ref"""
     start = time.monotonic()
     search_query = skipped_file_reason_search_query(skipped_indexed_query, name, rev)
-    data = graphql_request(
+
+    def validate(data: dict[str, Any]) -> None:
+        search_block = require_dict(data.get("search"), "skipped-file reason search")
+        require_dict(search_block.get("results"), "skipped-file reason results")
+
+    data = graphql_request_with_validation(
         endpoint,
         token,
         SKIPPED_FILES_REASON_QUERY,
@@ -2088,16 +2268,14 @@ def fetch_skipped_file_reason_query(
         timeout=REQUEST_TIMEOUT_SECONDS_WITH_COMMIT_COUNT,
         max_retries=max_retries,
         request_description=f"Skipped files for {name}@{rev}",
+        validate=validate,
     )
     elapsed = time.monotonic() - start
-    search_block = data.get("search")
-    if not isinstance(search_block, dict):
-        msg = f"skipped-file reason search returned no search data for {name}@{rev}"
-        raise GraphQLError(msg)
-    results_block = search_block.get("results")
-    if not isinstance(results_block, dict):
-        msg = f"skipped-file reason search returned no results data for {name}@{rev}"
-        raise GraphQLError(msg)
+    search_block = require_dict(data.get("search"), "skipped-file reason search")
+    results_block = require_dict(
+        search_block.get("results"),
+        "skipped-file reason results",
+    )
     raw_results: list[dict[str, Any] | None] = results_block.get("results") or []
     # Non-FileMatch results come back as empty objects; drop them
     matches = [result for result in raw_results if result and result.get("file")]
@@ -2578,13 +2756,7 @@ def collect_skipped_file_reason_search_results(
                 skipped_indexed_query,
                 max_retries=max_retries,
             )
-        except (
-            GraphQLError,
-            HTTPRequestError,
-            OSError,
-            http.client.HTTPException,
-            json.JSONDecodeError,
-        ) as error:
+        except REQUEST_FAILURE_TYPES as error:
             results.append(
                 SkippedFileReasonSearchResult(
                     repository_name=repo_name,
@@ -2595,7 +2767,7 @@ def collect_skipped_file_reason_search_results(
                     limit_hit=False,
                     alert_title=None,
                     alert_description=None,
-                    error=str(error),
+                    error=request_error_summary(error),
                 ),
             )
             continue
@@ -2623,12 +2795,6 @@ def write_skipped_file_reason_rows(
     """Append skipped-file detail rows from per-ref search results"""
     for search_result in search_results:
         if search_result.error is not None:
-            logger.warning(
-                "Skipped-file reason search failed for %s@%s: %s",
-                search_result.repository_name,
-                search_result.ref_name,
-                search_result.error,
-            )
             continue
         alert_parts = [
             part
@@ -2706,11 +2872,13 @@ class RepoProcessingResult:
     commit_count: int | None
     all_refs_count: int | None
     commit_elapsed_seconds: float | None
+    commit_error: str | None
     optimization_values: list[Any] | None
     search_match_count: int | None
     search_elapsed_seconds: float | None
     search_limit_hit: bool
     search_alert_title: str | None
+    search_error: str | None
     skipped_file_reason_search_results: list[SkippedFileReasonSearchResult]
 
 
@@ -2732,39 +2900,47 @@ def collect_repo_processing_result(
     commit_count: int | None = None
     all_refs_count: int | None = None
     commit_elapsed_seconds: float | None = None
+    commit_error: str | None = None
     optimization_values: list[Any] | None = None
     search_match_count: int | None = None
     search_elapsed_seconds: float | None = None
     search_limit_hit = False
     search_alert_title: str | None = None
+    search_error: str | None = None
     skipped_file_reason_search_results: list[SkippedFileReasonSearchResult] = []
     repo_name = str(repo.get("name") or "")
     if count_commits:
-        (
-            commit_count,
-            all_refs_count,
-            commit_elapsed_seconds,
-            optimization_values,
-        ) = fetch_commit_count(
-            endpoint,
-            token,
-            repo_name,
-            count_commits_rev,
-            max_retries=max_retries,
-        )
+        try:
+            (
+                commit_count,
+                all_refs_count,
+                commit_elapsed_seconds,
+                optimization_values,
+            ) = fetch_commit_count(
+                endpoint,
+                token,
+                repo_name,
+                count_commits_rev,
+                max_retries=max_retries,
+            )
+        except REQUEST_FAILURE_TYPES as error:
+            commit_error = request_error_summary(error)
     if run_search_pattern is not None:
-        (
-            search_match_count,
-            search_elapsed_seconds,
-            search_limit_hit,
-            search_alert_title,
-        ) = fetch_run_search(
-            endpoint,
-            token,
-            repo_name,
-            run_search_pattern,
-            max_retries=max_retries,
-        )
+        try:
+            (
+                search_match_count,
+                search_elapsed_seconds,
+                search_limit_hit,
+                search_alert_title,
+            ) = fetch_run_search(
+                endpoint,
+                token,
+                repo_name,
+                run_search_pattern,
+                max_retries=max_retries,
+            )
+        except REQUEST_FAILURE_TYPES as error:
+            search_error = request_error_summary(error)
     if skipped_file_reasons and has_skipped_files(repo):
         skipped_file_reason_search_results = collect_skipped_file_reason_search_results(
             endpoint,
@@ -2780,11 +2956,13 @@ def collect_repo_processing_result(
         commit_count=commit_count,
         all_refs_count=all_refs_count,
         commit_elapsed_seconds=commit_elapsed_seconds,
+        commit_error=commit_error,
         optimization_values=optimization_values,
         search_match_count=search_match_count,
         search_elapsed_seconds=search_elapsed_seconds,
         search_limit_hit=search_limit_hit,
         search_alert_title=search_alert_title,
+        search_error=search_error,
         skipped_file_reason_search_results=skipped_file_reason_search_results,
     )
 
@@ -2826,7 +3004,7 @@ def log_processing_result(
     repo_label = (
         result.repo.get("name") or result.repo.get("url") or result.repo.get("id")
     )
-    if count_commits:
+    if count_commits and result.commit_error is None:
         default_str = "?" if result.commit_count is None else f"{result.commit_count}"
         all_refs_str = (
             "?" if result.all_refs_count is None else f"{result.all_refs_count}"
@@ -2850,7 +3028,7 @@ def log_processing_result(
                 all_refs_str,
                 elapsed,
             )
-    if run_search_pattern is not None:
+    if run_search_pattern is not None and result.search_error is None:
         count_str = (
             "?" if result.search_match_count is None else f"{result.search_match_count}"
         )
@@ -3675,11 +3853,14 @@ def timestamped_log_path() -> Path:
 
 def configure_logging(log_path: Path) -> None:
     """Send INFO-level logs to both stderr (live feedback) and log_path"""
+    RUN_ISSUE_COUNTS.reset()
     root = logging.getLogger()
     root.setLevel(logging.INFO)
     # Clear existing handlers (e.g. on re-entry from tests)
     for handler in list(root.handlers):
         root.removeHandler(handler)
+
+    root.addHandler(IssueCountingHandler(level=logging.WARNING))
 
     stderr_handler = logging.StreamHandler(sys.stderr)
     stderr_handler.setFormatter(logging.Formatter("%(message)s"))
@@ -3712,6 +3893,17 @@ def _log_uncaught_exception(
     )
 
 
+def log_run_issue_summary() -> None:
+    """Log final warning, error, and retry counts"""
+    errors, warnings, retries = RUN_ISSUE_COUNTS.snapshot()
+    logger.info(
+        "Run issue summary: errors=%d warnings=%d retries=%d",
+        errors,
+        warnings,
+        retries,
+    )
+
+
 def main() -> None:
     """Entry point: configure logging, load env, parse args, run, handle errors"""
     configure_logging(timestamped_log_path())
@@ -3721,17 +3913,20 @@ def main() -> None:
     args = parse_args(sys.argv[1:])
     # Schema generation is offline and credential-free
     if args.write_csv_schema:
-        write_csv_schema(Path(DEFAULT_CSV_SCHEMA_FILE))
+        try:
+            write_csv_schema(Path(DEFAULT_CSV_SCHEMA_FILE))
+        finally:
+            log_run_issue_summary()
         return
-    load_dotenv()
-    endpoint, token = require_credentials(args)
-    logger.info(
-        "Running: %s (SRC_ENDPOINT=%s)",
-        redact_argv_for_log(sys.argv),
-        endpoint,
-    )
 
     try:
+        load_dotenv()
+        endpoint, token = require_credentials(args)
+        logger.info(
+            "Running: %s (SRC_ENDPOINT=%s)",
+            redact_argv_for_log(sys.argv),
+            endpoint,
+        )
         run(args, endpoint, token)
     except HTTPRequestError as exc:
         log_http_error(exc)
@@ -3752,6 +3947,8 @@ def main() -> None:
         else:
             logger.exception("GraphQL request failed")
         sys.exit(1)
+    finally:
+        log_run_issue_summary()
 
 
 if __name__ == "__main__":
