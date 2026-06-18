@@ -122,6 +122,14 @@ RETRYABLE_GRAPHQL_ERROR_TERMS = (
     "transport:",
 )
 TOO_MANY_TRIGRAMS_REASON = "contains too many trigrams"
+SKIPPED_FILE_REASON_CODES_BY_EXPLANATION = {
+    "contains binary content": "binary",
+    "contains too many trigrams": "too_many_trigrams",
+    "contains too few trigrams": "too_few_trigrams",
+    "exceeds the maximum size limit": "too_large",
+    "object missing from repository": "object_missing",
+    "unknown skip reason": "unknown",
+}
 SORTED_CSV_OUTPUTS: tuple[tuple[str, tuple[str, ...]], ...] = (
     (DEFAULT_OUTPUT_FILE, ("url",)),
     (DEFAULT_CLONING_ERRORS_FILE, ("url",)),
@@ -129,7 +137,7 @@ SORTED_CSV_OUTPUTS: tuple[tuple[str, tuple[str, ...]], ...] = (
     (DEFAULT_SKIPPED_FILES_FILE, ("url",)),
     (
         DEFAULT_SKIPPED_FILE_REASONS_FILE,
-        ("repository.name", "rev", "reason", "file.extension", "file.path"),
+        ("reason", "file.extension", "rev", "file_url"),
     ),
 )
 
@@ -1195,8 +1203,7 @@ CLONING_ERROR_CSV_COLUMNS = CSV_COLUMNS + [
 
 # Extra columns appended only to the skipped-files CSV. The query is the
 # Sourcegraph search query produced by the API; running it lists each skipped
-# file along with its NOT-INDEXED reason (too-large / binary / too-many-trigrams
-# / too-small / blob-missing)
+# file along with its NOT-INDEXED reason.
 SKIPPED_FILES_EXTRA_COLUMNS: list[
     tuple[str, Callable[[dict[str, Any]], Any], str, bool, str]
 ] = [
@@ -1230,20 +1237,8 @@ SKIPPED_FILES_CSV_COLUMNS = CSV_COLUMNS + [
 
 SKIPPED_FILE_REASON_COLUMNS: list[tuple[str, str, bool, str]] = [
     (
-        "repository.name",
-        "Sourcegraph repository name containing the skipped file",
-        False,
-        "string",
-    ),
-    (
-        "rev",
-        "Indexed revision parsed from Sourcegraph's skippedIndexed.query",
-        False,
-        "string",
-    ),
-    (
         "reason",
-        "NOT-INDEXED reason parsed from the indexed placeholder content",
+        "Compact NOT-INDEXED reason parsed from the indexed placeholder content",
         False,
         "string",
     ),
@@ -1260,14 +1255,16 @@ SKIPPED_FILE_REASON_COLUMNS: list[tuple[str, str, bool, str]] = [
         "integer",
     ),
     (
-        "repoRevSkippedIndexed.count",
-        "Count Sourcegraph reported for this repo/ref before running the details search",
+        "file.distinctTrigramCount",
+        "Distinct three-rune trigrams computed from GitBlob.content. "
+        "Only populated with --skipped-file-metrics for skipped files whose "
+        "reason is `too_many_trigrams`",
         False,
         "integer",
     ),
     (
-        "file.path",
-        "Path of the skipped file within the repository",
+        "rev",
+        "Indexed ref containing the skipped file",
         False,
         "string",
     ),
@@ -1279,25 +1276,10 @@ SKIPPED_FILE_REASON_COLUMNS: list[tuple[str, str, bool, str]] = [
     ),
 ]
 
-SKIPPED_FILE_METRIC_COLUMNS: list[tuple[str, str, bool, str]] = [
-    (
-        "file.distinctTrigramCount",
-        "Distinct three-rune trigrams computed from GitBlob.content. "
-        "Only populated for skipped files whose reason is `contains too many trigrams`",
-        False,
-        "integer",
-    ),
-]
 
-
-def skipped_file_reason_column_names(skipped_file_metrics: bool) -> list[str]:
-    """Return skipped-file detail CSV columns for the enabled modes"""
-    columns: list[str] = []
-    for name, _, _, _ in SKIPPED_FILE_REASON_COLUMNS:
-        columns.append(name)
-        if skipped_file_metrics and name == "file.byteSize":
-            columns.extend(name for name, _, _, _ in SKIPPED_FILE_METRIC_COLUMNS)
-    return columns
+def skipped_file_reason_column_names() -> list[str]:
+    """Return skipped-file detail CSV columns"""
+    return [name for name, _, _, _ in SKIPPED_FILE_REASON_COLUMNS]
 
 
 # --- Stats --------------------------------------------------------------------
@@ -1562,7 +1544,6 @@ def write_csv_schema(path: Path) -> None:
     cloning_list = format_columns_list(name_desc(CLONING_ERROR_EXTRA_COLUMNS))
     skipped_list = format_columns_list(name_desc(SKIPPED_FILES_EXTRA_COLUMNS))
     skipped_reason_list = format_columns_list(SKIPPED_FILE_REASON_COLUMNS)
-    skipped_metrics_list = format_columns_list(SKIPPED_FILE_METRIC_COLUMNS)
     commit_count_list = format_columns_list(COMMIT_COUNT_COLUMNS)
     run_search_list = format_columns_list(RUN_SEARCH_COLUMNS)
     stats_files_list = format_stats_files_list()
@@ -1592,7 +1573,7 @@ rows for it
 | `{DEFAULT_CLONING_ERRORS_FILE}` | at least one repo has a cloning error | main columns + cloning-error extras |
 | `{DEFAULT_INDEXING_ERRORS_FILE}` | at least one repo is cloned but is missing a search index | main columns |
 | `{DEFAULT_SKIPPED_FILES_FILE}` | `--skipped-files` is set and the last index excluded files in at least one repo | main columns + skipped-files extras |
-| `{DEFAULT_SKIPPED_FILE_REASONS_FILE}` | `--skipped-files-reason` is set, and at least one skipped-file detail row is found | skipped-file reason columns, plus skipped-file metrics columns when `--skipped-file-metrics` is set |
+| `{DEFAULT_SKIPPED_FILE_REASONS_FILE}` | `--skipped-files-reason` is set, and at least one skipped-file detail row is found | skipped-file reason columns |
 | `{DEFAULT_SKIPPED_FILE_REASON_STATS_FILE}` | `--skipped-files-reason REPO[@REV]` is set, and at least one NOT-INDEXED reason category is found | `reason,count` |
 | `{DEFAULT_STATS_FILE_PREFIX}-*.csv` | `--stats` is set and repo rows were processed | `bucket,count` (see Stats section) |
 
@@ -1631,14 +1612,6 @@ Written to `{DEFAULT_SKIPPED_FILE_REASONS_FILE}` when
 `--skipped-files-reason` finds detail rows
 
 {skipped_reason_list}
-
-## Skipped-file metrics columns
-
-Appended to skipped-file detail CSVs only when `--skipped-file-metrics`
-is used. These columns may require extra GitBlob content requests, and are
-therefore not fetched by default
-
-{skipped_metrics_list}
 
 ## `--count-commits` columns
 
@@ -2389,7 +2362,7 @@ def file_url(endpoint: str, repo_name: str, rev: str, file_path: str) -> str:
 
 
 def skipped_file_reason(match: dict[str, Any]) -> str:
-    """Extract the NOT-INDEXED reason from a skipped-file search match"""
+    """Extract the NOT-INDEXED explanation from a skipped-file search match"""
     chunks: list[dict[str, Any]] = match.get("chunkMatches") or []
     for chunk in chunks:
         reason_match = re.search(
@@ -2399,6 +2372,23 @@ def skipped_file_reason(match: dict[str, Any]) -> str:
         if reason_match:
             return reason_match.group(1).strip()
     return ""
+
+
+def skipped_file_reason_code(explanation: str) -> str:
+    """Return the compact CSV reason value for a NOT-INDEXED explanation"""
+    if not explanation:
+        return ""
+    if explanation in SKIPPED_FILE_REASON_CODES_BY_EXPLANATION:
+        return SKIPPED_FILE_REASON_CODES_BY_EXPLANATION[explanation]
+    normalized_explanation = re.sub(r"[^a-z0-9]+", "_", explanation.lower()).strip(
+        "_",
+    )
+    return normalized_explanation or "unknown"
+
+
+def skipped_file_reason_value(match: dict[str, Any]) -> str:
+    """Return the skipped-file detail CSV value for reason"""
+    return skipped_file_reason_code(skipped_file_reason(match))
 
 
 def skipped_file_needs_metrics(match: dict[str, Any]) -> bool:
@@ -2659,7 +2649,7 @@ def write_skipped_files_reason(
 
     reason_counts: collections.Counter[str] = collections.Counter()
     for match in matches:
-        reason = skipped_file_reason(match)
+        reason = skipped_file_reason_value(match)
         if reason:
             reason_counts[reason] += 1
 
@@ -2679,7 +2669,7 @@ def write_skipped_files_reason(
 
     files_writer = LazyCSVWriter(
         output_dir / DEFAULT_SKIPPED_FILE_REASONS_FILE,
-        skipped_file_reason_column_names(skipped_file_metrics),
+        skipped_file_reason_column_names(),
     )
     with files_writer as writer:
         write_skipped_file_reason_rows(
@@ -3296,29 +3286,24 @@ def write_skipped_file_reason_rows(
             file_path = str(file_obj.get("path") or "")
             byte_size = file_obj.get("byteSize")
             file_extension = Path(file_path).suffix.lstrip(".")
+            distinct_trigram_count: int | str = ""
+            if skipped_file_metrics:
+                distinct_trigram_count = (
+                    search_result.distinct_trigram_counts_by_path.get(file_path, "")
+                )
             row = [
-                search_result.repository_name,
-                search_result.ref_name,
-                skipped_file_reason(match),
+                skipped_file_reason_value(match),
                 file_extension,
                 int(byte_size) if byte_size is not None else "",
-            ]
-            if skipped_file_metrics:
-                row.append(
-                    search_result.distinct_trigram_counts_by_path.get(file_path, ""),
-                )
-            row.extend(
-                [
-                    search_result.skipped_count,
+                distinct_trigram_count,
+                search_result.ref_name,
+                file_url(
+                    endpoint,
+                    search_result.repository_name,
+                    search_result.indexed_rev,
                     file_path,
-                    file_url(
-                        endpoint,
-                        search_result.repository_name,
-                        search_result.indexed_rev,
-                        file_path,
-                    ),
-                ],
-            )
+                ),
+            ]
             writer.writerow(
                 row,
             )
@@ -4216,7 +4201,7 @@ def run(args: argparse.Namespace, endpoint: str, token: str, output_dir: Path) -
     skipped_file_reason_writer = (
         LazyCSVWriter(
             skipped_file_reasons_path,
-            skipped_file_reason_column_names(args.skipped_file_metrics),
+            skipped_file_reason_column_names(),
         )
         if skipped_file_reasons_path is not None
         else None
