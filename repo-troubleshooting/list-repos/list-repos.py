@@ -1839,17 +1839,39 @@ def retry_delay_seconds(retry_number: int) -> int:
     return 2 ** (retry_number - 1)
 
 
-def sleep_before_retry(reason: str, retry_number: int, max_retries: int) -> None:
+def retry_message_label(message: str) -> str:
+    """Return log suffix for a retry failure message"""
+    if message.startswith("GraphQL errors:"):
+        return message
+    return f"message: {message}"
+
+
+def sleep_before_retry(
+    reason: str,
+    retry_number: int,
+    max_retries: int,
+    message: str | None = None,
+) -> None:
     """Log and sleep before the next retry attempt for this request"""
     delay = retry_delay_seconds(retry_number)
     RUN_ISSUE_COUNTS.increment_retry()
-    logger.warning(
-        "%s; retrying (%d/%d) in %ds...",
-        reason,
-        retry_number,
-        max_retries,
-        delay,
-    )
+    if message is None:
+        logger.warning(
+            "%s; retrying (%d/%d) in %ds",
+            reason,
+            retry_number,
+            max_retries,
+            delay,
+        )
+    else:
+        logger.warning(
+            "%s; retrying (%d/%d) in %ds; %s",
+            reason,
+            retry_number,
+            max_retries,
+            delay,
+            retry_message_label(message),
+        )
     time.sleep(delay)
 
 
@@ -1973,9 +1995,10 @@ def graphql_request_with_validation(
                 )
                 raise
             sleep_before_retry(
-                f"{request_description} failed: {error_summary}",
+                f"{request_description} failed",
                 retry_number,
                 max_retries,
+                message=error_summary,
             )
     msg = f"{request_description} retry loop exhausted unexpectedly"
     raise RuntimeError(msg)
@@ -1998,7 +2021,7 @@ def graphql_request(
         "Content-Type": "application/json",
         "User-Agent": "list-repos/0.0.1",
     }
-    retry_prefix = f"{request_description}: " if request_description else ""
+    request_label = request_description or "GraphQL request"
     for retry_count in range(max_retries + 1):
         retry_number = retry_count + 1
         try:
@@ -2007,18 +2030,20 @@ def graphql_request(
             if not retryable_http_error(error) or retry_count >= max_retries:
                 raise
             sleep_before_retry(
-                f"{retry_prefix}HTTP {error.status} {error.reason}",
+                f"{request_label} failed",
                 retry_number,
                 max_retries,
+                message=request_error_summary(error),
             )
             continue
         except (OSError, http.client.HTTPException, json.JSONDecodeError) as error:
             if retry_count >= max_retries:
                 raise
             sleep_before_retry(
-                f"{retry_prefix}Request failed: {error}",
+                f"{request_label} failed",
                 retry_number,
                 max_retries,
+                message=truncate_log_text(str(error)),
             )
             continue
 
@@ -2029,9 +2054,10 @@ def graphql_request(
                 return data
             if retry_count < max_retries:
                 sleep_before_retry(
-                    f"{retry_prefix}GraphQL response data missing or not an object",
+                    f"{request_label} failed",
                     retry_number,
                     max_retries,
+                    message="GraphQL response data missing or not an object",
                 )
                 continue
             raise GraphQLError("GraphQL response data missing or not an object")
@@ -2039,10 +2065,13 @@ def graphql_request(
         if retry_count < max_retries:
             retry_label = "retryable " if has_retryable_graphql_error(errors) else ""
             sleep_before_retry(
-                f"{retry_prefix}GraphQL returned {retry_label}error(s): "
-                f"{summarize_graphql_errors(errors)}",
+                f"{request_label} failed",
                 retry_number,
                 max_retries,
+                message=(
+                    f"GraphQL returned {retry_label}error(s): "
+                    f"{summarize_graphql_errors(errors)}"
+                ),
             )
             continue
         msg = f"GraphQL errors: {summarize_graphql_errors(errors)}"
