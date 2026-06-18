@@ -718,12 +718,24 @@ def fetch_commit_count(
     """Return exact rev count, approximate all-refs count, elapsed time, extras"""
     start = time.monotonic()
 
+    def all_refs_count_from_data(data: dict[str, Any]) -> int:
+        search_block = require_dict(data.get("search"), "commit-count search")
+        search_results = require_dict(
+            search_block.get("results"),
+            "commit-count search results",
+        )
+        return require_int(
+            search_results.get("matchCount"), "commit-count all-refs matchCount"
+        )
+
     def validate(data: dict[str, Any]) -> None:
         repo_block = require_dict(data.get("repository"), "commit-count repository")
+        all_refs_count = all_refs_count_from_data(data)
+        commit_block = repo_block.get("commit")
+        if commit_block is None and all_refs_count == 0:
+            return
         commit_block = require_dict(
-            repo_block.get("commit"),
-            "commit-count commit",
-            retryable=False,
+            commit_block, "commit-count commit", retryable=False
         )
         ancestors_block = require_dict(
             commit_block.get("ancestors"),
@@ -732,14 +744,6 @@ def fetch_commit_count(
         require_int(
             ancestors_block.get("totalCount"),
             "commit-count default branch totalCount",
-        )
-        search_block = require_dict(data.get("search"), "commit-count search")
-        search_results = require_dict(
-            search_block.get("results"),
-            "commit-count search results",
-        )
-        require_int(
-            search_results.get("matchCount"), "commit-count all-refs matchCount"
         )
 
     data = graphql_request_with_validation(
@@ -758,25 +762,17 @@ def fetch_commit_count(
     )
     elapsed = time.monotonic() - start
     repo = require_dict(data.get("repository"), "commit-count repository")
-    commit = require_dict(
-        repo.get("commit"),
-        "commit-count commit",
-        retryable=False,
-    )
-    ancestors = require_dict(commit.get("ancestors"), "commit-count ancestors")
-    default_count = require_int(
-        ancestors.get("totalCount"),
-        "commit-count default branch totalCount",
-    )
-    search_block = require_dict(data.get("search"), "commit-count search")
-    search_results = require_dict(
-        search_block.get("results"),
-        "commit-count search results",
-    )
-    all_refs_count = require_int(
-        search_results.get("matchCount"),
-        "commit-count all-refs matchCount",
-    )
+    all_refs_count = all_refs_count_from_data(data)
+    commit = repo.get("commit")
+    if commit is None and all_refs_count == 0:
+        default_count = 0
+    else:
+        commit = require_dict(commit, "commit-count commit", retryable=False)
+        ancestors = require_dict(commit.get("ancestors"), "commit-count ancestors")
+        default_count = require_int(
+            ancestors.get("totalCount"),
+            "commit-count default branch totalCount",
+        )
     optimization_values = [
         extract(repo) for _, extract, _, _, _ in COMMIT_COUNT_OPTIMIZATION_COLUMNS
     ]
