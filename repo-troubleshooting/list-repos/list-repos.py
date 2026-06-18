@@ -92,6 +92,8 @@ DEFAULT_SKIPPED_FILE_REASON_STATS_FILE = "skipped-files-reason-stats.csv"
 DEFAULT_STATS_FILE_PREFIX = "stats"
 CSV_SORT_CHUNK_ROWS = 50_000
 CSV_RECORD_LINE_TERMINATOR = "\r\n"
+LOG_ERROR_TEXT_MAX_CHARS = 2_000
+LOG_GRAPHQL_ERROR_MAX_MESSAGES = 5
 DEFAULT_MAX_RETRIES = 5
 GRAPHQL_FIELD_COUNT_RETRY_HEADROOM_PERCENT = 95
 PAGE_SIZE = 500
@@ -585,6 +587,14 @@ def truncate_lines(value: str, head: int = 5, tail: int = 5) -> str:
     return "\n".join(
         [*lines[:head], f"... [{omitted} lines truncated] ...", *lines[-tail:]],
     )
+
+
+def truncate_log_text(value: str, max_chars: int = LOG_ERROR_TEXT_MAX_CHARS) -> str:
+    """Return value capped for one readable log record"""
+    if len(value) <= max_chars:
+        return value
+    omitted = len(value) - max_chars
+    return f"{value[:max_chars]}... [{omitted} chars truncated]"
 
 
 def has_cloning_error(repo: dict[str, Any]) -> bool:
@@ -1871,9 +1881,13 @@ def has_retryable_graphql_error(errors: object) -> bool:
 def summarize_graphql_errors(errors: object) -> str:
     """Return compact GraphQL error messages for retry logs"""
     if not isinstance(errors, list):
-        return str(errors)
-    messages = [graphql_error_message(error) for error in errors]
-    return "; ".join(messages)
+        return truncate_log_text(str(errors))
+    displayed_errors = errors[:LOG_GRAPHQL_ERROR_MAX_MESSAGES]
+    messages = [graphql_error_message(error) for error in displayed_errors]
+    omitted = len(errors) - len(displayed_errors)
+    if omitted > 0:
+        messages.append(f"... [{omitted} GraphQL errors omitted]")
+    return truncate_log_text("; ".join(messages))
 
 
 def request_error_summary(error: Exception) -> str:
@@ -1881,9 +1895,9 @@ def request_error_summary(error: Exception) -> str:
     if isinstance(error, HTTPRequestError):
         body = error.body.decode(errors="replace").strip()
         if body:
-            return f"HTTP {error.status} {error.reason}: {body}"
+            return truncate_log_text(f"HTTP {error.status} {error.reason}: {body}")
         return f"HTTP {error.status} {error.reason}"
-    return str(error)
+    return truncate_log_text(str(error))
 
 
 def request_failure_can_retry(error: Exception) -> bool:
@@ -2031,7 +2045,7 @@ def graphql_request(
                 max_retries,
             )
             continue
-        msg = f"GraphQL errors: {json.dumps(errors, indent=2)}"
+        msg = f"GraphQL errors: {summarize_graphql_errors(errors)}"
         raise GraphQLError(msg)
     msg = "graphql_request retry loop exhausted unexpectedly"
     raise RuntimeError(msg)
@@ -3696,7 +3710,7 @@ def log_http_error(exc: HTTPRequestError) -> None:
         logger.error("  %s: %s", header, value)
     body = exc.body.decode(errors="replace")
     if body:
-        logger.error("Response body:\n%s", body)
+        logger.error("Response body:\n%s", truncate_log_text(body))
     logger.error("HTTP request failed", exc_info=exc)
 
 
