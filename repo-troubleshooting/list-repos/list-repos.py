@@ -94,7 +94,8 @@ CSV_SORT_CHUNK_ROWS = 50_000
 CSV_RECORD_LINE_TERMINATOR = "\r\n"
 LOG_ERROR_TEXT_MAX_CHARS = 2_000
 LOG_GRAPHQL_ERROR_MAX_MESSAGES = 5
-DEFAULT_MAX_RETRIES = 5
+DEFAULT_MAX_RETRIES = 10
+MAX_RETRY_DELAY_SECONDS = 32
 GRAPHQL_FIELD_COUNT_RETRY_HEADROOM_PERCENT = 95
 PAGE_SIZE = 500
 REQUEST_TIMEOUT_SECONDS = 60
@@ -1835,8 +1836,8 @@ def send_once(
 
 
 def retry_delay_seconds(retry_number: int) -> int:
-    """Return exponential retry delay: 1, 2, 4, 8, 16... seconds"""
-    return 2 ** (retry_number - 1)
+    """Return capped exponential retry delay in seconds"""
+    return min(2 ** (retry_number - 1), MAX_RETRY_DELAY_SECONDS)
 
 
 def retry_message_label(message: str) -> str:
@@ -2737,6 +2738,8 @@ class LazyCSVWriter:
             self._writer = make_csv_writer(self._file)
             write_csv_row(self._writer, self.columns)
         write_csv_row(self._writer, row)
+        if self._file is not None:
+            self._file.flush()
         self.count += 1
 
     def __enter__(self) -> LazyCSVWriter:
@@ -3984,7 +3987,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         metavar="int",
         help=(
             "Retries per GraphQL request after the initial attempt "
-            f"(default {DEFAULT_MAX_RETRIES}; backoff 1s, 2s, 4s, ...)"
+            f"(default {DEFAULT_MAX_RETRIES}; backoff doubles from 1s "
+            f"to max {MAX_RETRY_DELAY_SECONDS}s)"
         ),
     )
     parser.add_argument(
@@ -4052,8 +4056,10 @@ def collect_scope(args: argparse.Namespace) -> tuple[str, str] | None:
 def run(args: argparse.Namespace, endpoint: str, token: str, output_dir: Path) -> None:
     """Confirm the connection, then stream every repo to the CSV file"""
     logger.info(
-        "Retry policy: %d retries per GraphQL request (backoff: 1s, 2s, 4s, ...)",
+        "Retry policy: %d retries per GraphQL request (backoff doubles from "
+        "1s to max %ds)",
         args.max_retries,
+        MAX_RETRY_DELAY_SECONDS,
     )
     if args.skipped_file_metrics and args.skipped_files_reason is None:
         die("--skipped-file-metrics requires --skipped-files-reason")
