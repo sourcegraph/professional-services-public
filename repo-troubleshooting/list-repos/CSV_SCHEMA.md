@@ -36,7 +36,7 @@ holding every output row in memory
 | `repos-with-cloning-errors.csv` | `url` |
 | `repos-with-indexing-errors.csv` | `url` |
 | `repos-with-skipped-files.csv` | `url` |
-| `skipped-files-reason-details.csv` | `reason`, `file.extension`, `rev`, `file_url` |
+| `skipped-files-reason-details.csv` | `repository.name`, `rev`, `reason`, `file.extension`, `file.path` |
 
 The optional `--count-commits` and `--run-search` flags append extra
 columns to the repo-listing CSVs above, excluding the `--stats`
@@ -107,11 +107,14 @@ Written to `skipped-files-reason-details.csv` when
 
 | Column | Type | Requires admin | Description |
 | --- | --- | --- | --- |
+| `repository.name` | string | | Sourcegraph repository name containing the skipped file |
+| `rev` | string | | Indexed ref containing the skipped file |
 | `reason` | string | | Compact NOT-INDEXED reason parsed from the indexed placeholder content |
 | `file.extension` | string | | File extension derived from file.path |
 | `file.byteSize` | integer | | Sourcegraph-reported file byte size |
 | `file.distinctTrigramCount` | integer | | Distinct three-rune trigrams computed from GitBlob.content. Only populated with --skipped-file-metrics for skipped files whose reason is `too_many_trigrams` |
-| `rev` | string | | Indexed ref containing the skipped file |
+| `repoRevSkippedIndexed.count` | integer | | Skipped-file count Sourcegraph reported for this repository ref |
+| `file.path` | string | | Path of the skipped file inside the repository |
 | `file_url` | string | | Sourcegraph blob URL for the skipped file at the indexed ref |
 
 ## `--count-commits` columns

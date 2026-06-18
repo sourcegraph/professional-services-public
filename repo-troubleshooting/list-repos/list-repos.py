@@ -137,7 +137,7 @@ SORTED_CSV_OUTPUTS: tuple[tuple[str, tuple[str, ...]], ...] = (
     (DEFAULT_SKIPPED_FILES_FILE, ("url",)),
     (
         DEFAULT_SKIPPED_FILE_REASONS_FILE,
-        ("reason", "file.extension", "rev", "file_url"),
+        ("repository.name", "rev", "reason", "file.extension", "file.path"),
     ),
 )
 
@@ -477,6 +477,29 @@ query ValidateRepoRev($name: String!, $rev: String!) {
 }
 """
 
+SKIPPED_FILE_REF_METADATA_QUERY = """
+query SkippedFileRefMetadata($name: String!) {
+  repository(name: $name) {
+    name
+    textSearchIndex {
+      refs {
+        ref {
+          displayName
+        }
+        indexed
+        indexedCommit {
+          oid
+        }
+        skippedIndexed {
+          count
+          query
+        }
+      }
+    }
+  }
+}
+"""
+
 
 # --- Metadata extractors used by the COLUMNS table --------------------------------
 
@@ -653,24 +676,41 @@ def refs_with_skipped_file_queries(
     """Return (ref name, skipped count, API search query, indexed commit) tuples"""
     refs: list[tuple[str, int, str, str]] = []
     for ref in _index_refs(repo):
-        if ref.get("indexed") is False:
+        ref_state = skipped_file_ref_state(ref)
+        if ref_state is None:
             continue
-        skipped: dict[str, Any] = ref.get("skippedIndexed") or {}
-        count = skipped.get("count")
-        if count is None:
-            continue
-        skipped_count = int(count)
+        name, skipped_count, skipped_indexed_query, indexed_oid = ref_state
         if skipped_count <= 0:
             continue
-        ref_node: dict[str, Any] = ref.get("ref") or {}
-        name = str(ref_node.get("displayName") or "")
-        if name:
-            indexed_commit: dict[str, Any] = ref.get("indexedCommit") or {}
-            indexed_oid = str(indexed_commit.get("oid") or "")
-            refs.append(
-                (name, skipped_count, str(skipped.get("query") or ""), indexed_oid)
-            )
+        refs.append((name, skipped_count, skipped_indexed_query, indexed_oid))
     return refs
+
+
+def skipped_file_ref_state(ref: dict[str, Any]) -> tuple[str, int, str, str] | None:
+    """Return skipped-file metadata for one indexed ref, including zero skips"""
+    if ref.get("indexed") is False:
+        return None
+    ref_node: dict[str, Any] = ref.get("ref") or {}
+    name = str(ref_node.get("displayName") or "")
+    if not name:
+        return None
+    skipped: dict[str, Any] = ref.get("skippedIndexed") or {}
+    count = int(skipped.get("count") or 0)
+    indexed_commit: dict[str, Any] = ref.get("indexedCommit") or {}
+    indexed_oid = str(indexed_commit.get("oid") or "")
+    return name, count, str(skipped.get("query") or ""), indexed_oid
+
+
+def skipped_file_ref_state_by_name(
+    repo: dict[str, Any],
+    ref_name: str,
+) -> tuple[str, int, str, str] | None:
+    """Return skipped-file metadata for a named indexed ref"""
+    for ref in _index_refs(repo):
+        ref_state = skipped_file_ref_state(ref)
+        if ref_state is not None and ref_state[0] == ref_name:
+            return ref_state
+    return None
 
 
 def refs_with_skipped_file_counts(repo: dict[str, Any]) -> list[tuple[str, int]]:
@@ -1233,6 +1273,18 @@ SKIPPED_FILES_CSV_COLUMNS = CSV_COLUMNS + [
 
 SKIPPED_FILE_REASON_COLUMNS: list[tuple[str, str, bool, str]] = [
     (
+        "repository.name",
+        "Sourcegraph repository name containing the skipped file",
+        False,
+        "string",
+    ),
+    (
+        "rev",
+        "Indexed ref containing the skipped file",
+        False,
+        "string",
+    ),
+    (
         "reason",
         "Compact NOT-INDEXED reason parsed from the indexed placeholder content",
         False,
@@ -1259,8 +1311,14 @@ SKIPPED_FILE_REASON_COLUMNS: list[tuple[str, str, bool, str]] = [
         "integer",
     ),
     (
-        "rev",
-        "Indexed ref containing the skipped file",
+        "repoRevSkippedIndexed.count",
+        "Skipped-file count Sourcegraph reported for this repository ref",
+        False,
+        "integer",
+    ),
+    (
+        "file.path",
+        "Path of the skipped file inside the repository",
         False,
         "string",
     ),
@@ -2148,6 +2206,38 @@ def fetch_single_repo(
     return cast("dict[str, Any]", repo)
 
 
+def fetch_skipped_file_ref_metadata(
+    endpoint: str,
+    token: str,
+    repo_name: str,
+    *,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+) -> dict[str, Any]:
+    """Fetch fresh text-search skipped-file ref metadata for one repo"""
+
+    def validate(data: dict[str, Any]) -> None:
+        require_dict(
+            data.get("repository"),
+            "skipped-file metadata repository",
+            retryable=False,
+        )
+
+    data = graphql_request_with_validation(
+        endpoint,
+        token,
+        SKIPPED_FILE_REF_METADATA_QUERY,
+        {"name": repo_name},
+        max_retries=max_retries,
+        request_description=f"Skipped-file metadata refresh for {repo_name}",
+        validate=validate,
+    )
+    return require_dict(
+        data.get("repository"),
+        "skipped-file metadata repository",
+        retryable=False,
+    )
+
+
 def trigger_reclone(
     endpoint: str,
     token: str,
@@ -2602,6 +2692,233 @@ def fetch_skipped_file_reason_query(
     )
 
 
+def skipped_file_reason_query_issue(
+    query_result: SkippedFileReasonQueryResult,
+    expected_skipped_count: int,
+) -> str | None:
+    """Return why a skipped-file reason result is incomplete, or None"""
+    file_match_count = len(query_result.matches)
+    if query_result.limit_hit:
+        return (
+            "search hit result limit: "
+            f"matchCount={query_result.match_count}, "
+            f"fileMatches={file_match_count}, "
+            f"textSearchIndex.refs.skippedIndexed.count={expected_skipped_count}"
+        )
+    if query_result.match_count is None:
+        return (
+            "search response was missing matchCount: "
+            f"fileMatches={file_match_count}, "
+            f"textSearchIndex.refs.skippedIndexed.count={expected_skipped_count}"
+        )
+    if (
+        file_match_count != expected_skipped_count
+        or query_result.match_count != expected_skipped_count
+    ):
+        return (
+            f"search returned {file_match_count} file match(es) "
+            f"(matchCount={query_result.match_count}, "
+            f"limitHit={query_result.limit_hit}) but "
+            "textSearchIndex.refs.skippedIndexed.count reported "
+            f"{expected_skipped_count}"
+        )
+    return None
+
+
+def build_skipped_file_reason_search_result(
+    repository_name: str,
+    reference_name: str,
+    indexed_revision: str,
+    skipped_count: int,
+    query_result: SkippedFileReasonQueryResult | None,
+    error: str | None,
+) -> SkippedFileReasonSearchResult:
+    """Build a skipped-file reason search result without retaining partial data on error"""
+    if query_result is None or error is not None:
+        return SkippedFileReasonSearchResult(
+            repository_name=repository_name,
+            ref_name=reference_name,
+            indexed_rev=indexed_revision,
+            skipped_count=skipped_count,
+            matches=[],
+            match_count=None,
+            limit_hit=False,
+            alert_title=None,
+            alert_description=None,
+            distinct_trigram_counts_by_path={},
+            error=error,
+        )
+    return SkippedFileReasonSearchResult(
+        repository_name=repository_name,
+        ref_name=reference_name,
+        indexed_rev=indexed_revision,
+        skipped_count=skipped_count,
+        matches=query_result.matches,
+        match_count=query_result.match_count,
+        limit_hit=query_result.limit_hit,
+        alert_title=query_result.alert_title,
+        alert_description=query_result.alert_description,
+        distinct_trigram_counts_by_path={},
+        error=None,
+    )
+
+
+def fetch_consistent_skipped_file_reason_search_result(
+    endpoint: str,
+    token: str,
+    repository_name: str,
+    reference_name: str,
+    skipped_count: int,
+    skipped_indexed_query: str,
+    indexed_commit_oid: str,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+) -> SkippedFileReasonSearchResult:
+    """Fetch skipped-file details, refreshing metadata when counts disagree"""
+    current_ref_state: tuple[str, int, str, str] | None = (
+        reference_name,
+        skipped_count,
+        skipped_indexed_query,
+        indexed_commit_oid,
+    )
+    latest_indexed_revision = indexed_commit_oid or skipped_file_query_revision(
+        skipped_indexed_query,
+        reference_name,
+    )
+    latest_skipped_count = skipped_count
+    last_issue = "skipped-file reason search did not run"
+
+    for retry_count in range(max_retries + 1):
+        retry_number = retry_count + 1
+        if current_ref_state is None:
+            last_issue = f"textSearchIndex.refs no longer contains indexed ref {reference_name!r}"
+        else:
+            (
+                _current_reference_name,
+                latest_skipped_count,
+                current_skipped_indexed_query,
+                current_indexed_commit_oid,
+            ) = current_ref_state
+            latest_indexed_revision = (
+                current_indexed_commit_oid
+                or skipped_file_query_revision(
+                    current_skipped_indexed_query,
+                    reference_name,
+                )
+            )
+            if latest_skipped_count <= 0:
+                if retry_count > 0:
+                    logger.warning(
+                        "Skipped-file metadata for %s@%s now reports 0 skipped "
+                        "file(s) after retry; no skipped-file detail rows needed",
+                        repository_name,
+                        reference_name,
+                    )
+                empty_query_result = SkippedFileReasonQueryResult(
+                    matches=[],
+                    match_count=0,
+                    limit_hit=False,
+                    alert_title=None,
+                    alert_description=None,
+                )
+                return build_skipped_file_reason_search_result(
+                    repository_name,
+                    reference_name,
+                    latest_indexed_revision,
+                    latest_skipped_count,
+                    empty_query_result,
+                    error=None,
+                )
+            try:
+                query_result = fetch_skipped_file_reason_query(
+                    endpoint,
+                    token,
+                    repository_name,
+                    latest_indexed_revision,
+                    current_skipped_indexed_query,
+                    max_retries=max_retries,
+                )
+            except REQUEST_FAILURE_TYPES as error:
+                return build_skipped_file_reason_search_result(
+                    repository_name,
+                    reference_name,
+                    latest_indexed_revision,
+                    latest_skipped_count,
+                    query_result=None,
+                    error=request_error_summary(error),
+                )
+
+            last_issue = (
+                skipped_file_reason_query_issue(
+                    query_result,
+                    latest_skipped_count,
+                )
+                or ""
+            )
+            if not last_issue:
+                return build_skipped_file_reason_search_result(
+                    repository_name,
+                    reference_name,
+                    latest_indexed_revision,
+                    latest_skipped_count,
+                    query_result,
+                    error=None,
+                )
+
+        if retry_count >= max_retries:
+            logger.error(
+                "Skipped-file reason search for %s@%s failed after %d attempt(s): %s",
+                repository_name,
+                reference_name,
+                retry_number,
+                last_issue,
+            )
+            return build_skipped_file_reason_search_result(
+                repository_name,
+                reference_name,
+                latest_indexed_revision,
+                latest_skipped_count,
+                query_result=None,
+                error=last_issue,
+            )
+
+        sleep_before_retry(
+            f"Skipped-file reason search for {repository_name}@{reference_name} "
+            "returned inconsistent results",
+            retry_number,
+            max_retries,
+            message=last_issue,
+        )
+        try:
+            refreshed_repo = fetch_skipped_file_ref_metadata(
+                endpoint,
+                token,
+                repository_name,
+                max_retries=max_retries,
+            )
+        except REQUEST_FAILURE_TYPES as error:
+            return build_skipped_file_reason_search_result(
+                repository_name,
+                reference_name,
+                latest_indexed_revision,
+                latest_skipped_count,
+                query_result=None,
+                error=request_error_summary(error),
+            )
+        current_ref_state = skipped_file_ref_state_by_name(
+            refreshed_repo,
+            reference_name,
+        )
+
+    return build_skipped_file_reason_search_result(
+        repository_name,
+        reference_name,
+        latest_indexed_revision,
+        latest_skipped_count,
+        query_result=None,
+        error=last_issue,
+    )
+
+
 def write_skipped_files_reason(
     endpoint: str,
     token: str,
@@ -2623,45 +2940,39 @@ def write_skipped_files_reason(
         ("count", lambda r: r[1]),
     ]
 
-    query_result = fetch_skipped_file_reason_query(
+    search_result = fetch_consistent_skipped_file_reason_search_result(
         endpoint,
         token,
         name,
-        indexed_rev,
+        display_rev,
+        skipped_count,
         skipped_indexed_query,
+        indexed_rev,
         max_retries=max_retries,
     )
-    matches = query_result.matches
+    if search_result.error is not None:
+        return
+
+    matches = search_result.matches
     distinct_trigram_counts_by_path: dict[str, int] = {}
     if skipped_file_metrics:
         distinct_trigram_counts_by_path = collect_distinct_trigram_counts(
             endpoint,
             token,
             name,
-            indexed_rev,
+            search_result.indexed_rev,
             matches,
             max_retries,
         )
+    search_result.distinct_trigram_counts_by_path.update(
+        distinct_trigram_counts_by_path
+    )
 
     reason_counts: collections.Counter[str] = collections.Counter()
     for match in matches:
         reason = skipped_file_reason_value(match)
         if reason:
             reason_counts[reason] += 1
-
-    search_result = SkippedFileReasonSearchResult(
-        repository_name=name,
-        ref_name=display_rev,
-        indexed_rev=indexed_rev,
-        skipped_count=skipped_count,
-        matches=matches,
-        match_count=query_result.match_count,
-        limit_hit=query_result.limit_hit,
-        alert_title=query_result.alert_title,
-        alert_description=query_result.alert_description,
-        distinct_trigram_counts_by_path=distinct_trigram_counts_by_path,
-        error=None,
-    )
 
     files_writer = LazyCSVWriter(
         output_dir / DEFAULT_SKIPPED_FILE_REASONS_FILE,
@@ -3172,59 +3483,28 @@ def collect_skipped_file_reason_search_results(
             skipped_indexed_query,
             display_ref_name,
         )
-        try:
-            query_result = fetch_skipped_file_reason_query(
-                endpoint,
-                token,
-                repo_name,
-                indexed_rev,
-                skipped_indexed_query,
-                max_retries=max_retries,
-            )
-        except REQUEST_FAILURE_TYPES as error:
-            results.append(
-                SkippedFileReasonSearchResult(
-                    repository_name=repo_name,
-                    ref_name=display_ref_name,
-                    indexed_rev=indexed_rev,
-                    skipped_count=skipped_count,
-                    matches=[],
-                    match_count=None,
-                    limit_hit=False,
-                    alert_title=None,
-                    alert_description=None,
-                    distinct_trigram_counts_by_path={},
-                    error=request_error_summary(error),
+        search_result = fetch_consistent_skipped_file_reason_search_result(
+            endpoint,
+            token,
+            repo_name,
+            display_ref_name,
+            skipped_count,
+            skipped_indexed_query,
+            indexed_rev,
+            max_retries=max_retries,
+        )
+        if skipped_file_metrics and search_result.error is None:
+            search_result.distinct_trigram_counts_by_path.update(
+                collect_distinct_trigram_counts(
+                    endpoint,
+                    token,
+                    repo_name,
+                    search_result.indexed_rev,
+                    search_result.matches,
+                    max_retries,
                 ),
             )
-            continue
-        distinct_trigram_counts_by_path = (
-            collect_distinct_trigram_counts(
-                endpoint,
-                token,
-                repo_name,
-                indexed_rev,
-                query_result.matches,
-                max_retries,
-            )
-            if skipped_file_metrics
-            else {}
-        )
-        results.append(
-            SkippedFileReasonSearchResult(
-                repository_name=repo_name,
-                ref_name=display_ref_name,
-                indexed_rev=indexed_rev,
-                skipped_count=skipped_count,
-                matches=query_result.matches,
-                match_count=query_result.match_count,
-                limit_hit=query_result.limit_hit,
-                alert_title=query_result.alert_title,
-                alert_description=query_result.alert_description,
-                distinct_trigram_counts_by_path=distinct_trigram_counts_by_path,
-                error=None,
-            ),
-        )
+        results.append(search_result)
     return results
 
 
@@ -3244,38 +3524,31 @@ def write_skipped_file_reason_rows(
             for part in (search_result.alert_title, search_result.alert_description)
             if part
         ]
-        if search_result.limit_hit:
-            logger.warning(
-                "Skipped-file reason search hit a result limit for %s@%s: "
-                "matchCount=%s, fileMatches=%d, skippedIndexed.count=%d",
+        query_issue = skipped_file_reason_query_issue(
+            SkippedFileReasonQueryResult(
+                matches=matches,
+                match_count=search_result.match_count,
+                limit_hit=search_result.limit_hit,
+                alert_title=search_result.alert_title,
+                alert_description=search_result.alert_description,
+            ),
+            search_result.skipped_count,
+        )
+        if query_issue is not None:
+            logger.error(
+                "Skipped-file reason search for %s@%s has incomplete results "
+                "after retry handling: %s",
                 search_result.repository_name,
                 search_result.ref_name,
-                search_result.match_count,
-                len(matches),
-                search_result.skipped_count,
+                query_issue,
             )
+            continue
         if alert_parts:
             logger.warning(
                 "Skipped-file reason search returned alert for %s@%s: %s",
                 search_result.repository_name,
                 search_result.ref_name,
                 "; ".join(alert_parts),
-            )
-        match_count_mismatch = (
-            search_result.match_count is not None
-            and search_result.match_count != search_result.skipped_count
-        )
-        if len(matches) != search_result.skipped_count or match_count_mismatch:
-            logger.warning(
-                "Skipped-file reason search returned %d file match(es) "
-                "(matchCount=%s, limitHit=%s) for %s@%s; "
-                "textSearchIndex.refs.skippedIndexed.count reported %d",
-                len(matches),
-                search_result.match_count,
-                search_result.limit_hit,
-                search_result.repository_name,
-                search_result.ref_name,
-                search_result.skipped_count,
             )
         for match in matches:
             file_obj: dict[str, Any] = match.get("file") or {}
@@ -3288,11 +3561,14 @@ def write_skipped_file_reason_rows(
                     search_result.distinct_trigram_counts_by_path.get(file_path, "")
                 )
             row = [
+                search_result.repository_name,
+                search_result.ref_name,
                 skipped_file_reason_value(match),
                 file_extension,
                 int(byte_size) if byte_size is not None else "",
                 distinct_trigram_count,
-                search_result.ref_name,
+                search_result.skipped_count,
+                file_path,
                 file_url(
                     endpoint,
                     search_result.repository_name,
