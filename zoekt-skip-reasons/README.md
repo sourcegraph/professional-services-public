@@ -12,6 +12,7 @@ using Sourcegraph's default settings for Zoekt:
 ## Requirements
 
 - Python >= 3.9
+- Memory consumption is up to 2x the size of the checked file, plus a small overhead
 
 ## Usage
 
