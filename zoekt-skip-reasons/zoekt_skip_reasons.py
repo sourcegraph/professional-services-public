@@ -52,10 +52,6 @@ def main() -> int:
     # Run the checks
     skip_checks = [
         (
-            "Empty file (file size == 0 bytes)",
-            len(content) == 0,
-        ),
-        (
             f"Exceeds the maximum size limit (file size > {MAX_FILE_SIZE_BYTES:,} bytes)",
             len(content) > MAX_FILE_SIZE_BYTES,
         ),
