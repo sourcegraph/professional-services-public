@@ -14,14 +14,14 @@ def count_unique_trigrams(content: bytes) -> int:
     # Trigrams are read as UTF-8 characters
     text = content.decode("utf-8", errors="replace")
 
-    # Set of unique trigrams, 3-character tuples
-    seen: set[tuple[str, str, str]] = set()
+    # Set of unique 3-character trigrams
+    seen: set[str] = set()
 
     # Loop through the file's contents, one character at a time
     for start in range(len(text) - 3 + 1):
         # Get each trigram, add to the set
         # Let the set type handle deduplicating trigrams
-        seen.add((text[start], text[start + 1], text[start + 2]))
+        seen.add(text[start : start + 3])
 
     return len(seen)
 
