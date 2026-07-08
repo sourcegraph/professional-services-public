@@ -1,0 +1,11 @@
+email,entitlement
+loadtest001@example.com,Tier 1
+loadtest002@example.com,Tier 1
+loadtest003@example.com,Tier 1
+loadtest004@example.com,Tier 1
+loadtest005@example.com,Tier 1
+loadtest006@example.com,Tier 2
+loadtest007@example.com,Tier 2
+loadtest008@example.com,Tier 2
+loadtest009@example.com,Tier 3
+sourcegraph@example.com,Tier 3
