@@ -288,30 +288,33 @@ class EntitlementSyncTest(unittest.TestCase):
             [("carol", "ds-tier-1")],
         )
 
-    def test_users_uses_users_api_and_extracts_user_id(self) -> None:
+    def test_users_uses_graphql_email_lookup_and_returns_graphql_id(self) -> None:
         client = SourcegraphClient("https://sourcegraph.example.com", "token")
-        client.api_post = Mock(  # type: ignore[method-assign]
+        client.graphql = Mock(  # type: ignore[method-assign]
             return_value={
-                "name": "users/123",
-                "username": "alice",
+                "user0": {"id": "U1", "username": "alice"},
+                "user1": None,
             }
         )
 
-        users = client.users({"alice@example.com"})
+        users = client.users({"alice@example.com", "missing@example.com"})
 
-        client.api_post.assert_called_once_with(
-            "/api/users.v1.Service/GetUser",
-            {"name": "users/alice@example.com"},
+        query, variables = client.graphql.call_args.args
+        self.assertIn("user0: user(email: $email0)", query)
+        self.assertIn("user1: user(email: $email1)", query)
+        self.assertEqual(
+            variables,
+            {"email0": "alice@example.com", "email1": "missing@example.com"},
         )
-        self.assertEqual(users, {"alice@example.com": UserInfo(id="123", username="alice")})
+        self.assertEqual(users, {"alice@example.com": UserInfo(id="U1", username="alice")})
 
-    def test_entitlement_grants_uses_numeric_database_id(self) -> None:
+    def test_entitlement_grants_uses_graphql_user_id(self) -> None:
         client = SourcegraphClient("https://sourcegraph.example.com", "token")
         client.graphql = Mock(  # type: ignore[method-assign]
             return_value={
                 "node": {
                     "userGrants": {
-                        "nodes": [{"databaseID": 123, "username": "alice"}],
+                        "nodes": [{"id": "U1", "username": "alice"}],
                         "pageInfo": {"hasNextPage": False, "endCursor": None},
                     }
                 }
@@ -320,7 +323,7 @@ class EntitlementSyncTest(unittest.TestCase):
 
         grants = client.entitlement_grants("E1")
 
-        self.assertEqual(grants, {"alice": "123"})
+        self.assertEqual(grants, {"alice": "U1"})
 
     def test_sourcegraph_client_uses_truststore_ssl_context(self) -> None:
         response = Mock()

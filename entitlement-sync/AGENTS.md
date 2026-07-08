@@ -19,8 +19,8 @@ Python CLI that reconciles Sourcegraph `DEEP_SEARCH` entitlement grants to match
 - `.python-version` pins `3.14` but `pyproject.toml` requires `>=3.12`; uv resolves against the pinned interpreter.
 - No linter/formatter is configured despite `.ruff_cache` being gitignored — do not assume `ruff` runs in CI.
 - The CLI exits `1` when any CSV rows are skipped (missing user/entitlement, or a default entitlement) while still applying resolved changes. Non-zero exit does not mean nothing happened.
-- CSV users are looked up with `POST /api/users.v1.Service/GetUser` using `name: "users/<email>"`; the numeric ID is extracted from the returned `users/<id>` resource name for entitlement mutations.
-- `GetUser` does not return entitlement grant state. Current explicit grants are derived from each non-default entitlement's GraphQL `userGrants` list, using `databaseID` so IDs match the users API numeric IDs.
+- CSV users are looked up with GraphQL `user(email:)`; use the returned `User.id` GraphQL ID for entitlement mutations.
+- Current explicit grants are derived from each non-default entitlement's GraphQL `userGrants` list, using `id` so IDs match the GraphQL IDs returned by `user(email:)`.
 - The default `DEEP_SEARCH` entitlement is never listed or revoked. Preserve this invariant — it is covered by `test_sync_never_lists_or_revokes_default_entitlement`.
 - On apply, revokes run before grants so a user moving between entitlements isn't blocked by the one-grant-per-type rule.
 - For local testing with the checked-in CSV, make sure each test user has a verified `<username>@example.com` email. Use `envchain LOCAL src users get -username=<username>` to inspect, and GraphQL mutations `addUserEmail` plus `setUserEmailVerified` via `envchain LOCAL src api` to add missing addresses.

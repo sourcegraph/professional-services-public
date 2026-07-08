@@ -2,7 +2,7 @@
 
 Reconcile Sourcegraph `DEEP_SEARCH` entitlement grants to match `user-entitlements.csv`.
 
-The CSV is the source of truth: the tool makes the instance match it. Each `email` value must be a verified Sourcegraph user email address. The tool resolves users through `POST /api/users.v1.Service/GetUser` with `name: "users/<email>"`, extracts the numeric user ID from the returned `users/<id>` resource name, and uses that ID in entitlement mutations. Each `entitlement` value is matched to an existing entitlement `name`. Grants that are no longer in the CSV are **removed**, so users are granted, moved, or revoked through the GraphQL mutations:
+The CSV is the source of truth: the tool makes the instance match it. Each `email` value must be a verified Sourcegraph user email address. The tool resolves users through the GraphQL `user(email:)` field and uses the returned GraphQL `User.id` in entitlement mutations. Each `entitlement` value is matched to an existing entitlement `name`. Grants that are no longer in the CSV are **removed**, so users are granted, moved, or revoked through the GraphQL mutations:
 
 ```graphql
 createEntitlementGrants(entitlementID: ID!, userIDs: [ID!]!)
@@ -20,7 +20,7 @@ A user may hold at most **one** `DEEP_SEARCH` entitlement. On each run the tool 
 
 All non-default entitlements are reconciled, even if the CSV no longer mentions a specific entitlement. Runs are idempotent: applying the same CSV twice makes no changes the second time.
 
-Current entitlement state is read from each non-default entitlement's grant list. The users API is used only for user identity lookup, because `GetUser` does not include entitlement grants.
+Current entitlement state is read from each non-default entitlement's grant list. User identity lookup and entitlement mutations both use GraphQL IDs so planned changes compare the same user identifier format end to end.
 
 ### The default entitlement is never modified
 

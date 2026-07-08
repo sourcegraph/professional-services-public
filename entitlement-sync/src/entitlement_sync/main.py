@@ -33,7 +33,7 @@ query EntitlementGrants($entitlementID: ID!, $first: Int!, $after: String) {
     ... on Entitlement {
       userGrants(first: $first, after: $after) {
         nodes {
-          databaseID
+          id
           username
         }
         pageInfo {
@@ -45,6 +45,8 @@ query EntitlementGrants($entitlementID: ID!, $first: Int!, $after: String) {
   }
 }
 """
+
+USER_LOOKUP_BATCH_SIZE = 100
 
 CREATE_ENTITLEMENT_GRANTS_MUTATION = """
 mutation CreateEntitlementGrants($entitlementID: ID!, $userIDs: [ID!]!) {
@@ -78,7 +80,7 @@ class Entitlement:
 
 @dataclass(frozen=True)
 class UserInfo:
-    """A Sourcegraph user resolved from the users.v1 API."""
+    """A Sourcegraph user resolved from GraphQL by verified email address."""
 
     id: str
     username: str
@@ -115,20 +117,6 @@ class SyncResult:
     def planned_revoke_count(self) -> int:
         return len(self.to_revoke)
 
-
-def user_id_from_resource_name(name: str) -> str:
-    prefix = "users/"
-    if not name.startswith(prefix) or len(name) == len(prefix):
-        raise RuntimeError(f"User API returned invalid user name: {name!r}")
-    return name[len(prefix) :]
-
-
-class SourcegraphAPIError(RuntimeError):
-    def __init__(self, status_code: int, detail: str) -> None:
-        self.status_code = status_code
-        super().__init__(f"API request failed with HTTP {status_code}: {detail}")
-
-
 class SourcegraphClient:
     def __init__(self, url: str, token: str) -> None:
         self.url = url.rstrip("/")
@@ -157,25 +145,6 @@ class SourcegraphClient:
             raise RuntimeError(f"GraphQL request failed: {payload['errors']}")
         return payload["data"]
 
-    def api_post(self, path: str, data: dict[str, Any]) -> dict[str, Any]:
-        body = json.dumps(data).encode()
-        request = urllib.request.Request(
-            f"{self.url}{path}",
-            data=body,
-            headers={
-                "Authorization": f"token {self.token}",
-                "Content-Type": "application/json",
-                "Connect-Protocol-Version": "1",
-            },
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(request, context=self.ssl_context) as response:
-                return json.loads(response.read())
-        except urllib.error.HTTPError as error:
-            detail = error.read().decode(errors="replace")
-            raise SourcegraphAPIError(error.code, detail) from error
-
     def entitlements(self) -> dict[str, Entitlement]:
         data = self.graphql(ENTITLEMENTS_QUERY, {"first": 100})
         return {
@@ -187,22 +156,25 @@ class SourcegraphClient:
 
     def users(self, user_identifiers: set[str]) -> dict[str, UserInfo]:
         users: dict[str, UserInfo] = {}
-        for user_identifier in sorted(user_identifiers):
-            try:
-                user = self.api_post(
-                    "/api/users.v1.Service/GetUser",
-                    {"name": f"users/{user_identifier}"},
-                )
-            except SourcegraphAPIError as error:
-                if error.status_code == 404:
-                    continue
-                raise
+        sorted_identifiers = sorted(user_identifiers)
+        for start in range(0, len(sorted_identifiers), USER_LOOKUP_BATCH_SIZE):
+            batch = sorted_identifiers[start : start + USER_LOOKUP_BATCH_SIZE]
+            variable_defs = ", ".join(f"$email{i}: String!" for i in range(len(batch)))
+            fields = "\n".join(
+                f"  user{i}: user(email: $email{i}) {{\n    id\n    username\n  }}"
+                for i in range(len(batch))
+            )
+            variables = {f"email{i}": user_identifier for i, user_identifier in enumerate(batch)}
+            data = self.graphql(f"query UsersByEmail({variable_defs}) {{\n{fields}\n}}", variables)
 
-            user_id = user_id_from_resource_name(user["name"])
-            resolved_username = user.get("username") or user_identifier
-            if not resolved_username:
-                continue
-            users[user_identifier] = UserInfo(id=user_id, username=resolved_username)
+            for i, user_identifier in enumerate(batch):
+                user = data.get(f"user{i}")
+                if user is None:
+                    continue
+                resolved_username = user.get("username") or user_identifier
+                if not resolved_username:
+                    continue
+                users[user_identifier] = UserInfo(id=user["id"], username=resolved_username)
         return users
 
     def entitlement_grants(self, entitlement_id: str) -> dict[str, str]:
@@ -219,7 +191,7 @@ class SourcegraphClient:
                 break
             connection = node["userGrants"]
             for user in connection["nodes"]:
-                grants[user["username"]] = str(user["databaseID"])
+                grants[user["username"]] = user["id"]
             page_info = connection["pageInfo"]
             if not page_info["hasNextPage"]:
                 break
@@ -361,7 +333,7 @@ def plan_reconciliation(
         entitlement = entitlement_by_id.get(entitlement_id)
         return entitlement is not None and entitlement.is_default
 
-    # Current grants come from the entitlement API because users.v1.GetUser only
+    # Current grants come from the entitlement API because user lookup only
     # returns user identity data.
     for entitlement_id in reconcilable_entitlement_ids:
         for username, current_user_id in client.entitlement_grants(entitlement_id).items():
