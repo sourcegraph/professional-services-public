@@ -125,6 +125,18 @@ When applying, users returned as `skippedUsers` by `createEntitlementGrants` (be
 
 ## Usage
 
+The tool needs a Sourcegraph instance URL and access token. Provide them with environment variables:
+
+- `SRC_ENDPOINT` - Sourcegraph instance URL, for example `https://sourcegraph.example.com`.
+- `SRC_ACCESS_TOKEN` - Sourcegraph access token used for users API lookups and entitlement GraphQL mutations.
+
+Alternatively, pass the same values as CLI flags:
+
+- `--sourcegraph-url https://sourcegraph.example.com`
+- `--token sgp_...`
+
+The environment variables and CLI flags are equivalent. If both are set, the CLI flag value is used. Both values are required for every run.
+
 The CSV must have these columns:
 
 ```csv
@@ -153,4 +165,3 @@ Use a different CSV:
 ```sh
 uv run entitlement-sync path/to/user-entitlements.csv --sourcegraph-url https://sourcegraph.example.com --token sgp_... --apply
 ```
-
