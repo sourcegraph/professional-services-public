@@ -1,0 +1,15 @@
+[tools]
+python = "3.13.12"
+"github:sourcegraph/src-cli" = "7.6.0"
+
+[tasks.setup]
+description = "Verify the runtime; no Python dependencies are required"
+run = "python --version && src user create --help > /dev/null"
+
+[tasks.check]
+description = "Check Python syntax"
+run = "python -m py_compile bulk_user_create.py tests/test_cli.py"
+
+[tasks.test]
+description = "Test the CLI without contacting Sourcegraph"
+run = "python -m unittest discover -s tests"
